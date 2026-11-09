@@ -22,7 +22,8 @@ def execute(
 
     def step(name, operation):
         check()
-        stage(name)
+        if name != "quality":
+            stage(name)
         start = time.monotonic()
         try:
             return operation()
@@ -88,6 +89,8 @@ def execute(
         ),
     )
     dest = step("encode", lambda: media.encode(root, info, check))
+    if os.environ.get("DETECTOR") == "yolo":
+        step("quality", lambda: vision.residual_quality(root, files, detections, check))
     return (
         dest,
         {

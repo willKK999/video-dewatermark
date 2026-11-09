@@ -12,9 +12,14 @@ ROOT = Path(__file__).resolve().parents[2]
 CATALOG = ROOT / "deploy" / "models.json"
 
 
-def test_shipped_catalog_blocks_production_startup():
-    with pytest.raises(ProvenanceError, match="UNRESOLVED|digest unresolved"):
-        validate_provenance(CATALOG)
+def test_catalog_pins_and_rejects_unresolved_assets(tmp_path):
+    catalog = validate_provenance(CATALOG)
+    required = next(m for m in catalog['models'] if m.get('phase') != 2)
+    required['assets'][0]['sha256'] = 'UNRESOLVED'
+    path = tmp_path / 'unresolved.json'
+    path.write_text(json.dumps(catalog))
+    with pytest.raises(ProvenanceError, match="digest unresolved"):
+        validate_provenance(path)
 
 
 def test_phase2_is_ignored_and_files_must_match(tmp_path):
@@ -78,3 +83,16 @@ def test_result_head_requires_length_and_sha256():
     assert exc.value.code == "OUTPUT_INVALID"
     with pytest.raises(PipelineError):
         verify_result_head({"ContentLength": 3, "Metadata": {"Sha256": "abcd"}}, 4, "abcd")
+
+
+@pytest.mark.parametrize('tagging', [True, False])
+def test_storage_capability_preserves_integrity_metadata(monkeypatch, tagging):
+    from worker.main import upload_options
+    monkeypatch.setenv('S3_OBJECT_TAGGING', str(tagging).lower())
+    result = upload_options('result', ChecksumAlgorithm='SHA256', Metadata={'sha256': 'ab'*32})
+    assert result['ChecksumAlgorithm'] == 'SHA256'
+    assert result['Metadata']['sha256'] == 'ab'*32
+    if tagging:
+        assert result['Tagging'] == 'kind=result'
+    else:
+        assert 'Tagging' not in result and result['Metadata']['kind'] == 'result'

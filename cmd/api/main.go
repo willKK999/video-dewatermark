@@ -64,7 +64,7 @@ func main() {
 	if maxPending < 1 {
 		panic("MAX_PENDING_JOBS must be positive")
 	}
-	srv := &control.Server{MaxPendingJobs: maxPending, DB: db, Redis: rd, Store: store, Signer: signer, Bucket: env("S3_BUCKET", "watermark"), Tokens: tokens, Pipeline: env("PIPELINE_VERSION", "mvp-1")}
+	srv := &control.Server{DisableObjectTagging: env("S3_OBJECT_TAGGING", "true") != "true", MaxPendingJobs: maxPending, DB: db, Redis: rd, Store: store, Signer: signer, Bucket: env("S3_BUCKET", "watermark"), Tokens: tokens, Pipeline: env("PIPELINE_VERSION", "mvp-1")}
 	go func() {
 		tick := time.NewTicker(time.Second)
 		defer tick.Stop()
@@ -84,7 +84,7 @@ func main() {
 			}
 		}
 	}()
-	httpServer := &http.Server{Addr: env("API_ADDR", ":8080"), Handler: srv.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
+	httpServer := &http.Server{Addr: env("API_ADDR", ":8080"), Handler: srv.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Minute, WriteTimeout: 10 * time.Minute, IdleTimeout: 60 * time.Second}
 	go func() {
 		<-ctx.Done()
 		c, cancel := context.WithTimeout(context.Background(), 10*time.Second)

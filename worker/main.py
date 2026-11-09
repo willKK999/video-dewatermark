@@ -12,6 +12,7 @@ from pathlib import Path
 import boto3
 import redis
 from botocore.config import Config
+from boto3.exceptions import S3UploadFailedError
 from botocore.exceptions import BotoCoreError, ClientError
 from . import store
 from .delivery import ack_after_miss, reclaim_batch
@@ -109,6 +110,15 @@ def object_store():
     )
 
 
+def upload_options(kind, **options):
+    """兼容不实现对象标签的存储；是否使用标签由部署能力明确配置。"""
+    if os.environ.get('S3_OBJECT_TAGGING', 'true').lower() == 'true':
+        options['Tagging'] = 'kind=' + kind
+    else:
+        options['Metadata'] = {**options.get('Metadata', {}), 'kind': kind}
+    return options
+
+
 def process(job, dsn, s3, bucket, workdir, engine):
     with (
         tempfile.TemporaryDirectory(prefix=job["id"] + "-", dir=workdir) as temp,
@@ -154,12 +164,9 @@ def process(job, dsn, s3, bucket, workdir, engine):
                 str(result_path),
                 bucket,
                 result_key,
-                ExtraArgs={
-                    "ContentType": "video/mp4",
-                    "Tagging": "kind=result",
-                    "ChecksumAlgorithm": "SHA256",
-                    "Metadata": {"sha256": sha256(result_path)},
-                },
+                ExtraArgs=upload_options('result', ContentType='video/mp4',
+                                         ChecksumAlgorithm='SHA256',
+                                         Metadata={'sha256': sha256(result_path)}),
                 Callback=lambda _: guard.check(),
             )
             verify_result_head(
@@ -172,19 +179,13 @@ def process(job, dsn, s3, bucket, workdir, engine):
                 str(root / "manifest.json"),
                 bucket,
                 prefix + "/manifest.json",
-                ExtraArgs={
-                    "ContentType": "application/json",
-                    "Tagging": "kind=intermediate",
-                },
+                ExtraArgs=upload_options('intermediate', ContentType='application/json'),
             )
             s3.upload_file(
                 str(root / "detections.json"),
                 bucket,
                 prefix + "/detections.json",
-                ExtraArgs={
-                    "ContentType": "application/json",
-                    "Tagging": "kind=intermediate",
-                },
+                ExtraArgs=upload_options('intermediate', ContentType='application/json'),
             )
             for mask in sorted((root / "masks").glob("*.png")):
                 guard.check()
@@ -192,10 +193,7 @@ def process(job, dsn, s3, bucket, workdir, engine):
                     str(mask),
                     bucket,
                     prefix + "/masks/" + mask.name,
-                    ExtraArgs={
-                        "ContentType": "image/png",
-                        "Tagging": "kind=intermediate",
-                    },
+                    ExtraArgs=upload_options('intermediate', ContentType='image/png'),
                 )
             timings["publish"] = round((time.monotonic() - started) * 1000)
             result.update(
@@ -213,7 +211,7 @@ def process(job, dsn, s3, bucket, workdir, engine):
             error = exc
             result_key = None
             result = None
-        except (BotoCoreError, ClientError, OSError) as exc:
+        except (BotoCoreError, ClientError, S3UploadFailedError, OSError) as exc:
             error = PipelineError(
                 "STORAGE_UNAVAILABLE", "storage or local IO failed", retryable=True
             )

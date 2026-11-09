@@ -21,18 +21,23 @@ import (
 )
 
 type Server struct {
-	DB             *pgxpool.Pool
-	Redis          *redis.Client
-	Store          *minio.Client
-	Signer         *minio.Client
-	Bucket         string
-	Tokens         map[string]string // bearer -> tenant, populated from secret configuration
-	Pipeline       string
-	MaxPendingJobs int
+	DB                   *pgxpool.Pool
+	Redis                *redis.Client
+	Store                *minio.Client
+	Signer               *minio.Client
+	Bucket               string
+	Tokens               map[string]string // bearer -> tenant, populated from secret configuration
+	Pipeline             string
+	MaxPendingJobs       int
+	DisableObjectTagging bool
 }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /", consolePage)
+	mux.HandleFunc("GET /v1/jobs", s.list)
+	mux.HandleFunc("PUT /v1/uploads/{id}/content", s.proxyUpload)
+	mux.HandleFunc("GET /v1/jobs/{id}/media/{kind}", s.media)
 	mux.HandleFunc("POST /v1/uploads", s.upload)
 	mux.HandleFunc("POST /v1/jobs", s.create)
 	mux.HandleFunc("GET /v1/jobs/{id}", s.get)
@@ -49,7 +54,9 @@ func (s *Server) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r.Header.Set("X-Request-ID", id("req_"))
 		w.Header().Set("X-Request-ID", r.Header.Get("X-Request-ID"))
-		if r.URL.Path == "/healthz" {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		if (r.URL.Path == "/" && r.Method == "GET") || r.URL.Path == "/healthz" {
 			mux.ServeHTTP(w, r)
 			return
 		}
@@ -99,7 +106,11 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 	// Sign Content-Type as well as the object key. Size is checked again with HEAD.
 	headers := http.Header{}
 	headers.Set("Content-Type", in.ContentType)
-	headers.Set("X-Amz-Tagging", "kind=intermediate")
+	if !s.DisableObjectTagging {
+		headers.Set("X-Amz-Tagging", "kind=intermediate")
+	} else {
+		headers.Set("X-Amz-Meta-Kind", "intermediate")
+	}
 	u, err := s.Signer.PresignHeader(r.Context(), http.MethodPut, s.Bucket, key, 15*time.Minute, url.Values{}, headers)
 	if err != nil {
 		fail(w, r, 503, "STORAGE_UNAVAILABLE", "cannot sign upload")
@@ -110,7 +121,11 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 		fail(w, r, 503, "DATABASE_UNAVAILABLE", "cannot create upload")
 		return
 	}
-	reply(w, 201, map[string]any{"upload_id": uid, "put_url": u.String(), "required_headers": map[string]string{"Content-Type": in.ContentType, "X-Amz-Tagging": "kind=intermediate"}, "expires_at": expires})
+	required := map[string]string{}
+	for key := range headers {
+		required[key] = headers.Get(key)
+	}
+	reply(w, 201, map[string]any{"upload_id": uid, "put_url": u.String(), "required_headers": required, "expires_at": expires})
 }
 func (s *Server) load(ctx context.Context, q interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
@@ -253,7 +268,7 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	}
 	jid := id("job_")
 	input := t + "/inputs/" + jid + "/source"
-	_, err = s.Store.CopyObject(ctx, minio.CopyDestOptions{Bucket: s.Bucket, Object: input, UserTags: map[string]string{"kind": "intermediate"}, ReplaceTags: true}, minio.CopySrcOptions{Bucket: s.Bucket, Object: source, MatchETag: info.ETag})
+	_, err = s.Store.CopyObject(ctx, s.inputCopyOptions(input), minio.CopySrcOptions{Bucket: s.Bucket, Object: source, MatchETag: info.ETag})
 	if err != nil {
 		fail(w, r, 503, "STORAGE_UNAVAILABLE", "cannot freeze input")
 		return
@@ -442,3 +457,12 @@ func (s *Server) Reap(ctx context.Context) error {
 	return tx.Commit(ctx)
 }
 func (s *Server) String() string { return fmt.Sprintf("pipeline=%s", s.Pipeline) }
+
+func (s *Server) inputCopyOptions(key string) minio.CopyDestOptions {
+	opts := minio.CopyDestOptions{Bucket: s.Bucket, Object: key}
+	if !s.DisableObjectTagging {
+		opts.UserTags = map[string]string{"kind": "intermediate"}
+		opts.ReplaceTags = true
+	}
+	return opts
+}

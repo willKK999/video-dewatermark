@@ -146,3 +146,40 @@ def test_mask_quality_detects_degradation():
     assert (
         not changed["identical"] and changed["ssim"] < 0.9 and changed["psnr_db"] < 30
     )
+
+
+def test_yolo_ignores_template(tmp_path, monkeypatch):
+    import worker.vision as vision
+
+    monkeypatch.setenv("DETECTOR", "yolo")
+    monkeypatch.setenv("TEMPLATE_PATH", str(tmp_path / "missing-template.png"))
+    monkeypatch.setenv("DETECT_PYTHON", "python")
+    monkeypatch.setenv("YOLO_WEIGHTS", "dedicated.pt")
+    image = tmp_path / "000000.png"
+    cv2.imwrite(str(image), np.zeros((100, 100, 3), dtype=np.uint8))
+
+    def detector_run(command, check):
+        (tmp_path / "detector-output.json").write_text(json.dumps([
+            dict(frame=0, box=[10, 10, 30, 30], confidence=.6)
+        ]))
+
+    monkeypatch.setattr(vision, "run", detector_run)
+    assert detect([image], [(0, 1)], {}, tmp_path)["hints"][0]["confidence"] == .6
+
+
+def test_yolo_quality_keeps_database_stage_compatible(tmp_path, monkeypatch):
+    import worker.pipeline as pipeline
+    source = generate(tmp_path, False, False)
+    root = tmp_path / 'work'
+    root.mkdir()
+    monkeypatch.setenv('DETECTOR', 'yolo')
+    def detections(files, scenes, options, root, check, **kwargs):
+        return dict(scenes=scenes, hints=[dict(frame=0, box=[20, 30, 62, 52], confidence=1)])
+    monkeypatch.setattr(pipeline.vision, 'detect', detections)
+    quality_calls = []
+    monkeypatch.setattr(pipeline.vision, 'residual_quality', lambda *args: quality_calls.append(True))
+    allowed = {'probe', 'detect', 'mask', 'inpaint', 'encode', 'publish'}
+    def stage(name):
+        assert name in allowed
+    _, _, timings = execute(source, root, {}, 'telea-dev', stage=stage)
+    assert quality_calls == [True] and 'quality' in timings
