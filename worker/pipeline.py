@@ -22,7 +22,8 @@ def execute(
 
     def step(name, operation):
         check()
-        stage(name)
+        if name != "quality":
+            stage(name)
         start = time.monotonic()
         try:
             return operation()
