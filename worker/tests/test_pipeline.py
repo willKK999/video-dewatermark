@@ -146,3 +146,22 @@ def test_mask_quality_detects_degradation():
     assert (
         not changed["identical"] and changed["ssim"] < 0.9 and changed["psnr_db"] < 30
     )
+
+
+def test_yolo_ignores_template(tmp_path, monkeypatch):
+    import worker.vision as vision
+
+    monkeypatch.setenv("DETECTOR", "yolo")
+    monkeypatch.setenv("TEMPLATE_PATH", str(tmp_path / "missing-template.png"))
+    monkeypatch.setenv("DETECT_PYTHON", "python")
+    monkeypatch.setenv("YOLO_WEIGHTS", "dedicated.pt")
+    image = tmp_path / "000000.png"
+    cv2.imwrite(str(image), np.zeros((100, 100, 3), dtype=np.uint8))
+
+    def detector_run(command, check):
+        (tmp_path / "detector-output.json").write_text(json.dumps([
+            dict(frame=0, box=[10, 10, 30, 30], confidence=.6)
+        ]))
+
+    monkeypatch.setattr(vision, "run", detector_run)
+    assert detect([image], [(0, 1)], {}, tmp_path)["hints"][0]["confidence"] == .6

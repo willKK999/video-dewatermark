@@ -12,9 +12,14 @@ ROOT = Path(__file__).resolve().parents[2]
 CATALOG = ROOT / "deploy" / "models.json"
 
 
-def test_shipped_catalog_blocks_production_startup():
-    with pytest.raises(ProvenanceError, match="UNRESOLVED|digest unresolved"):
-        validate_provenance(CATALOG)
+def test_catalog_pins_and_rejects_unresolved_assets(tmp_path):
+    catalog = validate_provenance(CATALOG)
+    required = next(m for m in catalog['models'] if m.get('phase') != 2)
+    required['assets'][0]['sha256'] = 'UNRESOLVED'
+    path = tmp_path / 'unresolved.json'
+    path.write_text(json.dumps(catalog))
+    with pytest.raises(ProvenanceError, match="digest unresolved"):
+        validate_provenance(path)
 
 
 def test_phase2_is_ignored_and_files_must_match(tmp_path):

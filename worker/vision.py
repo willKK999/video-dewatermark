@@ -8,6 +8,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from .process import PipelineError, run
+from .workflow import interpolated_box, bounded_mask, abrupt_area, setting
 
 
 def read(path, gray=False):
@@ -87,14 +88,20 @@ def shots(files, check=lambda: None):
     for i, f in enumerate(files):
         check()
         image = cv2.resize(read(f), (160, 90))
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         hist = cv2.calcHist([image], [0, 1], None, [16, 16], [0, 256, 0, 256])
         cv2.normalize(hist, hist)
-        if (
-            previous is not None
-            and cv2.compareHist(previous, hist, cv2.HISTCMP_BHATTACHARYYA) > 0.65
-        ):
-            cuts.append(i)
-        previous = hist
+        if previous is not None:
+            old_hist, old_gray = previous
+            distance = cv2.compareHist(old_hist, hist, cv2.HISTCMP_BHATTACHARYYA)
+            difference = np.abs(gray.astype(float)-old_gray)
+            delta = difference.mean()/255
+            changed = np.mean(difference > 32)
+            if distance > setting('SHOT_HIST_THRESHOLD', .5) or (
+                delta > setting('SHOT_PIXEL_THRESHOLD', .18) and changed > setting("SHOT_CHANGED_FRACTION", .5)
+            ):
+                cuts.append(i)
+        previous = hist, gray
     return list(zip(cuts, cuts[1:] + [len(files)]))
 
 
@@ -109,7 +116,7 @@ def detect(files, scenes, options, root, check=lambda: None, dense=False):
         )
     template_path = os.environ.get("TEMPLATE_PATH")
     detector = os.environ.get("DETECTOR")
-    template = read(template_path, True) if template_path else None
+    template = read(template_path, True) if template_path and detector != "yolo" else None
     if template is not None and template.std() < 2:
         raise PipelineError("INVALID_TEMPLATE", "template needs visible texture")
 
@@ -131,7 +138,10 @@ def detect(files, scenes, options, root, check=lambda: None, dense=False):
                 ],
                 check,
             )
-            for candidate in json.loads((root / "detector-output.json").read_text()):
+            candidates = json.loads((root / "detector-output.json").read_text())
+            if isinstance(candidates, dict):
+                raise PipelineError('DETECTION_UNCERTAIN', 'multiple plausible watermark tracks', review=True)
+            for candidate in candidates:
                 hints.setdefault(candidate["frame"], candidate)
         elif template is not None:
             th, tw = template.shape
@@ -153,7 +163,7 @@ def detect(files, scenes, options, root, check=lambda: None, dense=False):
 
     indices = set()
     for start, end in scenes:
-        indices.update(range(start, end, 1 if dense else 5))
+        indices.update(range(start, end, 1 if dense or detector == "yolo" else 5))
         indices.add(end - 1)
     sample(indices)
     missing = [
@@ -170,6 +180,12 @@ def detect(files, scenes, options, root, check=lambda: None, dense=False):
                 "a shot has no reliable detection; provide normalized-frame box prompts",
                 review=True,
             )
+    if detector == 'yolo':
+        for start, end in scenes:
+            observed = sorted(i for i in hints if start <= i < end)
+            positions = [start] + observed + [end-1]
+            if max((b-a for a, b in zip(positions, positions[1:])), default=0) > int(setting('DETECTION_MAX_GAP', 10)):
+                raise PipelineError('DETECTION_UNCERTAIN', 'watermark detection gap too long', review=True)
     image = read(files[0])
     h, w = image.shape[:2]
     for hint in hints.values():
@@ -226,7 +242,12 @@ def masks(root, files, detections, engine, check=lambda: None):
         mask = read(dest / f.name, True)
         if mask.shape != read(f).shape[:2] or not set(np.unique(mask)) <= {0, 255}:
             raise PipelineError("MASK_INVALID", "mask geometry or values differ")
-        mask = cv2.dilate(mask, np.ones((5, 5), np.uint8))
+        scene_hints = [p for p in detections['hints']
+                       if any(s <= i < e and s <= p['frame'] < e for s, e in detections['scenes'])]
+        if os.environ.get('DETECTOR') == 'yolo':
+            mask = bounded_mask(mask, interpolated_box(scene_hints, i))
+        else:
+            mask = cv2.dilate(mask, np.ones((5, 5), np.uint8))
         area = np.count_nonzero(mask) / mask.size
         # Conservative stop, rather than silently repairing an uncertain large region.
         if area > 0.2:
@@ -235,11 +256,7 @@ def masks(root, files, detections, engine, check=lambda: None):
             )
         if i in [s[0] for s in detections["scenes"]]:
             old_area = None
-        if (
-            old_area is not None
-            and min(area, old_area) > 0.005
-            and max(area, old_area) / min(area, old_area) > 4
-        ):
+        if abrupt_area(old_area, area):
             raise PipelineError(
                 "MASK_UNCERTAIN", "mask area changes abruptly", review=True
             )
@@ -390,3 +407,28 @@ def inpaint(root, files, scenes, engine, low_memory=False, check=lambda: None):
                 original[mask > 0] = repair[mask > 0]
                 cv2.imwrite(str(old), original)
             shutil.rmtree(window)
+
+
+def residual_quality(root, files, detections, check=lambda: None):
+    """独立复检输出；只统计与原水印轨迹相交的高置信残留。"""
+    if os.environ.get('DETECTOR') != 'yolo':
+        return
+    indices = sorted(set(np.linspace(0, len(files)-1, min(16, len(files)), dtype=int).tolist()))
+    (root / 'quality-indices.json').write_text(json.dumps(indices))
+    run([os.environ['DETECT_PYTHON'], str(Path(__file__).with_name('yolo_stage.py')),
+         '--frames', root / 'composite', '--output', root / 'quality-detections.json',
+         '--indices', root / 'quality-indices.json', '--weights', os.environ['YOLO_WEIGHTS'],
+         '--confidence', str(setting('RESIDUAL_CONFIDENCE', .65))], check)
+    candidates = json.loads((root / 'quality-detections.json').read_text())
+    from .yolo_stage import overlaps
+    count = 0
+    if isinstance(candidates, list):
+        for p in candidates:
+            scene = next((s, e) for s, e in detections['scenes'] if s <= p['frame'] < e)
+            hints = [h for h in detections['hints'] if scene[0] <= h['frame'] < scene[1]]
+            count += overlaps(p['box'], interpolated_box(hints, p['frame']))
+    uncertain = isinstance(candidates, dict) or count >= max(2, len(indices)*setting('RESIDUAL_FRACTION', .25))
+    (root / 'quality.json').write_text(json.dumps(dict(sample_count=len(indices), residual_count=count,
+                                                     needs_review=uncertain)))
+    if uncertain:
+        raise PipelineError('RESIDUAL_UNCERTAIN', 'persistent watermark evidence in output', review=True)
