@@ -8,6 +8,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from .process import PipelineError, run
+from .restoration import soft_composite, CleanReferences
 from .workflow import interpolated_box, bounded_mask, abrupt_area, setting
 
 
@@ -336,7 +337,12 @@ def inpaint(root, files, scenes, engine, low_memory=False, check=lambda: None):
             cv2.imwrite(str(dest / f.name), image)
         return
     size, overlap = (36, 8) if low_memory else (60, 12)
+    restoration_stats = []
     for scene_start, scene_end in scenes:
+        # 固定上限控制内存与 CPU 成本，参考始终来自同一镜头原图。
+        refs = np.unique(np.linspace(scene_start, scene_end-1, min(24, scene_end-scene_start), dtype=int))
+        references = CleanReferences([read(files[j]) for j in refs],
+                                     [read(root / "masks" / files[j].name, True) for j in refs])
         for index, (start, end) in enumerate(
             windows(scene_start, scene_end, size, overlap)
         ):
@@ -407,9 +413,11 @@ def inpaint(root, files, scenes, engine, low_memory=False, check=lambda: None):
                         )
                     weight = (j - start + 1) / (overlap + 1)
                     repair = cv2.addWeighted(repair, weight, previous, 1 - weight, 0)
-                original[mask > 0] = repair[mask > 0]
-                cv2.imwrite(str(old), original)
+                repair = references.restore(original, mask, repair)
+                cv2.imwrite(str(old), soft_composite(original, repair, mask))
             shutil.rmtree(window)
+        restoration_stats.append(dict(scene=[scene_start, scene_end], **references.stats))
+        (root / "restoration.json").write_text(json.dumps(restoration_stats))
 
 
 def residual_quality(root, files, detections, check=lambda: None):
