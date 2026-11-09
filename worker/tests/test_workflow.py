@@ -65,3 +65,24 @@ def test_shape_padding_preserves_background_between_characters():
     assert result[25, 17] == 255
     assert result[25, 40] == 0
     assert not bounded_mask(np.zeros_like(mask), [15, 15, 60, 35]).any()
+
+
+def test_yolo_samples_every_frame_and_rejects_long_blind_gap(tmp_path, monkeypatch):
+    import json
+    import pytest
+    import worker.vision as vision
+    from worker.process import PipelineError
+    monkeypatch.setenv('DETECTOR', 'yolo')
+    monkeypatch.setenv('DETECT_PYTHON', 'python')
+    monkeypatch.setenv('YOLO_WEIGHTS', 'local.pt')
+    files = [tmp_path / f'{i:06d}.png' for i in range(13)]
+    def fake_run(*args):
+        indices = json.loads((tmp_path / 'detect-indices.json').read_text())
+        assert indices == list(range(13))
+        (tmp_path / 'detector-output.json').write_text(json.dumps([
+            dict(frame=0, box=[2, 2, 10, 8], confidence=.8)
+        ]))
+    monkeypatch.setattr(vision, 'run', fake_run)
+    with pytest.raises(PipelineError) as exc:
+        vision.detect(files, [(0, 13)], {}, tmp_path)
+    assert exc.value.review and exc.value.code == 'DETECTION_UNCERTAIN'
