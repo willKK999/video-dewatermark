@@ -1,6 +1,6 @@
-# 动态移动视频去水印系统
+# 视频去水印系统
 
-依据《动态移动视频去水印系统—技术方案 V1.1》实现的首版工程。原文见 [SPEC-v1.1.md](docs/SPEC-v1.1.md)，原 DOCX 与 SHA-256 一并保留。提供 Go 控制面、PostgreSQL 状态/租约/事务发件箱、Redis Streams 分发、私有 S3 存储，以及分阶段 Python Worker。正式模型链路为检测 → SAM 2.1 Mask → ProPainter → FFmpeg；模型在独立 Python 进程运行，阶段结束释放显存。
+依据《视频去水印系统—技术方案 V1.1》实现的首版工程。原文见 [SPEC-v1.1.md](docs/SPEC-v1.1.md)，原 DOCX 与 SHA-256 一并保留。提供 Go 控制面、PostgreSQL 状态/租约/事务发件箱、Redis Streams 分发、私有 S3 存储，以及分阶段 Python Worker。正式模型链路为检测 → SAM 2.1 Mask → ProPainter → FFmpeg；模型在独立 Python 进程运行，阶段结束释放显存。
 
 当前仓库是两套 V1.1 实现合并后的**唯一代码路径**：云端已跑通的 API、`telea-dev` / `mvp-1-dev` 冒烟和 OpenAPI 作为底座；并行实现里的规格、模型来源清单和生产失败闭环融进同一套进程，没有第二套 `cmd/server` 或另一份 Worker。对比结论见下文「合并取舍」。CPU 工程闭环见 [验证记录](docs/validation.md)。SAM/ProPainter 适配代码和 GPU 候选镜像已提供，实际权重、4090 兼容性、画质与性能仍需按照 [GPU 发布与验收](docs/gpu-release.md) 实测。本仓库不宣称达到方案中的计划性能门槛，也没有下载多 GB 权重。
 

@@ -1,6 +1,6 @@
 {
   "metadata_checked_at": "2026-11-09",
-  "weights_downloaded": false,
+  "weights_downloaded": true,
   "models": [
     {
       "name": "sam2.1-small",
@@ -40,20 +40,20 @@
         {
           "file": "ProPainter.pth",
           "url": "https://github.com/sczhou/ProPainter/releases/download/v0.1.0/ProPainter.pth",
-          "sha256": "UNRESOLVED",
-          "note": "Official release metadata digest is null; no weights downloaded. Production blocked until independently verified."
+          "sha256": "12c070c4b48f374c91d8a2a17851140b85c159621080989f9e191bbc18bd6591",
+          "note": "从官方地址下载，已计算本机摘要并验证可加载；官方未提供独立摘要。"
         },
         {
           "file": "raft-things.pth",
           "url": "https://github.com/sczhou/ProPainter/releases/download/v0.1.0/raft-things.pth",
-          "sha256": "UNRESOLVED",
-          "note": "Official release metadata digest is null; no weights downloaded. Production blocked until independently verified."
+          "sha256": "fcfa4125d6418f4de95d84aec20a3c5f4e205101715a79f193243c186ac9a7e1",
+          "note": "从官方地址下载，已计算本机摘要并验证可加载；官方未提供独立摘要。"
         },
         {
           "file": "recurrent_flow_completion.pth",
           "url": "https://github.com/sczhou/ProPainter/releases/download/v0.1.0/recurrent_flow_completion.pth",
-          "sha256": "UNRESOLVED",
-          "note": "Official release metadata digest is null; no weights downloaded. Production blocked until independently verified."
+          "sha256": "22939a1a7900da878dbe1ccd011d646b1bfb30b8290039d8ff0e0c2fefbfd283",
+          "note": "从官方地址下载，已计算本机摘要并验证可加载；官方未提供独立摘要。"
         }
       ]
     },
