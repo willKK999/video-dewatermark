@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.env
+work/
+*.mp4
+*.mov
+*.pt
+*.pth
+*.safetensors
+models/vendor/
+models/weights/
+.ruff_cache/

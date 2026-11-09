@@ -1,0 +1,18 @@
+# syntax=docker/dockerfile:1
+FROM golang:1.24.9-bookworm AS build
+WORKDIR /src
+ARG GOPROXY="https://proxy.golang.org|direct"
+COPY go.mod go.sum ./
+RUN --mount=type=secret,id=proxy_ca,required=true SSL_CERT_FILE=/run/secrets/proxy_ca go mod download
+COPY cmd ./cmd
+COPY internal ./internal
+RUN CGO_ENABLED=0 go build -trimpath -o /api ./cmd/api
+FROM debian:bookworm-slim
+RUN groupadd -g 10001 app && useradd -u 10001 -g app app
+WORKDIR /app
+COPY --from=build /api /app/api
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY migrations ./migrations
+USER 10001
+EXPOSE 8080
+ENTRYPOINT ["/app/api"]

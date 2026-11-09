@@ -1,0 +1,30 @@
+# syntax=docker/dockerfile:1
+# Candidate baseline: validate on the intended 4090 before release.
+FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+ENV DEBIAN_FRONTEND=noninteractive PIP_DISABLE_PIP_VERSION_CHECK=1
+RUN --mount=type=secret,id=proxy_ca,required=true \
+    apt-get update && apt-get install -y --no-install-recommends \
+    python3.10 python3.10-venv python3-pip ffmpeg git build-essential libgomp1 ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN python3.10 -m venv /opt/worker && python3.10 -m venv /opt/track && python3.10 -m venv /opt/inpaint
+WORKDIR /app
+COPY worker/requirements.txt /app/requirements.txt
+RUN --mount=type=secret,id=proxy_ca,required=true PIP_CERT=/run/secrets/proxy_ca /opt/worker/bin/pip install -r requirements.txt
+COPY deploy/requirements-gpu.lock /app/requirements-gpu.lock
+RUN --mount=type=secret,id=proxy_ca,required=true \
+    PIP_CERT=/run/secrets/proxy_ca /opt/track/bin/pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124 && \
+    PIP_CERT=/run/secrets/proxy_ca /opt/inpaint/bin/pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124 && \
+    PIP_CERT=/run/secrets/proxy_ca /opt/track/bin/pip install --require-hashes -r requirements-gpu.lock && \
+    PIP_CERT=/run/secrets/proxy_ca /opt/inpaint/bin/pip install --require-hashes -r requirements-gpu.lock
+# Supply the reviewed upstream repositories + locked weights as read-only /models
+# at runtime. Install the reviewed SAM package offline after preparing the image
+# in the GPU release workflow; see docs/gpu-release.md.
+COPY worker /app/worker
+ENV TRACK_PYTHON=/opt/track/bin/python INPAINT_PYTHON=/opt/inpaint/bin/python \
+    DETECT_PYTHON=/opt/track/bin/python SAM_ROOT=/models/sam2 \
+    PROPAINTER_ROOT=/models/ProPainter SAM_CHECKPOINT=/models/sam2/checkpoints/sam2.1_hiera_small.pt \
+    SAM_CONFIG=configs/sam2.1/sam2.1_hiera_s.yaml MODEL_MANIFEST=/models/model-lock.json \
+    PYTHONPATH=/models/sam2:/app PATH=/opt/worker/bin:$PATH \
+    INPAINT_ENGINE=propainter PIPELINE_VERSION=mvp-1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 WORK_DIR=/work
+RUN useradd -u 10001 app && mkdir /work && chown app /work
+USER 10001
+CMD ["python", "-m", "worker.main"]

@@ -1,0 +1,155 @@
+openapi: 3.0.3
+info:
+  title: 动态移动视频去水印 API
+  version: mvp-1
+servers:
+  - url: http://localhost:8080/v1
+security:
+  - bearerAuth: []
+paths:
+  /uploads:
+    post:
+      summary: 申请私有对象上传地址
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [filename, size_bytes, content_type]
+              properties:
+                filename: {type: string, maxLength: 255}
+                size_bytes: {type: integer, minimum: 1, maximum: 209715200}
+                content_type: {type: string, enum: [video/mp4, video/quicktime]}
+      responses:
+        '201':
+          description: 客户端按 required_headers 直接 PUT 到 put_url
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [upload_id, put_url, required_headers, expires_at]
+                properties:
+                  upload_id: {type: string}
+                  put_url: {type: string, format: uri}
+                  required_headers: {type: object, additionalProperties: {type: string}}
+                  expires_at: {type: string, format: date-time}
+        default: {$ref: '#/components/responses/Error'}
+  /jobs:
+    post:
+      summary: 创建异步处理任务（相同租户、同键同体返回原任务）
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: true
+          schema: {type: string, maxLength: 200}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [upload_id]
+              properties:
+                upload_id: {type: string}
+                options: {$ref: '#/components/schemas/Options'}
+      responses:
+        '202': {$ref: '#/components/responses/Job'}
+        '409': {description: 同键请求体不一致}
+        default: {$ref: '#/components/responses/Error'}
+  /jobs/{id}:
+    parameters:
+      - {$ref: '#/components/parameters/JobID'}
+    get:
+      summary: 查询状态；成功结果生成十分钟有效的下载链接
+      responses:
+        '200': {$ref: '#/components/responses/Job'}
+        default: {$ref: '#/components/responses/Error'}
+  /jobs/{id}/cancel:
+    parameters:
+      - {$ref: '#/components/parameters/JobID'}
+    post:
+      summary: 发起取消；重复取消返回已有状态
+      responses:
+        '202': {$ref: '#/components/responses/Job'}
+        '409': {description: 已进入不可取消终态}
+        default: {$ref: '#/components/responses/Error'}
+components:
+  securitySchemes:
+    bearerAuth: {type: http, scheme: bearer}
+  parameters:
+    JobID: {in: path, name: id, required: true, schema: {type: string}}
+  responses:
+    Job:
+      description: 任务状态；异步失败仍返回 HTTP 200，查看 status 和 error
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Job'}
+    Error:
+      description: 400 参数、401 鉴权、404 无权/不存在、409 冲突、413 超限、422 上传无效、503 暂不可用
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error, request_id]
+            properties:
+              request_id: {type: string}
+              error: {$ref: '#/components/schemas/Error'}
+  schemas:
+    Error:
+      type: object
+      required: [code, message, retryable]
+      properties:
+        code: {type: string}
+        message: {type: string}
+        retryable: {type: boolean}
+    Options:
+      type: object
+      additionalProperties: false
+      properties:
+        max_short_edge: {type: integer, enum: [720, 540], default: 720}
+        allow_downgrade: {type: boolean, default: false}
+        prompts:
+          type: array
+          description: 归一视频中从0起的帧号和像素框；复核重跑需创建新任务
+          items:
+            type: object
+            required: [frame, box]
+            properties:
+              frame: {type: integer, minimum: 0, maximum: 899}
+              box:
+                type: array
+                minItems: 4
+                maxItems: 4
+                items: {type: number, minimum: 0, maximum: 1280}
+    Job:
+      type: object
+      required: [id, status, stage, attempt, pipeline_version, created_at, updated_at, result, error]
+      properties:
+        id: {type: string}
+        status: {type: string, enum: [QUEUED, RUNNING, SUCCEEDED, FAILED, NEEDS_REVIEW, CANCEL_REQUESTED, CANCELED]}
+        stage: {type: string, nullable: true, enum: [probe, detect, mask, inpaint, encode, publish, null]}
+        attempt: {type: integer, minimum: 0, maximum: 3}
+        pipeline_version: {type: string}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        result:
+          type: object
+          nullable: true
+          properties:
+            expired: {type: boolean}
+            download_url: {type: string, format: uri}
+            expires_at: {type: string, format: date-time}
+            width: {type: integer}
+            height: {type: integer}
+            duration_ms: {type: integer}
+            frame_count: {type: integer}
+            fps: {type: number}
+            engine: {type: string}
+            downgraded: {type: boolean}
+        error:
+          nullable: true
+          allOf:
+            - {$ref: '#/components/schemas/Error'}

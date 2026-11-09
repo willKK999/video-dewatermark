@@ -1,0 +1,80 @@
+name: watermark
+services:
+  postgres:
+    image: postgres:16.6-alpine@sha256:1d04b9ba1d4996401f2552b51beda8187f175c0645c091e4781134fc9c9a3eef
+    environment:
+      POSTGRES_USER: watermark
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-watermark-local-only}
+      POSTGRES_DB: watermark
+    ports: ['127.0.0.1:5432:5432']
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U watermark']
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  redis:
+    image: redis:7.4.1-alpine@sha256:c1e88455c85225310bbea54816e9c3f4b5295815e6dbf80c34d40afc6df28275
+    command: ['redis-server', '--appendonly', 'yes']
+    ports: ['127.0.0.1:6379:6379']
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  minio:
+    image: quay.io/minio/minio:RELEASE.2024-11-07T00-52-20Z
+    command: ['server', '/data', '--console-address', ':9001']
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-watermark-local}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-watermark-local-secret}
+    ports: ['127.0.0.1:9000:9000', '127.0.0.1:9001:9001']
+    volumes: [objects:/data]
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:9000/minio/health/live']
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  api:
+    profiles: [app]
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.api
+      secrets: [proxy_ca]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://watermark:${POSTGRES_PASSWORD:-watermark-local-only}@postgres:5432/watermark?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT: minio:9000
+      AUTO_MIGRATE: 'true'
+    ports: ['127.0.0.1:8080:8080']
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      minio: {condition: service_healthy}
+  worker-dev:
+    profiles: [dev]
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.worker-dev
+      secrets: [proxy_ca]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://watermark:${POSTGRES_PASSWORD:-watermark-local-only}@postgres:5432/watermark?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT: minio:9000
+      INPAINT_ENGINE: telea-dev
+      PIPELINE_VERSION: mvp-1-dev
+      WORK_DIR: /work
+    volumes: [gpuwork:/work]
+    depends_on:
+      api: {condition: service_started}
+volumes:
+  pgdata:
+  redisdata:
+  objects:
+  gpuwork:
+secrets:
+  proxy_ca:
+    file: ${BUILD_CA_BUNDLE:-/etc/ssl/certs/ca-certificates.crt}
