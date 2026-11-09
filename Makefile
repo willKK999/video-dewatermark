@@ -6,7 +6,7 @@ build:
 	$(GO) build -o work/api ./cmd/api
 test:
 	$(GO) test ./...
-	$(PYTHON) -m pytest worker/tests/test_pipeline.py -q
+	INTEGRATION= $(PYTHON) -m pytest worker/tests -q
 infra:
 	docker compose up -d postgres redis minio
 api:

@@ -14,12 +14,22 @@ import redis
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from . import store
+from .delivery import ack_after_miss, reclaim_batch
 from .pipeline import execute
 from .process import LeaseLost, PipelineError, run
+from .provenance import assert_catalog_locked, validate_provenance
 from .vision import verify_models, sha256
 
 log = logging.getLogger("worker")
 stop = threading.Event()
+
+
+def verify_result_head(head, size, digest):
+    meta = {
+        str(key).lower(): value for key, value in (head.get("Metadata") or {}).items()
+    }
+    if head.get("ContentLength") != size or meta.get("sha256") != digest:
+        raise PipelineError("OUTPUT_INVALID", "uploaded result verification failed")
 
 
 class Guard:
@@ -152,11 +162,11 @@ def process(job, dsn, s3, bucket, workdir, engine):
                 },
                 Callback=lambda _: guard.check(),
             )
-            if (
-                s3.head_object(Bucket=bucket, Key=result_key)["ContentLength"]
-                != result_path.stat().st_size
-            ):
-                raise PipelineError("OUTPUT_INVALID", "uploaded result length differs")
+            verify_result_head(
+                s3.head_object(Bucket=bucket, Key=result_key),
+                result_path.stat().st_size,
+                sha256(result_path),
+            )
             # Hashes bind local frame/mask indices; the attempt prefix fences all artifacts.
             s3.upload_file(
                 str(root / "manifest.json"),
@@ -269,15 +279,24 @@ def main():
         raise ValueError("unknown inpaint engine")
     if engine == "telea-dev" and not version.endswith("-dev"):
         raise ValueError("CPU smoke engine requires a distinct -dev pipeline version")
+    if engine == "propainter" and version.endswith("-dev"):
+        raise ValueError("production engine cannot use a -dev pipeline version")
     run(["ffprobe", "-version"])
-    encoders = run(["ffmpeg", "-encoders"]).decode()
-    if "libx264" not in encoders:
-        raise RuntimeError("FFmpeg H.264 encoder missing")
-    model_hash = (
-        verify_models(os.environ["MODEL_MANIFEST"])
-        if engine == "propainter"
-        else "dev-no-models"
-    )
+    encoders = set(run(["ffmpeg", "-encoders"]).decode().split())
+    if "libx264" not in encoders or "aac" not in encoders:
+        raise RuntimeError("FFmpeg H.264 or AAC encoder missing")
+    if engine == "propainter":
+        # Official catalog first. An operator lock cannot paper over UNRESOLVED digests.
+        catalog = validate_provenance(
+            os.getenv("MODEL_CATALOG", "deploy/models.json"),
+            os.getenv("WEIGHTS_DIR"),
+        )
+        model_hash = verify_models(os.environ["MODEL_MANIFEST"])
+        assert_catalog_locked(
+            catalog, json.loads(Path(os.environ["MODEL_MANIFEST"]).read_text())
+        )
+    else:
+        model_hash = "dev-no-models"
     os.environ["MODEL_LOCK_HASH"] = model_hash
     log.info(
         json.dumps(
@@ -318,6 +337,7 @@ def main():
     except redis.ResponseError as e:
         if "BUSYGROUP" not in str(e):
             raise
+    image_digest = os.getenv("IMAGE_DIGEST", "unrecorded")
     config = store.config_hash(
         {
             "pipeline": version,
@@ -327,30 +347,47 @@ def main():
             "template_sha256": sha256(os.environ["TEMPLATE_PATH"])
             if os.getenv("TEMPLATE_PATH")
             else None,
-            "image": os.getenv("IMAGE_DIGEST", "unrecorded"),
+            "image": image_digest,
             "fp16": os.getenv("PROPAINTER_FP16", "false"),
             "bf16": os.getenv("SAM_BF16", "false"),
         }
     )
+    reclaim_cursor = "0-0"
     while not stop.is_set():
         try:
             reclaimed = queue.xautoclaim(
-                "jobs", group, consumer, min_idle_time=60000, start_id="0-0", count=1
+                "jobs",
+                group,
+                consumer,
+                min_idle_time=60000,
+                start_id=reclaim_cursor,
+                count=1,
             )
-            messages = reclaimed[1]
+            reclaim_cursor, messages = reclaim_batch(reclaim_cursor, reclaimed)
             if not messages:
                 streams = queue.xreadgroup(
                     group, consumer, {"jobs": ">"}, count=1, block=1000
                 )
                 messages = streams[0][1] if streams else []
             for mid, fields in messages:
+                jid = fields.get("job_id", "")
                 job = store.claim(
-                    dsn, fields.get("job_id", ""), consumer, version, config
+                    dsn,
+                    jid,
+                    consumer,
+                    version,
+                    config,
+                    image_digest,
+                    {"pipeline_version": version, "engine": engine},
                 )
-                # A version-mismatched message can be ACKed: the outbox reconciler republishes it.
-                queue.xack("jobs", group, mid)
                 if job:
+                    queue.xack("jobs", group, mid)
                     process(job, dsn, s3, bucket, workdir, engine)
+                    continue
+                # Another pipeline version may be waiting for its own worker.
+                row = store.job_delivery_row(dsn, jid)
+                if ack_after_miss(row, version):
+                    queue.xack("jobs", group, mid)
         except Exception as exc:
             log.error("worker loop failed: %s", type(exc).__name__)
             stop.wait(2)

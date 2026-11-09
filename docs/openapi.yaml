@@ -88,7 +88,7 @@ components:
         application/json:
           schema: {$ref: '#/components/schemas/Job'}
     Error:
-      description: 400 参数、401 鉴权、404 无权/不存在、409 冲突、413 超限、422 上传无效、503 暂不可用
+      description: 400 参数、401 鉴权、404 无权/不存在、409 冲突、413 超限、422 上传无效、429 配额、503 暂不可用
       content:
         application/json:
           schema:

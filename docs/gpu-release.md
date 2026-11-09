@@ -2,6 +2,8 @@
 
 GPU 镜像是候选配置，当前环境没有 NVIDIA GPU，尚未验证 SAM/ProPainter 的兼容性、显存与吞吐。`telea-dev` 只用于工程冒烟，不计入正式效果验收。
 
+正式进程启动时先读 [deploy/models.json](../deploy/models.json)。ProPainter v0.1.0 三项权重在官方 release metadata 里没有 digest，清单写为 `UNRESOLVED`。在有权操作员离线核实并填入 SHA-256 之前，`INPAINT_ENGINE=propainter` 直接退出，不消费队列。`telea-dev` 不能搭配不带 `-dev` 后缀的流水线版本，因此也不能顶替 `mvp-1`。来源说明见 [MODEL-PROVENANCE.md](MODEL-PROVENANCE.md)。操作员 lock 必须覆盖清单中每一个已公布 digest，包括 SAM 2.1 Tiny。
+
 ## 模型准备
 
 在可信构建机取得并审查官方源码，固定完整 Git commit：
@@ -17,6 +19,7 @@ GPU 镜像是候选配置，当前环境没有 NVIDIA GPU，尚未验证 SAM/Pro
 ```
 /models/sam2/                   # 完整 Git checkout（含 .git，干净的已提交源码）
 /models/sam2/checkpoints/sam2.1_hiera_small.pt
+/models/sam2/checkpoints/sam2.1_hiera_tiny.pt
 /models/ProPainter/             # 完整 Git checkout
 /models/ProPainter/weights/{ProPainter,raft-things,recurrent_flow_completion}.pth
 /models/model-lock.json
@@ -28,6 +31,7 @@ GPU 镜像是候选配置，当前环境没有 NVIDIA GPU，尚未验证 SAM/Pro
 python scripts/lock_models.py \
   --repo /models/sam2 --repo /models/ProPainter \
   --file /models/sam2/checkpoints/sam2.1_hiera_small.pt \
+  --file /models/sam2/checkpoints/sam2.1_hiera_tiny.pt \
   --file /models/ProPainter/weights/ProPainter.pth \
   --file /models/ProPainter/weights/raft-things.pth \
   --file /models/ProPainter/weights/recurrent_flow_completion.pth \
