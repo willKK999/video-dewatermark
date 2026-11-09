@@ -55,3 +55,13 @@ def test_residual_requires_persistent_overlapping_evidence(tmp_path, monkeypatch
     for p in candidates:
         p['box'] = [100, 100, 200, 120]  # 独立字幕不计入原水印残留
     vision.residual_quality(tmp_path, files, detections)
+
+
+def test_shape_padding_preserves_background_between_characters():
+    mask = np.zeros((100, 100), np.uint8)
+    mask[20:30, 20:25] = 255
+    mask[20:30, 50:55] = 255
+    result = bounded_mask(mask, [15, 15, 60, 35])
+    assert result[25, 17] == 255
+    assert result[25, 40] == 0
+    assert not bounded_mask(np.zeros_like(mask), [15, 15, 60, 35]).any()

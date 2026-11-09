@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 import torch
 from sam2.build_sam import build_sam2_video_predictor
+from workflow import expand_box
 
 
 def main():
@@ -37,12 +38,14 @@ def main():
                     video_path=tmp, offload_video_to_cpu=True, offload_state_to_cpu=True
                 )
                 hints = [p for p in detections["hints"] if start <= p["frame"] < end]
+                image = cv2.imread(str(root / 'frames' / f'{start:06d}.png'))
+                height, width = image.shape[:2]
                 for p in hints:
                     predictor.add_new_points_or_box(
                         state,
                         frame_idx=p["frame"] - start,
                         obj_id=1,
-                        box=np.array(p["box"], dtype=np.float32),
+                        box=np.array(expand_box(p["box"], width, height), dtype=np.float32),
                     )
                 first = min(p["frame"] - start for p in hints)
                 for reverse in [False, True]:

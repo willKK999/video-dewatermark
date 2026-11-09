@@ -245,6 +245,8 @@ def masks(root, files, detections, engine, check=lambda: None):
         scene_hints = [p for p in detections['hints']
                        if any(s <= i < e and s <= p['frame'] < e for s, e in detections['scenes'])]
         if os.environ.get('DETECTOR') == 'yolo':
+            if not np.any(mask):
+                raise PipelineError('TRACKING_DRIFT', 'empty SAM watermark segmentation', review=True)
             mask = bounded_mask(mask, interpolated_box(scene_hints, i))
         else:
             mask = cv2.dilate(mask, np.ones((5, 5), np.uint8))

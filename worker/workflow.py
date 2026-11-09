@@ -26,11 +26,15 @@ def bounded_mask(mask, box):
     x1, y1, x2, y2 = expand_box(box, w, h)
     region = np.zeros_like(mask)
     region[int(y1):int(np.ceil(y2)), int(x1):int(np.ceil(x2))] = 255
-    # 检测框是覆盖下限；SAM 提供框附近的形状细节。
-    radius = max(1, int(round(min(w, h)*setting('MASK_PAD_RATIO', .004))))
-    grown = cv2.dilate(mask, np.ones((radius*2+1, radius*2+1), np.uint8))
-    outer = cv2.dilate(region, np.ones((radius*2+1, radius*2+1), np.uint8))
-    return cv2.bitwise_or(cv2.bitwise_and(grown, outer), region)
+    # 只外扩分割形状，保留字间及图标周围的真实背景。
+    radius = max(int(setting('MASK_PAD_MIN', 3)),
+                 int(round(min(w, h)*setting('MASK_PAD_RATIO', .004))),
+                 int(round((box[3]-box[1])*setting('MASK_PAD_BOX_RATIO', .12))))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius*2+1, radius*2+1))
+    grown = cv2.dilate(mask, kernel)
+    outer = cv2.dilate(region, kernel)
+    return cv2.bitwise_and(grown, outer)
+
 
 
 def abrupt_area(previous, area):
