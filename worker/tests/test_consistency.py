@@ -83,3 +83,16 @@ def test_result_head_requires_length_and_sha256():
     assert exc.value.code == "OUTPUT_INVALID"
     with pytest.raises(PipelineError):
         verify_result_head({"ContentLength": 3, "Metadata": {"Sha256": "abcd"}}, 4, "abcd")
+
+
+@pytest.mark.parametrize('tagging', [True, False])
+def test_storage_capability_preserves_integrity_metadata(monkeypatch, tagging):
+    from worker.main import upload_options
+    monkeypatch.setenv('S3_OBJECT_TAGGING', str(tagging).lower())
+    result = upload_options('result', ChecksumAlgorithm='SHA256', Metadata={'sha256': 'ab'*32})
+    assert result['ChecksumAlgorithm'] == 'SHA256'
+    assert result['Metadata']['sha256'] == 'ab'*32
+    if tagging:
+        assert result['Tagging'] == 'kind=result'
+    else:
+        assert 'Tagging' not in result and result['Metadata']['kind'] == 'result'
