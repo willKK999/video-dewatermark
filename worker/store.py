@@ -10,10 +10,27 @@ from psycopg.types.json import Jsonb
 
 
 def connect(dsn):
-    return psycopg.connect(dsn, row_factory=dict_row, connect_timeout=5)
+    conn = psycopg.connect(
+        dsn,
+        row_factory=dict_row,
+        connect_timeout=5,
+        client_encoding="utf8",
+    )
+    # LOCAL applies only to this transaction, including the statements below.
+    conn.execute("SET LOCAL statement_timeout = '15s'")
+    conn.execute("SET LOCAL lock_timeout = '5s'")
+    return conn
 
 
-def claim(dsn, jid, worker, version, config_hash):
+def claim(
+    dsn,
+    jid,
+    worker,
+    version,
+    config_hash,
+    image_digest="unrecorded",
+    model_versions=None,
+):
     token = secrets.token_hex(24)
     with connect(dsn) as db:
         job = db.execute(
@@ -40,10 +57,26 @@ def claim(dsn, jid, worker, version, config_hash):
                 json.dumps(job["execution_config"], sort_keys=True).encode()
             ).hexdigest()
             db.execute(
-                "INSERT INTO attempts(job_id,attempt_no,worker_id,config_hash) VALUES(%s,%s,%s,%s)",
-                (jid, job["attempt"], worker, job["config_hash"]),
+                """INSERT INTO attempts(job_id,attempt_no,worker_id,config_hash,image_digest,model_versions)
+                VALUES(%s,%s,%s,%s,%s,%s)""",
+                (
+                    jid,
+                    job["attempt"],
+                    worker,
+                    job["config_hash"],
+                    image_digest,
+                    Jsonb(model_versions or {}),
+                ),
             )
         return job
+
+
+def job_delivery_row(dsn, jid):
+    with connect(dsn) as db:
+        return db.execute(
+            "SELECT status, pipeline_version FROM jobs WHERE id=%s",
+            (jid,),
+        ).fetchone()
 
 
 def heartbeat(dsn, job):

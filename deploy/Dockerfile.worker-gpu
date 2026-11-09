@@ -19,10 +19,12 @@ RUN --mount=type=secret,id=proxy_ca,required=true \
 # at runtime. Install the reviewed SAM package offline after preparing the image
 # in the GPU release workflow; see docs/gpu-release.md.
 COPY worker /app/worker
+COPY deploy/models.json /app/deploy/models.json
 ENV TRACK_PYTHON=/opt/track/bin/python INPAINT_PYTHON=/opt/inpaint/bin/python \
     DETECT_PYTHON=/opt/track/bin/python SAM_ROOT=/models/sam2 \
     PROPAINTER_ROOT=/models/ProPainter SAM_CHECKPOINT=/models/sam2/checkpoints/sam2.1_hiera_small.pt \
     SAM_CONFIG=configs/sam2.1/sam2.1_hiera_s.yaml MODEL_MANIFEST=/models/model-lock.json \
+    MODEL_CATALOG=/app/deploy/models.json \
     PYTHONPATH=/models/sam2:/app PATH=/opt/worker/bin:$PATH \
     INPAINT_ENGINE=propainter PIPELINE_VERSION=mvp-1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 WORK_DIR=/work
 RUN useradd -u 10001 app && mkdir /work && chown app /work

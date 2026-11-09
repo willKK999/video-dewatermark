@@ -53,6 +53,7 @@ services:
       postgres: {condition: service_healthy}
       redis: {condition: service_healthy}
       minio: {condition: service_healthy}
+  # 仅 telea-dev。不要让 propainter Worker 同时消费这条 Redis 流。
   worker-dev:
     profiles: [dev]
     build:

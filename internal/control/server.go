@@ -310,18 +310,27 @@ func (s *Server) cancel(w http.ResponseWriter, r *http.Request) {
 		fail(w, r, 503, "DATABASE_UNAVAILABLE", "cannot cancel")
 		return
 	}
+	changed := true
 	switch status {
 	case "QUEUED":
 		status = "CANCELED"
 	case "RUNNING":
 		status = "CANCEL_REQUESTED"
 	case "CANCEL_REQUESTED", "CANCELED":
+		// Repeat cancel returns the current row and must not rewrite a terminal state.
+		changed = false
 	default:
 		fail(w, r, 409, "NOT_CANCELABLE", "job is terminal")
 		return
 	}
-	_, err = tx.Exec(ctx, `UPDATE jobs SET status=$3,updated_at=now(),stage=CASE WHEN $3='CANCELED' THEN NULL ELSE stage END WHERE id=$1 AND tenant_id=$2`, jid, t, status)
-	if err != nil || tx.Commit(ctx) != nil {
+	if changed {
+		_, err = tx.Exec(ctx, `UPDATE jobs SET status=$3,updated_at=now(),stage=CASE WHEN $3='CANCELED' THEN NULL ELSE stage END WHERE id=$1 AND tenant_id=$2`, jid, t, status)
+		if err != nil {
+			fail(w, r, 503, "DATABASE_UNAVAILABLE", "cannot commit cancellation")
+			return
+		}
+	}
+	if tx.Commit(ctx) != nil {
 		fail(w, r, 503, "DATABASE_UNAVAILABLE", "cannot commit cancellation")
 		return
 	}

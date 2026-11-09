@@ -31,10 +31,7 @@ func main() {
 	defer db.Close()
 	must(db.Ping(ctx))
 	if env("AUTO_MIGRATE", "false") == "true" {
-		sql, e := os.ReadFile("migrations/001_init.sql")
-		must(e)
-		_, e = db.Exec(ctx, string(sql))
-		must(e)
+		must(control.ApplyMigrations(ctx, db, "migrations"))
 	}
 	tokens := map[string]string{}
 	must(json.Unmarshal([]byte(os.Getenv("API_TOKENS")), &tokens))

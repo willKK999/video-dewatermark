@@ -11,3 +11,4 @@ work/
 models/vendor/
 models/weights/
 .ruff_cache/
+.codex-out/

@@ -1,0 +1,69 @@
+{
+  "metadata_checked_at": "2026-11-09",
+  "weights_downloaded": false,
+  "models": [
+    {
+      "name": "sam2.1-small",
+      "source_url": "https://github.com/facebookresearch/sam2",
+      "source_revision": "2b90b9f5ceec907a1c18123530e92e794ad901a4",
+      "hf_revision": "ee5bba1d82bb8749febdf90f45e84b687142ba03",
+      "metadata_url": "https://huggingface.co/api/models/facebook/sam2.1-hiera-small?blobs=true",
+      "assets": [
+        {
+          "file": "sam2.1_hiera_small.pt",
+          "url": "https://huggingface.co/facebook/sam2.1-hiera-small/resolve/ee5bba1d82bb8749febdf90f45e84b687142ba03/sam2.1_hiera_small.pt",
+          "sha256": "6d1aa6f30de5c92224f8172114de081d104bbd23dd9dc5c58996f0cad5dc4d38"
+        }
+      ]
+    },
+    {
+      "name": "sam2.1-tiny",
+      "source_url": "https://github.com/facebookresearch/sam2",
+      "source_revision": "2b90b9f5ceec907a1c18123530e92e794ad901a4",
+      "hf_revision": "de431c4043854a71d8101e17995dfe596bf101a5",
+      "metadata_url": "https://huggingface.co/api/models/facebook/sam2.1-hiera-tiny?blobs=true",
+      "assets": [
+        {
+          "file": "sam2.1_hiera_tiny.pt",
+          "url": "https://huggingface.co/facebook/sam2.1-hiera-tiny/resolve/de431c4043854a71d8101e17995dfe596bf101a5/sam2.1_hiera_tiny.pt",
+          "sha256": "7402e0d864fa82708a20fbd15bc84245c2f26dff0eb43a4b5b93452deb34be69"
+        }
+      ]
+    },
+    {
+      "name": "ProPainter",
+      "source_url": "https://github.com/sczhou/ProPainter",
+      "source_revision": "326782529a63d997cab80ab21439b92ed422b3d3",
+      "release": "v0.1.0",
+      "metadata_url": "https://api.github.com/repos/sczhou/ProPainter/releases/tags/v0.1.0",
+      "assets": [
+        {
+          "file": "ProPainter.pth",
+          "url": "https://github.com/sczhou/ProPainter/releases/download/v0.1.0/ProPainter.pth",
+          "sha256": "UNRESOLVED",
+          "note": "Official release metadata digest is null; no weights downloaded. Production blocked until independently verified."
+        },
+        {
+          "file": "raft-things.pth",
+          "url": "https://github.com/sczhou/ProPainter/releases/download/v0.1.0/raft-things.pth",
+          "sha256": "UNRESOLVED",
+          "note": "Official release metadata digest is null; no weights downloaded. Production blocked until independently verified."
+        },
+        {
+          "file": "recurrent_flow_completion.pth",
+          "url": "https://github.com/sczhou/ProPainter/releases/download/v0.1.0/recurrent_flow_completion.pth",
+          "sha256": "UNRESOLVED",
+          "note": "Official release metadata digest is null; no weights downloaded. Production blocked until independently verified."
+        }
+      ]
+    },
+    {
+      "name": "DiffuEraser",
+      "phase": 2,
+      "source_url": "https://github.com/lixiaowen-xw/DiffuEraser",
+      "weights_url": "https://huggingface.co/lixiaowen/diffuEraser/tree/main",
+      "source_revision": "UNRESOLVED",
+      "assets": []
+    }
+  ]
+}
