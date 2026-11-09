@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 import cv2
 import numpy as np
@@ -19,9 +20,13 @@ def main():
     root = Path(args.root)
     detections = json.loads((root / "detections.json").read_text())
     torch.cuda.reset_peak_memory_stats()
+    started = time.perf_counter()
     predictor = build_sam2_video_predictor(
         os.environ["SAM_CONFIG"], os.environ["SAM_CHECKPOINT"], device="cuda"
     )
+    torch.cuda.synchronize()
+    load_seconds = time.perf_counter()-started
+    started = time.perf_counter()
     dtype = torch.bfloat16 if os.environ.get("SAM_BF16") == "true" else torch.float32
     with (
         torch.inference_mode(),
@@ -60,6 +65,8 @@ def main():
     (root / "metrics.sam.json").write_text(
         json.dumps(
             {
+                "model_load_seconds": load_seconds,
+                "segmentation_seconds": time.perf_counter()-started,
                 "allocated_mib": round(torch.cuda.max_memory_allocated() / 2**20),
                 "reserved_mib": round(torch.cuda.max_memory_reserved() / 2**20),
             }

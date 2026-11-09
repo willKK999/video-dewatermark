@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 import shutil
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import cv2
 import numpy as np
@@ -324,6 +326,49 @@ def windows(start, end, size=60, overlap=12):
         start = stop - overlap
 
 
+def _composite_window(root, files, start, end, overlap, window, check, references, performance):
+    dest = root / "composite"
+    predicted = sorted((window / "out" / "frames" / "frames").glob("*.png"))
+    if len(predicted) != end - start:
+        raise PipelineError(
+            "OUTPUT_INVALID", "ProPainter did not return every frame"
+        )
+    for j, p in enumerate(predicted, start):
+        check()
+        started = time.perf_counter()
+        original = read(files[j])
+        mask = read(root / "masks" / files[j].name, True)
+        repair = read(p)
+        if repair.shape != original.shape:
+            raise PipelineError("OUTPUT_INVALID", "repair geometry differs")
+        old = dest / files[j].name
+        if old.exists():
+            previous = read(old)
+            region = mask > 0
+            if (
+                region.any()
+                and np.abs(previous.astype(float) - repair.astype(float))[
+                    region
+                ].mean()
+                > 35
+            ):
+                raise PipelineError(
+                    "SEAM_UNCERTAIN",
+                    "overlap disagreement requires review",
+                    review=True,
+                )
+            weight = (j - start + 1) / (overlap + 1)
+            repair = cv2.addWeighted(repair, weight, previous, 1 - weight, 0)
+        performance["composite_io_seconds"] += time.perf_counter()-started
+        started = time.perf_counter()
+        repair = references.restore(original, mask, repair)
+        performance["restoration_seconds"] += time.perf_counter()-started
+        started = time.perf_counter()
+        cv2.imwrite(str(old), soft_composite(original, repair, mask))
+        performance["composite_io_seconds"] += time.perf_counter()-started
+    shutil.rmtree(window)
+
+
 def inpaint(root, files, scenes, engine, low_memory=False, check=lambda: None):
     dest = root / "composite"
     dest.mkdir()
@@ -338,86 +383,71 @@ def inpaint(root, files, scenes, engine, low_memory=False, check=lambda: None):
         return
     size, overlap = (36, 8) if low_memory else (60, 12)
     restoration_stats = []
-    for scene_start, scene_end in scenes:
-        # 固定上限控制内存与 CPU 成本，参考始终来自同一镜头原图。
-        refs = np.unique(np.linspace(scene_start, scene_end-1, min(24, scene_end-scene_start), dtype=int))
-        references = CleanReferences([read(files[j]) for j in refs],
-                                     [read(root / "masks" / files[j].name, True) for j in refs])
-        for index, (start, end) in enumerate(
-            windows(scene_start, scene_end, size, overlap)
-        ):
-            check()
-            window = root / f"window-{scene_start}-{index}"
-            window.mkdir()
-            frames = window / "frames"
-            frames.mkdir()
-            masks_dir = window / "masks"
-            masks_dir.mkdir()
-            for j in range(start, end):
-                name = f"{j - start:06d}.png"
-                os.link(files[j], frames / name)
-                os.link(root / "masks" / files[j].name, masks_dir / name)
-            args = [
-                os.environ["INPAINT_PYTHON"],
-                str(Path(__file__).with_name("torch_stage.py")),
-                "--metrics",
-                root / f"metrics.inpaint-{scene_start}-{index}.json",
-                "--script",
-                str(Path(os.environ["PROPAINTER_ROOT"]) / "inference_propainter.py"),
-                "--video",
-                frames,
-                "--mask",
-                masks_dir,
-                "--output",
-                window / "out",
-                "--save_frames",
-                "--mask_dilation",
-                "0",
-                "--subvideo_length",
-                str(size),
-                "--neighbor_length",
-                "6" if low_memory else "10",
-                "--ref_stride",
-                "20" if low_memory else "10",
-            ]
-            if os.environ.get("PROPAINTER_FP16") == "true":
-                args.append("--fp16")
-            run(args, check, cwd=os.environ["PROPAINTER_ROOT"])
-            predicted = sorted((window / "out" / "frames" / "frames").glob("*.png"))
-            if len(predicted) != end - start:
-                raise PipelineError(
-                    "OUTPUT_INVALID", "ProPainter did not return every frame"
-                )
-            for j, p in enumerate(predicted, start):
+    performance = dict(propainter_seconds=0., restoration_seconds=0., composite_io_seconds=0.)
+    def save_performance():
+        (root / "performance.json").write_text(json.dumps(performance))
+    # 单一合成线程严格保留重叠顺序；至多一个窗口合成与下一窗口推理重叠。
+    with ThreadPoolExecutor(max_workers=1) as compositor:
+        pending = None
+        for scene_start, scene_end in scenes:
+            # 固定上限控制内存与 CPU 成本，参考始终来自同一镜头原图。
+            refs = np.unique(np.linspace(scene_start, scene_end-1, min(24, scene_end-scene_start), dtype=int))
+            references = CleanReferences([read(files[j]) for j in refs],
+                                         [read(root / "masks" / files[j].name, True) for j in refs])
+            for index, (start, end) in enumerate(
+                windows(scene_start, scene_end, size, overlap)
+            ):
                 check()
-                original = read(files[j])
-                mask = read(root / "masks" / files[j].name, True)
-                repair = read(p)
-                if repair.shape != original.shape:
-                    raise PipelineError("OUTPUT_INVALID", "repair geometry differs")
-                old = dest / files[j].name
-                if old.exists():
-                    previous = read(old)
-                    region = mask > 0
-                    if (
-                        region.any()
-                        and np.abs(previous.astype(float) - repair.astype(float))[
-                            region
-                        ].mean()
-                        > 35
-                    ):
-                        raise PipelineError(
-                            "SEAM_UNCERTAIN",
-                            "overlap disagreement requires review",
-                            review=True,
-                        )
-                    weight = (j - start + 1) / (overlap + 1)
-                    repair = cv2.addWeighted(repair, weight, previous, 1 - weight, 0)
-                repair = references.restore(original, mask, repair)
-                cv2.imwrite(str(old), soft_composite(original, repair, mask))
-            shutil.rmtree(window)
-        restoration_stats.append(dict(scene=[scene_start, scene_end], **references.stats))
-        (root / "restoration.json").write_text(json.dumps(restoration_stats))
+                window = root / f"window-{scene_start}-{index}"
+                window.mkdir()
+                frames = window / "frames"
+                frames.mkdir()
+                masks_dir = window / "masks"
+                masks_dir.mkdir()
+                for j in range(start, end):
+                    name = f"{j - start:06d}.png"
+                    os.link(files[j], frames / name)
+                    os.link(root / "masks" / files[j].name, masks_dir / name)
+                args = [
+                    os.environ["INPAINT_PYTHON"],
+                    str(Path(__file__).with_name("torch_stage.py")),
+                    "--metrics",
+                    root / f"metrics.inpaint-{scene_start}-{index}.json",
+                    "--frames-only",
+                    "--script",
+                    str(Path(os.environ["PROPAINTER_ROOT"]) / "inference_propainter.py"),
+                    "--video",
+                    frames,
+                    "--mask",
+                    masks_dir,
+                    "--output",
+                    window / "out",
+                    "--save_frames",
+                    "--mask_dilation",
+                    "0",
+                    "--subvideo_length",
+                    str(size),
+                    "--neighbor_length",
+                    "6" if low_memory else "10",
+                    "--ref_stride",
+                    "20" if low_memory else "10",
+                ]
+                if os.environ.get("PROPAINTER_FP16") == "true":
+                    args.append("--fp16")
+                started = time.perf_counter()
+                run(args, check, cwd=os.environ["PROPAINTER_ROOT"])
+                performance["propainter_seconds"] += time.perf_counter()-started
+                if pending is not None:
+                    pending.result()
+                pending = compositor.submit(_composite_window, root, files, start, end,
+                                            overlap, window, check, references, performance)
+            if pending is not None:
+                pending.result()
+            for key, value in getattr(references, "timings", {}).items():
+                performance[key] = performance.get(key, 0.)+value
+            save_performance()
+            restoration_stats.append(dict(scene=[scene_start, scene_end], **references.stats))
+            (root / "restoration.json").write_text(json.dumps(restoration_stats))
 
 
 def residual_quality(root, files, detections, check=lambda: None):
