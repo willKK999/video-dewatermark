@@ -43,12 +43,12 @@ def test_residual_requires_persistent_overlapping_evidence(tmp_path, monkeypatch
     monkeypatch.setenv('YOLO_WEIGHTS', 'local.pt')
     files = [tmp_path / f'{i:06d}.png' for i in range(16)]
     detections = dict(scenes=[(0, 16)], hints=[dict(frame=0, box=[10, 10, 40, 30])])
-    candidates = [dict(frame=i, box=[10, 10, 40, 30]) for i in range(3)]
+    candidates = [dict(frame=i, box=[10, 10, 40, 30]) for i in range(2)]
     def fake_run(*args):
         (tmp_path / 'quality-detections.json').write_text(json.dumps(candidates))
     monkeypatch.setattr(vision, 'run', fake_run)
     vision.residual_quality(tmp_path, files, detections)
-    candidates.append(dict(frame=3, box=[10, 10, 40, 30]))
+    candidates.append(dict(frame=2, box=[10, 10, 40, 30]))
     with pytest.raises(PipelineError) as exc:
         vision.residual_quality(tmp_path, files, detections)
     assert exc.value.review and exc.value.code == 'RESIDUAL_UNCERTAIN'
@@ -86,3 +86,13 @@ def test_yolo_samples_every_frame_and_rejects_long_blind_gap(tmp_path, monkeypat
     with pytest.raises(PipelineError) as exc:
         vision.detect(files, [(0, 13)], {}, tmp_path)
     assert exc.value.review and exc.value.code == 'DETECTION_UNCERTAIN'
+
+
+def test_edge_support_recovers_text_omitted_by_segmentation():
+    image = np.full((100, 200, 3), 60, np.uint8)
+    cv2.putText(image, 'ABC', (40, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (220, 220, 220), 2)
+    mask = np.zeros((100, 200), np.uint8)
+    mask[25:50, 15:25] = 255
+    result = bounded_mask(mask, [10, 20, 110, 55], image)
+    assert np.count_nonzero(result[20:55, 40:105]) > 300
+    assert not result[80:].any()

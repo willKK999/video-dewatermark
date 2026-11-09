@@ -83,3 +83,36 @@ def test_grazing_false_positive_does_not_expand_watermark():
     result = merge_boxes([box(0, [94, 329, 247, 358], .84),
                           box(0, [244, 354, 377, 407], .46)], {0}, 120)
     assert result['box'] == [94, 329, 247, 358]
+
+
+def test_large_overlapping_scene_object_cannot_absorb_logo_track():
+    result = merge_boxes([box(0, [11, 11, 111, 31], .8),
+                          box(0, [5, 5, 220, 90], .95)], {0}, 5, [10, 10, 110, 30])
+    assert result['box'] == [11, 11, 111, 31]
+
+
+def test_reference_gate_keeps_weak_residue_despite_stronger_subtitle(tmp_path, monkeypatch):
+    import json
+    import sys
+    from worker.yolo_stage import main
+    frames = tmp_path / 'frames'
+    frames.mkdir()
+    (frames / '000000.png').touch()
+    weights = tmp_path / 'best.pt'
+    weights.touch()
+    (tmp_path / 'indices.json').write_text('[0]')
+    (tmp_path / 'reference.json').write_text(json.dumps(dict(scenes=[[0, 1]], hints=[
+        dict(frame=0, box=[10, 10, 60, 30])
+    ])))
+    class Model:
+        names = {0: 'corner_logo'}
+        def predict(self, *args, **kwargs):
+            return [SimpleNamespace(boxes=[box(0, [10, 10, 60, 30], .4),
+                                           box(0, [10, 90, 180, 110], .95)])]
+    monkeypatch.setitem(sys.modules, 'ultralytics', SimpleNamespace(YOLO=lambda path: Model()))
+    monkeypatch.setattr(sys, 'argv', ['yolo_stage', '--frames', str(frames), '--weights', str(weights),
+        '--indices', str(tmp_path/'indices.json'), '--output', str(tmp_path/'out.json'),
+        '--reference', str(tmp_path/'reference.json')])
+    main()
+    result = json.loads((tmp_path/'out.json').read_text())
+    assert result[0]['box'] == [10, 10, 60, 30] and result[0]['confidence'] == .4

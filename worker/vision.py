@@ -240,14 +240,15 @@ def masks(root, files, detections, engine, check=lambda: None):
     for i, f in enumerate(files):
         check()
         mask = read(dest / f.name, True)
-        if mask.shape != read(f).shape[:2] or not set(np.unique(mask)) <= {0, 255}:
+        image = read(f)
+        if mask.shape != image.shape[:2] or not set(np.unique(mask)) <= {0, 255}:
             raise PipelineError("MASK_INVALID", "mask geometry or values differ")
         scene_hints = [p for p in detections['hints']
                        if any(s <= i < e and s <= p['frame'] < e for s, e in detections['scenes'])]
         if os.environ.get('DETECTOR') == 'yolo':
             if not np.any(mask):
                 raise PipelineError('TRACKING_DRIFT', 'empty SAM watermark segmentation', review=True)
-            mask = bounded_mask(mask, interpolated_box(scene_hints, i))
+            mask = bounded_mask(mask, interpolated_box(scene_hints, i), image)
         else:
             mask = cv2.dilate(mask, np.ones((5, 5), np.uint8))
         area = np.count_nonzero(mask) / mask.size
@@ -415,21 +416,23 @@ def residual_quality(root, files, detections, check=lambda: None):
     """独立复检输出；只统计与原水印轨迹相交的高置信残留。"""
     if os.environ.get('DETECTOR') != 'yolo':
         return
-    indices = sorted(set(np.linspace(0, len(files)-1, min(16, len(files)), dtype=int).tolist()))
+    indices = list(range(len(files)))
     (root / 'quality-indices.json').write_text(json.dumps(indices))
     run([os.environ['DETECT_PYTHON'], str(Path(__file__).with_name('yolo_stage.py')),
          '--frames', root / 'composite', '--output', root / 'quality-detections.json',
          '--indices', root / 'quality-indices.json', '--weights', os.environ['YOLO_WEIGHTS'],
-         '--confidence', str(setting('RESIDUAL_CONFIDENCE', .65))], check)
+         '--confidence', str(setting('RESIDUAL_CONFIDENCE', .35)),
+         '--reference', root / 'detections.json'], check)
     candidates = json.loads((root / 'quality-detections.json').read_text())
-    from .yolo_stage import overlaps
+    from .yolo_stage import reference_match
     count = 0
     if isinstance(candidates, list):
         for p in candidates:
             scene = next((s, e) for s, e in detections['scenes'] if s <= p['frame'] < e)
             hints = [h for h in detections['hints'] if scene[0] <= h['frame'] < scene[1]]
-            count += overlaps(p['box'], interpolated_box(hints, p['frame']))
-    uncertain = isinstance(candidates, dict) or count >= max(2, len(indices)*setting('RESIDUAL_FRACTION', .25))
+            expected = interpolated_box(hints, p['frame'])
+            count += reference_match(p['box'], expected)
+    uncertain = isinstance(candidates, dict) or count >= max(int(setting('RESIDUAL_MIN_FRAMES', 3)), len(indices)*setting('RESIDUAL_FRACTION', .05))
     (root / 'quality.json').write_text(json.dumps(dict(sample_count=len(indices), residual_count=count,
                                                      needs_review=uncertain)))
     if uncertain:
