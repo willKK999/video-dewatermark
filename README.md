@@ -119,3 +119,7 @@ sha256sum -c docs/spec-v1.1.docx.sha256
 有意不并入的部分：并行实现的 `cmd/server`、另一套 Worker 包和 `explicit-cpu-mock` 出片。那条 CPU 通路用矩形 mock 代替修复，不能替代已经冒烟下载出真实 MP4 的 Telea 通路。取消语义保留云端行为：排队任务直接 `CANCELED`，运行中任务进入 `CANCEL_REQUESTED`，由持有租约的 Worker 或租约回收收尾；没有改成「所有取消都先等 reaper」。OOM 次数仍由 `attempts.failure_code=GPU_OOM` 判定，不另加一套 `oom_retries` 计数。配额环境变量仍是 `MAX_PENDING_JOBS`（默认 10）。Compose 仍使用已固定摘要的 PostgreSQL 16.6 / Redis 7.4.1，以及已经验证过的 Moto 替代路径；并行实现的 Compose 未在无 Docker 的机器上跑通，不替换当前文件。
 
 待实际部署完成的部分：填入并核实 ProPainter digest 之后才能启动正式 Worker、模型与镜像最终锁定、4090/30 条素材验收、GPU 依赖兼容性修补、真实 S3 签名与权限验证、监控告警接入、复杂跳位与半透明水印的检测参数调优。阶段二 DiffuEraser 与阶段三自动引擎路由按方案留待后续，不计入首版闭环。并行实现当时的 Go/Python 命令记录留在 [实现清单](docs/IMPLEMENTATION-CHECKLIST.md)，那是另一棵源码树上的结果，不能代替本仓库的 [验证记录](docs/validation.md)。
+
+### 中文网页操作台
+
+Go API 直接托管中文操作台，浏览器打开 API 根路径即可输入访问令牌、上传视频、管理任务、播放对比及下载成品。网页采用同源代理上传，无需配置 R2 浏览器跨域。公网部署、专用令牌文件、HTTPS 证书说明和测试方式见 [操作台说明](deploy/console/操作台说明.md)。

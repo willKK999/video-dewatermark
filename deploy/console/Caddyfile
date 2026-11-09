@@ -1,0 +1,9 @@
+{
+ admin off
+ default_sni 175.121.93.64
+ auto_https disable_redirects
+}
+https://175.121.93.64:10100 {
+ tls internal
+ reverse_proxy 127.0.0.1:18080
+}
