@@ -28,6 +28,21 @@ def main():
         page.locator("#workspace").wait_for(state="visible")
         assert page.locator("#token").input_value() == ""
         print("登录通过", flush=True)
+        page.locator("#submit").click()
+        assert "请先选择" in page.locator("#notice").inner_text()
+        page.locator("#dropzone").evaluate("""zone => {
+            const transfer = new DataTransfer();
+            transfer.items.add(new File(['test'], '拖拽验收.mp4', {type:'video/mp4'}));
+            zone.dispatchEvent(new DragEvent('drop', {bubbles:true, dataTransfer:transfer}));
+        }""")
+        assert page.locator("#chosenFilename").inner_text() == "拖拽验收.mp4"
+        page.locator("#file").set_input_files([])
+        for stage, index in [("probe", 0), ("detect", 1), ("mask", 2), ("inpaint", 3), ("publish", 4)]:
+            assert page.evaluate("""([stage,index]) => {
+                const steps=stageProgress({status:'RUNNING',stage});
+                return steps.children.length===5 && steps.children[index].getAttribute('aria-current')==='step';
+            }""", [stage, index])
+        print("未选文件拦截、拖拽选择及五阶段展示通过", flush=True)
         if args.upload:
             page.locator("#file").set_input_files(str(args.upload.resolve()))
             page.locator("#submit").click()
@@ -54,6 +69,8 @@ def main():
             page.wait_for_timeout(4000)
         else:
             raise RuntimeError("等待处理超时")
+        success = page.locator("#taskList .task").filter(has_text="成功").first
+        success.click()
         page.get_by_role("button", name="播放对比与下载").first.click()
         for _ in range(60):
             if page.locator("video").count() == 2 and page.locator("video").evaluate_all("(vs)=>vs.every(v=>v.readyState>=1)"):
@@ -61,7 +78,7 @@ def main():
             page.wait_for_timeout(2000)
         else:
             raise RuntimeError("双视频未成功加载")
-        assert page.get_by_role("button", name="播放对比与下载").count() == 0
+        assert page.locator(".card:not([hidden]) video").count() == 2
         for video in page.locator("video").all():
             video.evaluate("async (v)=>{v.muted=true; await v.play()}")
         page.wait_for_timeout(1200)
@@ -73,7 +90,13 @@ def main():
             page.get_by_text("下载成品", exact=True).first.click()
         event.value.save_as(str(output / "验收成品.mp4"))
         assert (output / "验收成品.mp4").stat().st_size > 0
-        page.screenshot(path=str(output / "console-result.png"), full_page=True)
+        page.evaluate("window.scrollTo(0, 0)")
+        page.screenshot(path=str(output / "ui-v2-desktop.png"), full_page=True)
+        page.set_viewport_size({"width": 390, "height": 844})
+        page.evaluate("window.scrollTo(0, 0)")
+        page.wait_for_timeout(400)
+        assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+        page.screenshot(path=str(output / "ui-v2-mobile.png"), full_page=True)
         page.reload(wait_until="domcontentloaded")
         page.locator("#workspace").wait_for(state="visible")
         page.get_by_role("button", name="退出登录").click()
