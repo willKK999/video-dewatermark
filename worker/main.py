@@ -17,6 +17,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 from . import store
 from .delivery import ack_after_miss, reclaim_batch
 from .pipeline import execute
+from .publication import upload_artifacts
 from .process import LeaseLost, PipelineError, run
 from .provenance import assert_catalog_locked, validate_provenance
 from .vision import verify_models, sha256
@@ -160,41 +161,25 @@ def process(job, dsn, s3, bucket, workdir, engine):
             started = time.monotonic()
             prefix = f"{job['tenant_id']}/jobs/{job['id']}/attempts/{job['attempt']}-{job['lease_token']}"
             result_key = prefix + "/result.mp4"
+            digest = sha256(result_path)
             s3.upload_file(
                 str(result_path),
                 bucket,
                 result_key,
                 ExtraArgs=upload_options('result', ContentType='video/mp4',
                                          ChecksumAlgorithm='SHA256',
-                                         Metadata={'sha256': sha256(result_path)}),
+                                         Metadata={'sha256': digest}),
                 Callback=lambda _: guard.check(),
             )
             verify_result_head(
                 s3.head_object(Bucket=bucket, Key=result_key),
                 result_path.stat().st_size,
-                sha256(result_path),
+                digest,
             )
-            # Hashes bind local frame/mask indices; the attempt prefix fences all artifacts.
-            s3.upload_file(
-                str(root / "manifest.json"),
-                bucket,
-                prefix + "/manifest.json",
-                ExtraArgs=upload_options('intermediate', ContentType='application/json'),
-            )
-            s3.upload_file(
-                str(root / "detections.json"),
-                bucket,
-                prefix + "/detections.json",
-                ExtraArgs=upload_options('intermediate', ContentType='application/json'),
-            )
-            for mask in sorted((root / "masks").glob("*.png")):
-                guard.check()
-                s3.upload_file(
-                    str(mask),
-                    bucket,
-                    prefix + "/masks/" + mask.name,
-                    ExtraArgs=upload_options('intermediate', ContentType='image/png'),
-                )
+            result_ms = round((time.monotonic() - started) * 1000)
+            artifacts_ms = upload_artifacts(s3, bucket, prefix, root, upload_options, guard.check)
+            (root / 'publish_ms.json').write_text(json.dumps(
+                dict(result=result_ms, artifacts=artifacts_ms)))
             timings["publish"] = round((time.monotonic() - started) * 1000)
             result.update(
                 engine=engine,
@@ -230,6 +215,10 @@ def process(job, dsn, s3, bucket, workdir, engine):
         metrics = {
             f.stem: json.loads(f.read_text()) for f in root.glob("metrics*.json")
         }
+        for filename in ("performance.json", "publish_ms.json"):
+            path = root / filename
+            if path.exists():
+                metrics[path.stem] = json.loads(path.read_text())
         metrics["execution_config"] = {
             **job["execution_config"],
             "config_hash": job["config_hash"],

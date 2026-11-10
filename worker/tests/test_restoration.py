@@ -174,3 +174,63 @@ def test_inner_feather_does_not_mix_watermark_back():
     result = soft_composite(original,np.full_like(original,70),mask)
     assert np.all(result[actual > 0] == 70)
     assert np.array_equal(result[mask == 0], original[mask == 0])
+
+
+def test_sparse_feather_matches_dense_arithmetic_exactly():
+    rng = np.random.default_rng(92)
+    original = rng.integers(0, 256, (73, 81, 3), dtype=np.uint8)
+    repaired = rng.integers(0, 256, original.shape, dtype=np.uint8)
+    mask = np.zeros(original.shape[:2], np.uint8)
+    mask[0:17, 8:23] = 255
+    mask[43:73, 65:81] = 255
+    distance = cv2.distanceTransform((mask > 0).astype(np.uint8), cv2.DIST_L2, 5)
+    alpha = np.clip(distance/3, 0, 1)
+    expected = np.rint(original*(1-alpha[..., None])+repaired*alpha[..., None]).astype(np.uint8)
+    expected[mask == 0] = original[mask == 0]
+    assert np.array_equal(soft_composite(original, repaired, mask), expected)
+
+
+def test_next_model_window_overlaps_ordered_compositing(tmp_path, monkeypatch):
+    import threading
+    import worker.vision as vision
+    monkeypatch.setenv('INPAINT_PYTHON', 'python')
+    monkeypatch.setenv('PROPAINTER_ROOT', str(tmp_path))
+    (tmp_path/'frames').mkdir()
+    (tmp_path/'masks').mkdir()
+    mask = np.zeros((40, 50), np.uint8)
+    mask[15:25, 20:30] = 255
+    paths = []
+    for i in range(65):
+        path = tmp_path/'frames'/f'{i:06d}.png'
+        cv2.imwrite(str(path), np.full((40, 50, 3), 80, np.uint8))
+        cv2.imwrite(str(tmp_path/'masks'/path.name), mask)
+        paths.append(path)
+    next_model = threading.Event()
+    writes = []
+
+    class References:
+        def __init__(self, *args):
+            self.stats = {}
+        def restore(self, original, mask, repaired):
+            assert next_model.wait(timeout=5)
+            writes.append(len(writes))
+            return repaired
+
+    calls = []
+    def run(args, *unused, **kwargs):
+        args = list(map(str, args))
+        frames = __import__('pathlib').Path(args[args.index('--video')+1])
+        output = __import__('pathlib').Path(args[args.index('--output')+1])/'frames'/'frames'
+        output.mkdir(parents=True)
+        calls.append(frames)
+        if len(calls) == 2:
+            next_model.set()
+        for path in frames.glob('*.png'):
+            cv2.imwrite(str(output/path.name), np.full((40, 50, 3), 150, np.uint8))
+
+    monkeypatch.setattr(vision, 'CleanReferences', References)
+    monkeypatch.setattr(vision, 'run', run)
+    vision.inpaint(tmp_path, paths, [(0, 65)], 'propainter')
+    assert len(calls) == 2 and len(writes) == 77
+    assert len(list((tmp_path/'composite').glob('*.png'))) == 65
+    assert not list(tmp_path.glob('window-*'))

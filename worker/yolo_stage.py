@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import time
 
 
 def watermark_class(name):
@@ -95,9 +96,12 @@ def main():
     # Require an existing local artifact; never implicitly download generic weights.
     if not Path(args.weights).is_file():
         raise ValueError("local dedicated watermark weights required")
+    started = time.perf_counter()
     from ultralytics import YOLO
 
     model = YOLO(args.weights)
+    load_seconds = time.perf_counter()-started
+    started = time.perf_counter()
     classes = dedicated_classes(model.names)
     results = []
     files = sorted(Path(args.frames).glob("*.png"))
@@ -121,6 +125,9 @@ def main():
                 uncertain.append(i)
             results.append(candidate)
             previous_box = candidate["box"]
+    Path(args.output).with_name('metrics.'+Path(args.output).name).write_text(
+        json.dumps(dict(model_load_seconds=load_seconds,
+                        detection_seconds=time.perf_counter()-started)))
     if len(uncertain) > max(2, len(results)*.1):
         Path(args.output).write_text(json.dumps({'uncertain': True}))
     else:
