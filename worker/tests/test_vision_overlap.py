@@ -99,8 +99,9 @@ def test_overlap_does_not_feather_same_frame_twice(tmp_path):
 
 
 @pytest.mark.parametrize("count", [1, 2])
+@pytest.mark.parametrize("large_mask", [False, True])
 def test_single_frame_scene_gets_same_frame_context_without_extra_output(
-    tmp_path, monkeypatch, count
+    tmp_path, monkeypatch, count, large_mask
 ):
     import sys
     from worker import vision
@@ -110,6 +111,8 @@ def test_single_frame_scene_gets_same_frame_context_without_extra_output(
     image = np.full((20, 20, 3), 80, np.uint8)
     mask = np.zeros((20, 20), np.uint8)
     mask[8:12, 8:12] = 255
+    if large_mask:
+        mask[5:15, 5:15] = 255
     files = []
     for i in range(count):
         path = tmp_path / "frames" / f"{i:06d}.png"
@@ -126,6 +129,12 @@ def test_single_frame_scene_gets_same_frame_context_without_extra_output(
     calls = []
 
     def model(args, check, cwd):
+        assert args[args.index("--subvideo_length") + 1] == (
+            "36" if large_mask else "60"
+        )
+        assert args[args.index("--neighbor_length") + 1] == (
+            "6" if large_mask else "10"
+        )
         frames = Path(args[args.index("--video") + 1])
         paths = sorted(frames.glob("*.png"))
         assert len(paths) == 2

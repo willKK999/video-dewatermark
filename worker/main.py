@@ -200,6 +200,8 @@ def process(job, dsn, s3, bucket, workdir, engine):
                         else []
                     ),
                     *sorted(root.glob("seam-*.jpg")),
+                    *sorted(root.glob("multitrack-*.npz")),
+                    *sorted(root.glob("multitrack-*.json")),
                 ]:
                     relative = path.relative_to(root).as_posix()
                     content_type = {
@@ -209,6 +211,7 @@ def process(job, dsn, s3, bucket, workdir, engine):
                         "mp4": "video/mp4",
                         "json": "application/json",
                         "jpg": "image/jpeg",
+                        "npz": "application/octet-stream",
                     }[path.suffix[1:]]
                     s3.upload_file(
                         str(path),

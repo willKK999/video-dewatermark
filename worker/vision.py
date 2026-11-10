@@ -97,11 +97,12 @@ def shots(files, check=lambda: None):
         if previous is not None:
             old_hist, old_gray = previous
             distance = cv2.compareHist(old_hist, hist, cv2.HISTCMP_BHATTACHARYYA)
-            difference = np.abs(gray.astype(float)-old_gray)
-            delta = difference.mean()/255
+            difference = np.abs(gray.astype(float) - old_gray)
+            delta = difference.mean() / 255
             changed = np.mean(difference > 32)
-            if distance > setting('SHOT_HIST_THRESHOLD', .5) or (
-                delta > setting('SHOT_PIXEL_THRESHOLD', .18) and changed > setting("SHOT_CHANGED_FRACTION", .5)
+            if distance > setting("SHOT_HIST_THRESHOLD", 0.5) or (
+                delta > setting("SHOT_PIXEL_THRESHOLD", 0.18)
+                and changed > setting("SHOT_CHANGED_FRACTION", 0.5)
             ):
                 cuts.append(i)
         previous = hist, gray
@@ -109,22 +110,28 @@ def shots(files, check=lambda: None):
 
 
 def detect(files, scenes, options, root, check=lambda: None, dense=False):
+    if options.get("multitrack_prior"):
+        from .multitrack import make_tracks
+
+        return make_tracks(files, scenes, options["multitrack_prior"], root, check)
     hints = {
         int(p["frame"]): dict(frame=int(p["frame"]), box=p["box"], confidence=1.0)
         for p in options.get("prompts", [])
     }
-    seeds=options.get("hls_reference",[])
+    seeds = options.get("hls_reference", [])
     for seed in seeds:
-        hints.setdefault(int(seed['frame']),dict(seed))
+        hints.setdefault(int(seed["frame"]), dict(seed))
     if seeds:
-        (root/'hls-seeds.json').write_text(json.dumps(seeds))
+        (root / "hls-seeds.json").write_text(json.dumps(seeds))
     if any(i >= len(files) for i in hints):
         raise PipelineError(
             "INVALID_PROMPT", "prompt frame is outside normalized video"
         )
     template_path = os.environ.get("TEMPLATE_PATH")
     detector = os.environ.get("DETECTOR")
-    template = read(template_path, True) if template_path and detector != "yolo" else None
+    template = (
+        read(template_path, True) if template_path and detector != "yolo" else None
+    )
     if template is not None and template.std() < 2:
         raise PipelineError("INVALID_TEMPLATE", "template needs visible texture")
 
@@ -143,21 +150,29 @@ def detect(files, scenes, options, root, check=lambda: None, dense=False):
                     root / "detect-indices.json",
                     "--weights",
                     os.environ["YOLO_WEIGHTS"],
-                    *(["--seeds",root/"hls-seeds.json"] if seeds else []),
+                    *(["--seeds", root / "hls-seeds.json"] if seeds else []),
                     *(["--continuous-track"] if options.get("hls") else []),
                 ],
                 check,
             )
             candidates = json.loads((root / "detector-output.json").read_text())
-            audit_path = root / 'metrics.detector-output.json'
-            if options.get('hls') and audit_path.exists():
+            audit_path = root / "metrics.detector-output.json"
+            if options.get("hls") and audit_path.exists():
                 audit = json.loads(audit_path.read_text())
-                if audit.get('uncovered_watermark_frames', 0) > max(5, len(indices)*.05):
-                    raise PipelineError('DETECTION_UNCERTAIN',
-                                        '检测到多个独立水印候选，当前单轨迹修复不能保证完整覆盖',
-                                        review=True)
+                if audit.get("uncovered_watermark_frames", 0) > max(
+                    5, len(indices) * 0.05
+                ):
+                    raise PipelineError(
+                        "DETECTION_UNCERTAIN",
+                        "检测到多个独立水印候选，当前单轨迹修复不能保证完整覆盖",
+                        review=True,
+                    )
             if isinstance(candidates, dict):
-                raise PipelineError('DETECTION_UNCERTAIN', 'multiple plausible watermark tracks', review=True)
+                raise PipelineError(
+                    "DETECTION_UNCERTAIN",
+                    "multiple plausible watermark tracks",
+                    review=True,
+                )
             for candidate in candidates:
                 hints.setdefault(candidate["frame"], candidate)
         elif template is not None:
@@ -197,12 +212,18 @@ def detect(files, scenes, options, root, check=lambda: None, dense=False):
                 "a shot has no reliable detection; provide normalized-frame box prompts",
                 review=True,
             )
-    if detector == 'yolo':
+    if detector == "yolo":
         for start, end in scenes:
             observed = sorted(i for i in hints if start <= i < end)
-            positions = [start] + observed + [end-1]
-            if max((b-a for a, b in zip(positions, positions[1:])), default=0) > int(setting('DETECTION_MAX_GAP', 10)):
-                raise PipelineError('DETECTION_UNCERTAIN', 'watermark detection gap too long', review=True)
+            positions = [start] + observed + [end - 1]
+            if max((b - a for a, b in zip(positions, positions[1:])), default=0) > int(
+                setting("DETECTION_MAX_GAP", 10)
+            ):
+                raise PipelineError(
+                    "DETECTION_UNCERTAIN",
+                    "watermark detection gap too long",
+                    review=True,
+                )
     image = read(files[0])
     h, w = image.shape[:2]
     for hint in hints.values():
@@ -211,10 +232,11 @@ def detect(files, scenes, options, root, check=lambda: None, dense=False):
             raise PipelineError(
                 "INVALID_PROMPT", "prompt exceeds normalized frame dimensions"
             )
-    ordered=sorted(hints.values(),key=lambda p:p['frame'])
-    if options.get('hls'):
+    ordered = sorted(hints.values(), key=lambda p: p["frame"])
+    if options.get("hls"):
         from .workflow import stabilize_hls_hints
-        ordered=stabilize_hls_hints(ordered,scenes,seeds)
+
+        ordered = stabilize_hls_hints(ordered, scenes, seeds)
     result = {
         "scenes": scenes,
         "hints": ordered,
@@ -257,6 +279,11 @@ def masks(root, files, detections, engine, check=lambda: None):
                 cv2.imwrite(str(dest / files[i].name), mask)
     if len(list(dest.glob("*.png"))) != len(files):
         raise PipelineError("MASK_INVALID", "mask count differs")
+    prior = None
+    if detections.get("multitrack"):
+        from .multitrack import load_prior
+
+        prior = load_prior(detections["prior"])
     manifest = []
     old_area = None
     for i, f in enumerate(files):
@@ -265,11 +292,26 @@ def masks(root, files, detections, engine, check=lambda: None):
         image = read(f)
         if mask.shape != image.shape[:2] or not set(np.unique(mask)) <= {0, 255}:
             raise PipelineError("MASK_INVALID", "mask geometry or values differ")
-        scene_hints = [p for p in detections['hints']
-                       if any(s <= i < e and s <= p['frame'] < e for s, e in detections['scenes'])]
-        if os.environ.get('DETECTOR') == 'yolo':
+        scene_hints = [
+            p
+            for p in detections["hints"]
+            if any(s <= i < e and s <= p["frame"] < e for s, e in detections["scenes"])
+        ]
+        if detections.get("multitrack"):
+            from .multitrack import prior_masks_loaded, merge_masks
+
+            components = prior_masks_loaded(
+                detections, i, image.shape[:2], prior[0], prior[2]
+            )
+            supports = merge_masks(components.values(), image.shape[:2])
+            # 各目标的时域先验补齐淡色笔画和相邻图标；SAM 仅在支持邻域内扩展。
+            allowed = cv2.dilate(supports, np.ones((7, 7), np.uint8))
+            mask = cv2.bitwise_or(supports, cv2.bitwise_and(mask, allowed))
+        elif os.environ.get("DETECTOR") == "yolo":
             if not np.any(mask):
-                raise PipelineError('TRACKING_DRIFT', 'empty SAM watermark segmentation', review=True)
+                raise PipelineError(
+                    "TRACKING_DRIFT", "empty SAM watermark segmentation", review=True
+                )
             mask = bounded_mask(mask, interpolated_box(scene_hints, i), image)
         else:
             mask = cv2.dilate(mask, np.ones((5, 5), np.uint8))
@@ -294,7 +336,7 @@ def masks(root, files, detections, engine, check=lambda: None):
             else None
         )
         key_hint = next((p for p in detections["hints"] if p["frame"] == i), None)
-        if key_hint and bbox:
+        if key_hint and bbox and not detections.get("multitrack"):
             a, b = bbox, key_hint["box"]
             intersection = max(0, min(a[2], b[2]) - max(a[0], b[0])) * max(
                 0, min(a[3], b[3]) - max(a[1], b[1])
@@ -345,13 +387,13 @@ def windows(start, end, size=60, overlap=12):
         start = stop - overlap
 
 
-def _composite_window(root, files, start, end, overlap, window, check, references, performance):
+def _composite_window(
+    root, files, start, end, overlap, window, check, references, performance
+):
     dest = root / "composite"
     predicted = sorted((window / "out" / "frames" / "frames").glob("*.png"))
     if len(predicted) != end - start:
-        raise PipelineError(
-            "OUTPUT_INVALID", "ProPainter did not return every frame"
-        )
+        raise PipelineError("OUTPUT_INVALID", "ProPainter did not return every frame")
     for j, p in enumerate(predicted, start):
         check()
         started = time.perf_counter()
@@ -360,10 +402,12 @@ def _composite_window(root, files, start, end, overlap, window, check, reference
         repair = read(p)
         if repair.shape != original.shape:
             raise PipelineError("OUTPUT_INVALID", "repair geometry differs")
-        performance["composite_io_seconds"] += time.perf_counter()-started
+        performance["composite_io_seconds"] += time.perf_counter() - started
         started = time.perf_counter()
-        repair = soft_composite(original, references.restore(original, mask, repair), mask)
-        performance["restoration_seconds"] += time.perf_counter()-started
+        repair = soft_composite(
+            original, references.restore(original, mask, repair), mask
+        )
+        performance["restoration_seconds"] += time.perf_counter() - started
         started = time.perf_counter()
         old = dest / files[j].name
         if old.exists():
@@ -371,9 +415,7 @@ def _composite_window(root, files, start, end, overlap, window, check, reference
             region = mask > 0
             if (
                 region.any()
-                and np.abs(previous.astype(float) - repair.astype(float))[
-                    region
-                ].mean()
+                and np.abs(previous.astype(float) - repair.astype(float))[region].mean()
                 > 35
             ):
                 raise PipelineError(
@@ -384,7 +426,7 @@ def _composite_window(root, files, start, end, overlap, window, check, reference
             weight = (j - start + 1) / (overlap + 1)
             repair = cv2.addWeighted(repair, weight, previous, 1 - weight, 0)
         cv2.imwrite(str(old), repair)
-        performance["composite_io_seconds"] += time.perf_counter()-started
+        performance["composite_io_seconds"] += time.perf_counter() - started
     shutil.rmtree(window)
 
 
@@ -400,19 +442,45 @@ def inpaint(root, files, scenes, engine, low_memory=False, check=lambda: None):
             image[mask > 0] = repaired[mask > 0]
             cv2.imwrite(str(dest / f.name), image)
         return
+    sampled_masks = [
+        read(root / "masks" / files[int(i)].name, True)
+        for i in np.linspace(0, len(files) - 1, min(8, len(files)), dtype=int)
+    ]
+    mask_fraction = max(np.count_nonzero(mask) / mask.size for mask in sampled_masks)
+    # 多目标联合掩膜增加稀疏注意力的活动区域，自动缩短窗口而不降分辨率。
+    low_memory = low_memory or mask_fraction > 0.05
     size, overlap = (36, 8) if low_memory else (60, 12)
     restoration_stats = []
-    performance = dict(propainter_seconds=0., restoration_seconds=0., composite_io_seconds=0.)
+    performance = dict(
+        propainter_seconds=0.0,
+        restoration_seconds=0.0,
+        composite_io_seconds=0.0,
+        window_frames=size,
+        overlap_frames=overlap,
+        mask_fraction=mask_fraction,
+        low_memory=low_memory,
+    )
+
     def save_performance():
         (root / "performance.json").write_text(json.dumps(performance))
+
     # 单一合成线程严格保留重叠顺序；至多一个窗口合成与下一窗口推理重叠。
     with ThreadPoolExecutor(max_workers=1) as compositor:
         pending = None
         for scene_start, scene_end in scenes:
             # 固定上限控制内存与 CPU 成本，参考始终来自同一镜头原图。
-            refs = np.unique(np.linspace(scene_start, scene_end-1, min(24, scene_end-scene_start), dtype=int))
-            references = CleanReferences([read(files[j]) for j in refs],
-                                         [read(root / "masks" / files[j].name, True) for j in refs])
+            refs = np.unique(
+                np.linspace(
+                    scene_start,
+                    scene_end - 1,
+                    min(24, scene_end - scene_start),
+                    dtype=int,
+                )
+            )
+            references = CleanReferences(
+                [read(files[j]) for j in refs],
+                [read(root / "masks" / files[j].name, True) for j in refs],
+            )
             for index, (start, end) in enumerate(
                 windows(scene_start, scene_end, size, overlap)
             ):
@@ -427,11 +495,13 @@ def inpaint(root, files, scenes, engine, low_memory=False, check=lambda: None):
                     name = f"{j - start:06d}.png"
                     os.link(files[j], frames / name)
                     os.link(root / "masks" / files[j].name, masks_dir / name)
-                singleton = end-start == 1
+                singleton = end - start == 1
                 if singleton:
                     # 单帧镜头没有跨帧光流；复制同帧，绝不借用转场另一侧的画面。
                     os.link(files[start], frames / "000001.png")
-                    os.link(root / "masks" / files[start].name, masks_dir / "000001.png")
+                    os.link(
+                        root / "masks" / files[start].name, masks_dir / "000001.png"
+                    )
                 args = [
                     os.environ["INPAINT_PYTHON"],
                     str(Path(__file__).with_name("torch_stage.py")),
@@ -439,7 +509,9 @@ def inpaint(root, files, scenes, engine, low_memory=False, check=lambda: None):
                     root / f"metrics.inpaint-{scene_start}-{index}.json",
                     "--frames-only",
                     "--script",
-                    str(Path(os.environ["PROPAINTER_ROOT"]) / "inference_propainter.py"),
+                    str(
+                        Path(os.environ["PROPAINTER_ROOT"]) / "inference_propainter.py"
+                    ),
                     "--video",
                     frames,
                     "--mask",
@@ -461,51 +533,98 @@ def inpaint(root, files, scenes, engine, low_memory=False, check=lambda: None):
                 started = time.perf_counter()
                 run(args, check, cwd=os.environ["PROPAINTER_ROOT"])
                 if singleton:
-                    emitted = sorted((window / "out" / "frames" / "frames").glob("*.png"))
+                    emitted = sorted(
+                        (window / "out" / "frames" / "frames").glob("*.png")
+                    )
                     if len(emitted) != 2:
-                        raise PipelineError("OUTPUT_INVALID", "单帧镜头的模型上下文输出数量不一致")
+                        raise PipelineError(
+                            "OUTPUT_INVALID", "单帧镜头的模型上下文输出数量不一致"
+                        )
                     emitted[-1].unlink()
-                performance["propainter_seconds"] += time.perf_counter()-started
+                performance["propainter_seconds"] += time.perf_counter() - started
                 if pending is not None:
                     pending.result()
-                pending = compositor.submit(_composite_window, root, files, start, end,
-                                            overlap, window, check, references, performance)
+                pending = compositor.submit(
+                    _composite_window,
+                    root,
+                    files,
+                    start,
+                    end,
+                    overlap,
+                    window,
+                    check,
+                    references,
+                    performance,
+                )
             if pending is not None:
                 pending.result()
             for key, value in getattr(references, "timings", {}).items():
-                performance[key] = performance.get(key, 0.)+value
+                performance[key] = performance.get(key, 0.0) + value
             save_performance()
-            restoration_stats.append(dict(scene=[scene_start, scene_end], **references.stats))
+            restoration_stats.append(
+                dict(scene=[scene_start, scene_end], **references.stats)
+            )
             (root / "restoration.json").write_text(json.dumps(restoration_stats))
 
 
 def residual_quality(root, files, detections, check=lambda: None):
     """独立复检输出；只统计与原水印轨迹相交的高置信残留。"""
-    if os.environ.get('DETECTOR') != 'yolo':
+    if os.environ.get("DETECTOR") != "yolo":
         return
+    if detections.get("multitrack"):
+        from .multitrack import residual_quality
+
+        return residual_quality(root, files, detections, check)
     indices = list(range(len(files)))
-    hls = detections.get('hls', False)
-    confidence = setting('RESIDUAL_CONFIDENCE', .35)
+    hls = detections.get("hls", False)
+    confidence = setting("RESIDUAL_CONFIDENCE", 0.35)
     if hls:
-        confidence = min(confidence, setting('HLS_RESIDUAL_CONFIDENCE', .15))
-    (root / 'quality-indices.json').write_text(json.dumps(indices))
-    run([os.environ['DETECT_PYTHON'], str(Path(__file__).with_name('yolo_stage.py')),
-         '--frames', root / 'composite', '--output', root / 'quality-detections.json',
-         '--indices', root / 'quality-indices.json', '--weights', os.environ['YOLO_WEIGHTS'],
-         '--confidence', str(confidence),
-         '--reference', root / 'detections.json',
-         *(['--reference-margin', '1.5'] if hls else [])], check)
-    candidates = json.loads((root / 'quality-detections.json').read_text())
+        confidence = min(confidence, setting("HLS_RESIDUAL_CONFIDENCE", 0.15))
+    (root / "quality-indices.json").write_text(json.dumps(indices))
+    run(
+        [
+            os.environ["DETECT_PYTHON"],
+            str(Path(__file__).with_name("yolo_stage.py")),
+            "--frames",
+            root / "composite",
+            "--output",
+            root / "quality-detections.json",
+            "--indices",
+            root / "quality-indices.json",
+            "--weights",
+            os.environ["YOLO_WEIGHTS"],
+            "--confidence",
+            str(confidence),
+            "--reference",
+            root / "detections.json",
+            *(["--reference-margin", "1.5"] if hls else []),
+        ],
+        check,
+    )
+    candidates = json.loads((root / "quality-detections.json").read_text())
     from .yolo_stage import residual_match
+
     count = 0
     if isinstance(candidates, list):
         for p in candidates:
-            scene = next((s, e) for s, e in detections['scenes'] if s <= p['frame'] < e)
-            hints = [h for h in detections['hints'] if scene[0] <= h['frame'] < scene[1]]
-            expected = interpolated_box(hints, p['frame'])
-            count += residual_match(p['box'], expected, 1.5 if hls else 0)
-    uncertain = isinstance(candidates, dict) or count >= max(int(setting('RESIDUAL_MIN_FRAMES', 3)), len(indices)*setting('RESIDUAL_FRACTION', .05))
-    (root / 'quality.json').write_text(json.dumps(dict(sample_count=len(indices), residual_count=count,
-                                                     needs_review=uncertain)))
+            scene = next((s, e) for s, e in detections["scenes"] if s <= p["frame"] < e)
+            hints = [
+                h for h in detections["hints"] if scene[0] <= h["frame"] < scene[1]
+            ]
+            expected = interpolated_box(hints, p["frame"])
+            count += residual_match(p["box"], expected, 1.5 if hls else 0)
+    uncertain = isinstance(candidates, dict) or count >= max(
+        int(setting("RESIDUAL_MIN_FRAMES", 3)),
+        len(indices) * setting("RESIDUAL_FRACTION", 0.05),
+    )
+    (root / "quality.json").write_text(
+        json.dumps(
+            dict(
+                sample_count=len(indices), residual_count=count, needs_review=uncertain
+            )
+        )
+    )
     if uncertain:
-        raise PipelineError('RESIDUAL_UNCERTAIN', 'persistent watermark evidence in output', review=True)
+        raise PipelineError(
+            "RESIDUAL_UNCERTAIN", "persistent watermark evidence in output", review=True
+        )

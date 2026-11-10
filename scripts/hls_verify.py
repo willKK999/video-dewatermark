@@ -17,6 +17,17 @@ from worker.process import run
 from worker.vision import sha256
 
 
+def boxes_at(references, frame):
+    if not references.get("multitrack"):
+        return [interpolated_box(references["hints"], frame)]
+    return [
+        p["box"]
+        for t in references["tracks"]
+        for p in t["hints"]
+        if p["frame"] == frame
+    ]
+
+
 def temporal_windows(source, result, plans, fps, references, output):
     """用接缝附近普通帧对作基线，镜头切换及不可靠对齐不强行打分。"""
     from scripts.quality_v3 import align_previous
@@ -42,7 +53,7 @@ def temporal_windows(source, result, plans, fps, references, output):
                     "-i",
                     path,
                     "-vf",
-                    f"select=between(n\\,{first}\\,{first+30}),scale={width}:{height}",
+                    f"fps={fps},select=between(n\\,{first}\\,{first+30}),scale={width}:{height}",
                     "-fps_mode",
                     "passthrough",
                     "-frames:v",
@@ -64,9 +75,7 @@ def temporal_windows(source, result, plans, fps, references, output):
             frame = first + j
             if frame in cuts:
                 continue
-            boxes = [
-                interpolated_box(references["hints"], k) for k in (frame - 1, frame)
-            ]
+            boxes = [b for k in (frame - 1, frame) for b in boxes_at(references, k)]
             x1 = max(0, int(min(b[0] for b in boxes)) - 12)
             y1 = max(0, int(min(b[1] for b in boxes)) - 12)
             x2 = min(width, int(np.ceil(max(b[2] for b in boxes))) + 12)
@@ -129,17 +138,43 @@ def sample_sheets(source, result, plans, fps, references, output):
     total = 0
     try:
         for frame in range(plans[-1]["end"]):
-            images = [cap.read()[1] for cap in caps]
-            if any(image is None for image in images):
-                raise ValueError("抽样视频帧数不一致")
+            clean = caps[1].read()[1]
+            if clean is None:
+                raise ValueError("成品抽样帧缺失")
             if frame not in sample_frames:
                 continue
-            original, clean = images
+            caps[0].set(cv2.CAP_PROP_POS_MSEC, frame * 1000 / fps)
+            original = caps[0].read()[1]
+            if original is None:
+                raise ValueError("原片同一时间戳抽样帧缺失")
             h, w = clean.shape[:2]
             original = cv2.resize(original, (w, h))
-            a, b, c, d = interpolated_box(references["hints"], frame)
+            boxes = boxes_at(references, frame)
+            a, b, c, d = [
+                min(p[0] for p in boxes),
+                min(p[1] for p in boxes),
+                max(p[2] for p in boxes),
+                max(p[3] for p in boxes),
+            ]
             x1, y1 = max(0, int(a) - 24), max(0, int(b) - 24)
             x2, y2 = min(w, int(np.ceil(c)) + 24), min(h, int(np.ceil(d)) + 24)
+            if references.get("multitrack") and round(frame / fps) in (5, 60, 120, 200):
+                for track in references["tracks"]:
+                    hint = next(
+                        (p for p in track["hints"] if p["frame"] == frame), None
+                    )
+                    if hint is None:
+                        continue
+                    x, y, r, b = hint["box"]
+                    x, y = max(0, int(x) - 12), max(0, int(y) - 12)
+                    r, b = min(w, int(np.ceil(r)) + 12), min(h, int(np.ceil(b)) + 12)
+                    cv2.imwrite(
+                        str(
+                            output
+                            / f"对比-{round(frame/fps):03d}秒-轨迹{track['id']:02d}.jpg"
+                        ),
+                        np.hstack([original[y:b, x:r], clean[y:b, x:r]]),
+                    )
             pair = np.hstack([original[y1:y2, x1:x2], clean[y1:y2, x1:x2]])
             scale = min(560 / pair.shape[1], 100 / pair.shape[0])
             pair = cv2.resize(pair, None, fx=scale, fy=scale)

@@ -105,6 +105,11 @@ def export(job_id, output, detect):
             )
         )
     references = json.loads(ref_file.read_text())
+    if references.get("multitrack"):
+        prior = output / "multitrack-prior.npz"
+        download(prefix + "/multitrack-prior.npz", prior)
+        references["prior"] = str(prior.resolve())
+        ref_file.write_text(json.dumps(references))
     safe = dict(
         id=job_id,
         status=job["status"],

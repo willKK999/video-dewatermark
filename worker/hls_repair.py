@@ -126,6 +126,12 @@ def reseed_masks(work, root, files, detections, candidates, affected, ranges, ch
 
 def refine(root, files, detections, engine, low_memory, fps, stage, check, rounds=2):
     """只使用模型生成的掩膜，不以人工框或整幅画面覆盖作为回退。"""
+    if detections.get("multitrack"):
+        from .multitrack import refine as multi_refine
+
+        return multi_refine(
+            root, files, detections, engine, low_memory, fps, stage, check
+        )
     records = []
     for iteration in range(rounds):
         quality = json.loads((root / "quality.json").read_text())

@@ -403,7 +403,7 @@ def seam_metrics(
                 "-i",
                 source,
                 "-vf",
-                f"select=between(n\\,{n-1}\\,{n}),scale={a.shape[1]}:{a.shape[0]}",
+                f"fps={fps},select=between(n\\,{n-1}\\,{n}),scale={a.shape[1]}:{a.shape[0]}",
                 "-fps_mode",
                 "passthrough",
                 "-frames:v",
@@ -465,6 +465,43 @@ def seam_metrics(
                     [np.hstack([roi(x) for x in raw]), np.hstack([roi(a), roi(b)])]
                 ),
             )
+        if references and any("track_id" in h for h in references):
+            per_track = []
+            for identity in sorted({h["track_id"] for h in references}):
+                near = [
+                    h
+                    for h in references
+                    if h["track_id"] == identity and abs(h["frame"] - n) <= 1
+                ]
+                if not near:
+                    continue
+                x1 = max(0, int(min(h["box"][0] for h in near)) - 12)
+                y1 = max(0, int(min(h["box"][1] for h in near)) - 12)
+                x2 = min(a.shape[1], int(np.ceil(max(h["box"][2] for h in near))) + 12)
+                y2 = min(a.shape[0], int(np.ceil(max(h["box"][3] for h in near))) + 12)
+                roi = lambda image: image[y1:y2, x1:x2]
+                per_track.append(
+                    dict(
+                        track_id=identity,
+                        roi=[x1, y1, x2, y2],
+                        source_mae=delta(roi(raw[0]), roi(raw[1])),
+                        result_mae=delta(roi(a), roi(b)),
+                        repair_delta_mae=delta(
+                            roi(b).astype(np.float32) - roi(raw[1]),
+                            roi(a).astype(np.float32) - roi(raw[0]),
+                        ),
+                    )
+                )
+                cv2.imwrite(
+                    str(root / f"seam-{i:02d}-track-{identity:02d}.jpg"),
+                    np.vstack(
+                        [
+                            np.hstack([roi(raw[0]), roi(raw[1])]),
+                            np.hstack([roi(a), roi(b)]),
+                        ]
+                    ),
+                )
+            record["tracks"] = per_track
         records.append(record)
     return records
 
@@ -546,7 +583,7 @@ def checkpoint_hash(digest, options, engine, low_memory, execution_fingerprint="
     return hashlib.sha256(
         json.dumps(
             dict(
-                strategy="hls-coverage-and-short-tail-v6",
+                strategy="hls-multitrack-consensus-v7",
                 source=digest,
                 options=options,
                 models=os.getenv("MODEL_LOCK_HASH", ""),
@@ -699,6 +736,21 @@ def execute_hls(
     cache_hash = checkpoint_hash(
         digest, options, engine, low_memory, execution_fingerprint
     )
+    prior_path = None
+    if os.getenv("DETECTOR") == "yolo":
+        from .multitrack import prepare
+
+        prior_path = root / "multitrack-prior.npz"
+        prior_key = checkpoint_prefix + "/multitrack-v7.npz"
+        try:
+            s3.download_file(bucket, prior_key, str(prior_path))
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] not in ("404", "NoSuchKey", "NotFound"):
+                raise
+            stage("detect")
+            progress(0, len(plans), "detect")
+            prior_path = prepare(full, root, check)
+            s3.upload_file(str(prior_path), bucket, prior_key)
     for i, p in enumerate(plans):
         check()
         progress(i + 1, len(plans), "probe")
@@ -794,6 +846,7 @@ def execute_hls(
             # 每帧检测与相同参数保证移动水印轨迹；重叠帧的结果在合并时共享。
             block_options = {
                 **options,
+                **({"multitrack_prior": str(prior_path)} if prior_path else {}),
                 "hls_reference": [
                     dict(h, frame=h["frame"] - p["left"])
                     for h in previous_hints
@@ -806,6 +859,10 @@ def execute_hls(
                 s3, bucket, cache, work, clip, options, low_memory, check
             )
             restored_draft = phase is not None
+            if restored_draft and prior_path:
+                draft_detection = json.loads((work / "detections.json").read_text())
+                draft_detection["prior"] = str(prior_path)
+                (work / "detections.json").write_text(json.dumps(draft_detection))
             if restored_draft:
                 from . import vision
 
@@ -908,6 +965,10 @@ def execute_hls(
             )
             composite = work / "composite"
         if (work / "detections.json").exists():
+            chunk_detection = json.loads((work / "detections.json").read_text())
+            if chunk_detection.get("multitrack"):
+                chunk_detection["prior"] = str(prior_path)
+                (work / "detections.json").write_text(json.dumps(chunk_detection))
             previous_hints = [
                 dict(h, frame=h["frame"] + p["left"])
                 for h in json.loads((work / "detections.json").read_text())["hints"]
@@ -956,6 +1017,10 @@ def execute_hls(
             "scenes": vision.shots(files, check),
             "hints": sorted(references, key=lambda x: x["frame"]),
         }
+        if prior_path:
+            from .multitrack import combine_tracks
+
+            detections = combine_tracks(detections, prior_path)
         (root / "detections.json").write_text(json.dumps(detections))
     stage("encode")
     progress(len(plans), len(plans), "encode")
