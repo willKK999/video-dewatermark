@@ -1,6 +1,6 @@
 openapi: 3.0.3
 info:
-  title: 动态移动视频去水印 API
+  title: 视频去水印系统 API
   version: mvp-1
 servers:
   - url: http://localhost:8080/v1
@@ -51,9 +51,12 @@ paths:
             schema:
               type: object
               additionalProperties: false
-              required: [upload_id]
+              oneOf:
+                - required: [upload_id]
+                - required: [hls_input]
               properties:
                 upload_id: {type: string}
+                hls_input: {type: string, maxLength: 4096, description: 当前租户的 R2 m3u8 对象键或公开 HTTP/HTTPS 链接，与 upload_id 二选一}
                 options: {$ref: '#/components/schemas/Options'}
       responses:
         '202': {$ref: '#/components/responses/Job'}
@@ -75,6 +78,34 @@ paths:
       responses:
         '202': {$ref: '#/components/responses/Job'}
         '409': {description: 已进入不可取消终态}
+        default: {$ref: '#/components/responses/Error'}
+  /jobs/{id}/retry:
+    parameters:
+      - {$ref: '#/components/parameters/JobID'}
+    post:
+      summary: 重试失败的 HLS 未完成块，复用已完成块检查点，累计至多三次执行
+      responses:
+        '202': {$ref: '#/components/responses/Job'}
+        '409': {description: 状态或尝试次数不允许重试}
+        default: {$ref: '#/components/responses/Error'}
+  /jobs/{id}/hls/{name}:
+    parameters:
+      - {$ref: '#/components/parameters/JobID'}
+      - {in: path, name: name, required: true, schema: {type: string}, description: index.m3u8 或六位数字 ts 文件名}
+    get:
+      summary: 读取同源 HLS 播放列表或分片，每次请求均需身份凭证
+      responses:
+        '200': {description: 播放列表或 MPEG-TS 视频分片}
+        default: {$ref: '#/components/responses/Error'}
+  /jobs/{id}/media/{kind}:
+    parameters:
+      - {$ref: '#/components/parameters/JobID'}
+      - {in: path, name: kind, required: true, schema: {type: string, enum: [source, result, bundle]}}
+    get:
+      summary: 读取原片 MP4、成品 MP4 或 HLS ZIP 包，支持范围请求
+      responses:
+        '200': {description: 媒体或打包文件}
+        '206': {description: 指定范围内容}
         default: {$ref: '#/components/responses/Error'}
 components:
   securitySchemes:
@@ -109,6 +140,7 @@ components:
       type: object
       additionalProperties: false
       properties:
+        hls_bandwidth: {type: integer, minimum: 0, default: 0, description: 主播放列表码率上限 bit/s；0 选择最高码率}
         max_short_edge: {type: integer, enum: [720, 540], default: 720}
         allow_downgrade: {type: boolean, default: false}
         prompts:
@@ -135,10 +167,20 @@ components:
         pipeline_version: {type: string}
         created_at: {type: string, format: date-time}
         updated_at: {type: string, format: date-time}
+        progress:
+          type: object
+          properties:
+            current_chunk: {type: integer, minimum: 1}
+            total_chunks: {type: integer, minimum: 1}
+            phase: {type: string, enum: [probe, detect, mask, inpaint, encode, quality, publish]}
         result:
           type: object
           nullable: true
           properties:
+            hls: {type: boolean}
+            chunk_count: {type: integer}
+            audio_copy_verified: {type: boolean}
+            residual_count: {type: integer}
             expired: {type: boolean}
             download_url: {type: string, format: uri}
             expires_at: {type: string, format: date-time}

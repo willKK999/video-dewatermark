@@ -96,3 +96,14 @@ def test_edge_support_recovers_text_omitted_by_segmentation():
     result = bounded_mask(mask, [10, 20, 110, 55], image)
     assert np.count_nonzero(result[20:55, 40:105]) > 300
     assert not result[80:].any()
+
+
+def test_hls_geometry_stabilizes_spike_without_smoothing_motion_or_seeds():
+    from worker.workflow import stabilize_hls_hints
+    hints=[dict(frame=i,box=[i,10,i+100,30],confidence=.8) for i in range(21)]
+    hints[10]['box']=[0,0,200,50]
+    result=stabilize_hls_hints(hints,[(0,21)])
+    assert result[10]['box']==[10,10,110,30]
+    assert result[9]==hints[9] and result[11]==hints[11]
+    assert stabilize_hls_hints(hints,[(0,21)],[hints[10]])[10]==hints[10]
+    assert stabilize_hls_hints(hints,[(0,10),(10,21)])[10]==hints[10]

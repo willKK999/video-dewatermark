@@ -22,7 +22,7 @@ def execute(
 
     def step(name, operation):
         check()
-        if name != "quality":
+        if name != "quality" or options.get("hls"):
             stage(name)
         start = time.monotonic()
         try:

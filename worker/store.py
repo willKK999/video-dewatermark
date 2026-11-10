@@ -177,3 +177,15 @@ def finish(
 
 def config_hash(config):
     return hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
+
+
+def set_progress(dsn, job, progress):
+    with connect(dsn) as db:
+        updated = db.execute(
+            """UPDATE jobs SET progress=%s WHERE id=%s AND lease_token=%s
+            AND lease_until>now() AND status='RUNNING'""",
+            (Jsonb(progress), job['id'], job['lease_token']),
+        ).rowcount
+        if updated != 1:
+            from .process import LeaseLost
+            raise LeaseLost()

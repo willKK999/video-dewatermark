@@ -14,10 +14,13 @@ import (
 
 func TestConsoleAccessBoundary(t *testing.T) {
 	s := &Server{Tokens: map[string]string{"test-session-token": "kelin"}}
-	for _, path := range []string{"/v1/jobs", "/v1/jobs/other/media/source", "/v1/jobs/other/media/result", "/v1/uploads/other/content"} {
+	for _, path := range []string{"/v1/jobs", "/v1/jobs/other/media/source", "/v1/jobs/other/media/result", "/v1/uploads/other/content", "/v1/jobs/other/hls/index.m3u8", "/v1/jobs/other/hls/000000.ts", "/v1/jobs/other/media/bundle", "/v1/jobs/other/retry"} {
 		method := "GET"
 		if strings.Contains(path, "uploads") {
 			method = "PUT"
+		}
+		if strings.HasSuffix(path, "/retry") {
+			method = "POST"
 		}
 		w := httptest.NewRecorder()
 		s.Handler().ServeHTTP(w, httptest.NewRequest(method, path, nil))
@@ -109,5 +112,17 @@ func TestCopyStorageCapability(t *testing.T) {
 				t.Fatal("不能丢弃原片媒体类型和元数据")
 			}
 		})
+	}
+}
+
+func TestHLSPlayerAssetPublic(t *testing.T) {
+	s := &Server{}
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, httptest.NewRequest("GET", "/assets/hls.min.js", nil))
+	if w.Code != 200 || !strings.HasPrefix(w.Header().Get("Content-Type"), "text/javascript") || w.Body.Len() < 100000 {
+		t.Fatal("登录页应能从同源读取实际播放器依赖")
+	}
+	if w.Header().Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatal("缺少静态资源响应保护")
 	}
 }

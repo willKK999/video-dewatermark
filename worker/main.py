@@ -113,10 +113,10 @@ def object_store():
 
 def upload_options(kind, **options):
     """兼容不实现对象标签的存储；是否使用标签由部署能力明确配置。"""
-    if os.environ.get('S3_OBJECT_TAGGING', 'true').lower() == 'true':
-        options['Tagging'] = 'kind=' + kind
+    if os.environ.get("S3_OBJECT_TAGGING", "true").lower() == "true":
+        options["Tagging"] = "kind=" + kind
     else:
-        options['Metadata'] = {**options.get('Metadata', {}), 'kind': kind}
+        options["Metadata"] = {**options.get("Metadata", {}), "kind": kind}
     return options
 
 
@@ -133,42 +133,104 @@ def process(job, dsn, s3, bucket, workdir, engine):
         try:
             guard.stage("probe")
             source = root / "source"
-            # Bounded stream and lease checks, including during downloads.
-            body = s3.get_object(Bucket=bucket, Key=job["input_key"])["Body"]
-            try:
-                with source.open("wb") as out:
-                    total = 0
-                    while chunk := body.read(1024 * 1024):
-                        guard.check()
-                        total += len(chunk)
-                        if total > 200 * 1024 * 1024:
-                            raise PipelineError(
-                                "INVALID_MEDIA", "input exceeds 200 MiB"
-                            )
-                        out.write(chunk)
-            finally:
-                body.close()
-            result_path, result, timings = execute(
-                source,
-                root,
-                job["options"],
-                engine,
-                job["low_memory"],
-                guard.stage,
-                guard.check,
-            )
+            if job["options"].get("hls"):
+                from .hls import execute_hls
+
+                def progress(current, total, phase):
+                    store.set_progress(
+                        dsn,
+                        job,
+                        dict(current_chunk=current, total_chunks=total, phase=phase),
+                    )
+
+                result_path, result, timings = execute_hls(
+                    job["input_key"],
+                    root,
+                    job["options"],
+                    engine,
+                    job["low_memory"],
+                    guard.stage,
+                    guard.check,
+                    s3,
+                    bucket,
+                    f"{job['tenant_id']}/jobs/{job['id']}/checkpoints",
+                    progress,
+                    execution_fingerprint=job["execution_config"]["base_config_hash"],
+                )
+            else:
+                # Bounded stream and lease checks, including during downloads.
+                body = s3.get_object(Bucket=bucket, Key=job["input_key"])["Body"]
+                try:
+                    with source.open("wb") as out:
+                        total = 0
+                        while chunk := body.read(1024 * 1024):
+                            guard.check()
+                            total += len(chunk)
+                            if total > 200 * 1024 * 1024:
+                                raise PipelineError(
+                                    "INVALID_MEDIA", "input exceeds 200 MiB"
+                                )
+                            out.write(chunk)
+                finally:
+                    body.close()
+                result_path, result, timings = execute(
+                    source,
+                    root,
+                    job["options"],
+                    engine,
+                    job["low_memory"],
+                    guard.stage,
+                    guard.check,
+                )
             guard.stage("publish")
             started = time.monotonic()
             prefix = f"{job['tenant_id']}/jobs/{job['id']}/attempts/{job['attempt']}-{job['lease_token']}"
             result_key = prefix + "/result.mp4"
+            if result.get("hls"):
+                progress(result["chunk_count"], result["chunk_count"], "publish")
+                for path in [
+                    *sorted((root / "hls").glob("*.ts")),
+                    root / "hls" / "index.m3u8",
+                    root / "hls.zip",
+                    root / "source.mp4",
+                    root / "metrics-hls.json",
+                    *(
+                        [root / "detections.json"]
+                        if (root / "detections.json").exists()
+                        else []
+                    ),
+                    *sorted(root.glob("seam-*.jpg")),
+                ]:
+                    relative = path.relative_to(root).as_posix()
+                    content_type = {
+                        "ts": "video/mp2t",
+                        "m3u8": "application/vnd.apple.mpegurl",
+                        "zip": "application/zip",
+                        "mp4": "video/mp4",
+                        "json": "application/json",
+                        "jpg": "image/jpeg",
+                    }[path.suffix[1:]]
+                    s3.upload_file(
+                        str(path),
+                        bucket,
+                        prefix + "/" + relative,
+                        ExtraArgs=upload_options("result", ContentType=content_type),
+                        Callback=lambda _: guard.check(),
+                    )
+                result["hls_prefix"] = prefix + "/hls/"
+                result["bundle_key"] = prefix + "/hls.zip"
+                result["source_key"] = prefix + "/source.mp4"
             digest = sha256(result_path)
             s3.upload_file(
                 str(result_path),
                 bucket,
                 result_key,
-                ExtraArgs=upload_options('result', ContentType='video/mp4',
-                                         ChecksumAlgorithm='SHA256',
-                                         Metadata={'sha256': digest}),
+                ExtraArgs=upload_options(
+                    "result",
+                    ContentType="video/mp4",
+                    ChecksumAlgorithm="SHA256",
+                    Metadata={"sha256": digest},
+                ),
                 Callback=lambda _: guard.check(),
             )
             verify_result_head(
@@ -177,9 +239,16 @@ def process(job, dsn, s3, bucket, workdir, engine):
                 digest,
             )
             result_ms = round((time.monotonic() - started) * 1000)
-            artifacts_ms = upload_artifacts(s3, bucket, prefix, root, upload_options, guard.check)
-            (root / 'publish_ms.json').write_text(json.dumps(
-                dict(result=result_ms, artifacts=artifacts_ms)))
+            artifacts_ms = (
+                0
+                if result.get("hls")
+                else upload_artifacts(
+                    s3, bucket, prefix, root, upload_options, guard.check
+                )
+            )
+            (root / "publish_ms.json").write_text(
+                json.dumps(dict(result=result_ms, artifacts=artifacts_ms))
+            )
             timings["publish"] = round((time.monotonic() - started) * 1000)
             result.update(
                 engine=engine,
@@ -331,9 +400,11 @@ def main():
             "engine": engine,
             "models": model_hash,
             "detector": os.getenv("DETECTOR", "template-or-prompt"),
-            "template_sha256": sha256(os.environ["TEMPLATE_PATH"])
-            if os.getenv("TEMPLATE_PATH")
-            else None,
+            "template_sha256": (
+                sha256(os.environ["TEMPLATE_PATH"])
+                if os.getenv("TEMPLATE_PATH")
+                else None
+            ),
             "image": image_digest,
             "fp16": os.getenv("PROPAINTER_FP16", "false"),
             "bf16": os.getenv("SAM_BF16", "false"),

@@ -27,12 +27,12 @@ func consolePage(w http.ResponseWriter, r *http.Request) {
 	}
 	b, _ := consoleFiles.ReadFile("web/index.html")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; media-src 'self' blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+	w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; media-src 'self' blob:; worker-src 'self' blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
 	w.Write(b)
 }
 
 func (s *Server) list(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.DB.Query(r.Context(), `SELECT j.id,j.status,j.stage,j.attempt,j.pipeline_version,j.created_at,j.updated_at,j.result_meta,j.result_expires_at,j.error_code,j.error_message,u.filename FROM jobs j JOIN uploads u ON u.id=j.upload_id WHERE j.tenant_id=$1 ORDER BY j.created_at DESC,j.id DESC LIMIT 100`, tenant(r))
+	rows, err := s.DB.Query(r.Context(), `SELECT j.id,j.status,j.stage,j.attempt,j.pipeline_version,j.created_at,j.updated_at,j.progress,j.result_meta,j.result_expires_at,j.error_code,j.error_message,u.filename FROM jobs j JOIN uploads u ON u.id=j.upload_id WHERE j.tenant_id=$1 ORDER BY j.created_at DESC,j.id DESC LIMIT 100`, tenant(r))
 	if err != nil {
 		fail(w, r, 503, "DATABASE_UNAVAILABLE", "暂时无法读取任务")
 		return
@@ -49,7 +49,7 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) {
 		var expires *time.Time
 		var code, message *string
 		j := &e.Job
-		if err = rows.Scan(&j.ID, &j.Status, &j.Stage, &j.Attempt, &j.PipelineVersion, &j.CreatedAt, &j.UpdatedAt, &meta, &expires, &code, &message, &e.Filename); err != nil {
+		if err = rows.Scan(&j.ID, &j.Status, &j.Stage, &j.Attempt, &j.PipelineVersion, &j.CreatedAt, &j.UpdatedAt, &j.Progress, &meta, &expires, &code, &message, &e.Filename); err != nil {
 			break
 		}
 		if code != nil {
@@ -151,9 +151,11 @@ func (s *Server) proxyUpload(w http.ResponseWriter, r *http.Request) {
 func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 	var key string
 	var expires *time.Time
-	query := `SELECT input_key,NULL::timestamptz FROM jobs WHERE id=$1 AND tenant_id=$2`
+	query := `SELECT CASE WHEN options->>'hls'='true' THEN result_meta->>'source_key' ELSE input_key END,NULL::timestamptz FROM jobs WHERE id=$1 AND tenant_id=$2`
 	if r.PathValue("kind") == "result" {
 		query = `SELECT result_key,result_expires_at FROM jobs WHERE id=$1 AND tenant_id=$2 AND status='SUCCEEDED' AND result_key IS NOT NULL AND result_expires_at>now()`
+	} else if r.PathValue("kind") == "bundle" {
+		query = `SELECT result_meta->>'bundle_key',result_expires_at FROM jobs WHERE id=$1 AND tenant_id=$2 AND status='SUCCEEDED' AND result_meta->>'bundle_key' IS NOT NULL AND result_expires_at>now()`
 	} else if r.PathValue("kind") != "source" {
 		http.NotFound(w, r)
 		return
@@ -179,7 +181,11 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", info.ContentType)
-	http.ServeContent(w, r, "video.mp4", info.LastModified, obj)
+	name := "视频.mp4"
+	if r.PathValue("kind") == "bundle" {
+		name = "HLS视频.zip"
+	}
+	http.ServeContent(w, r, name, info.LastModified, obj)
 }
 
 func validConsoleVideo(streams []struct {

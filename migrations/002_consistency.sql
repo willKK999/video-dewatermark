@@ -4,7 +4,7 @@
 
 ALTER TABLE uploads DROP CONSTRAINT IF EXISTS uploads_content_type_check;
 ALTER TABLE uploads ADD CONSTRAINT uploads_content_type_check
- CHECK (content_type IN ('video/mp4', 'video/quicktime'));
+ CHECK (content_type IN ('video/mp4', 'video/quicktime', 'application/vnd.apple.mpegurl'));
 
 CREATE UNIQUE INDEX IF NOT EXISTS uploads_tenant_id_uidx ON uploads (tenant_id, id);
 
