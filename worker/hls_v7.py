@@ -586,22 +586,15 @@ def verify_block(work, assets, info):
         视频摘要=sha256(result),
         通过=candidates == 0 and low_count == 0,
     )
-    # 自动候选原样保留。误报只能由与当前视频摘要绑定的逐项人工证据排除。
+    # 所有类型均保留逐项证据；误报复核必须同时绑定视频、候选清单和完整序号。
+    from .hls_final_audit import approved_review
+    ledger = block_candidates(quality, brand, panel, low)
+    import hashlib
+    candidate_digest = hashlib.sha256(json.dumps(ledger, sort_keys=True).encode()).hexdigest()
+    summary.update(原始候选=ledger, 候选摘要=candidate_digest)
     review_path = work / "review.json"
-    if candidates and review_path.exists():
-        review = json.loads(review_path.read_text())
-        items = review.get("逐项复核", [])
-        if (
-            review.get("视频摘要") == summary["视频摘要"]
-            and len(items) == candidates
-            and all(
-                p.get("结论") == "误报"
-                and p.get("证据文件")
-                and Path(p["证据文件"]).is_file()
-                for p in items
-            )
-        ):
-            summary.update(残留=low_count, 通过=low_count == 0, 人工误报复核=review)
+    if ledger and approved_review(review_path, summary["视频摘要"], candidate_digest, len(ledger)):
+        summary.update(残留=0, 低频残留=0, 通过=True, 人工误报复核=json.loads(review_path.read_text()))
     write_json(work / "verified.json", summary)
     shutil.rmtree(encoded)
     print(
@@ -621,6 +614,21 @@ def verify_block(work, assets, info):
         ),
         flush=True,
     )
+
+
+def block_candidates(quality, brand, panel, low):
+    """统一单块的自动原始候选，禁止用计数相同代替候选身份相同。"""
+    from .hls_settings import is_residual_score
+
+    rows = [dict(类型="移动模板", 详情=p) for p in quality["moving_evidence"]]
+    rows += [dict(类型="固定时域模板", 详情=p) for p in quality["fixed_template_scores"] if any(is_residual_score(s) for s in p["components"])]
+    rows += [dict(类型="完整品牌", 详情=p) for p in brand["证据"]]
+    rows += [dict(类型="不透明面板", 详情=p) for p in panel["证据"]]
+    rows += [dict(类型="完整图形低频", 详情=p) for p in (low or {}).get("区域", []) if p["residual"]]
+    expected = quality["residual_count"] + brand["残留证据数"] + panel["候选数"] + (low or {}).get("残留区域数", 0)
+    if len(rows) != expected:
+        raise PipelineError("OUTPUT_INVALID", "单块原始候选清单和计数不一致")
+    return rows
 
 
 def scale_plan(plan, factor):

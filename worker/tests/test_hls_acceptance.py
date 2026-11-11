@@ -138,3 +138,26 @@ def test_clarity_sampling_covers_both_phases_and_late_target_boundaries():
     assert set(range(72, 77)) <= selected
     assert set(range(88, 93)) <= selected
     assert sample_pairs(indices, d, 1) == set(range(1, 180))
+
+
+def test_block_review_covers_low_band_and_all_detectors_without_discarding_raw_items():
+    from worker.hls_v7 import block_candidates
+    point = dict(correlation=.6, relative_amplitude=.3)
+    quality = dict(moving_evidence=[dict(frame=5)], fixed_template_scores=[dict(components=[point])], residual_count=2)
+    brand = dict(证据=[dict(frame=7)], 残留证据数=1)
+    panel = dict(证据=[dict(frame=8)], 候选数=1)
+    low = dict(区域=[dict(region=4, residual=True, components=[point])], 残留区域数=1)
+    rows = block_candidates(quality, brand, panel, low)
+    assert len(rows) == 5 and rows[-1]["类型"] == "完整图形低频"
+    assert rows[-1]["详情"] == low["区域"][0]
+    with pytest.raises(PipelineError):
+        block_candidates(dict(quality, residual_count=1), brand, panel, low)
+
+
+def test_same_candidate_count_cannot_reuse_a_different_candidate_review(tmp_path):
+    from worker.hls_final_audit import approved_review
+    proof = tmp_path / "对照图.jpg"
+    proof.write_bytes(b"evidence")
+    path = tmp_path / "review.json"
+    path.write_text(json.dumps(dict(视频摘要="same-video", 候选摘要="old-candidates", 逐项复核=[dict(候选序号=0, 结论="误报", 证据文件=str(proof))])))
+    assert not approved_review(path, "same-video", "new-candidates", 1)
