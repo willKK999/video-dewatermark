@@ -201,4 +201,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        from .gpu_lock import device_lock
+    except ImportError:
+        from gpu_lock import device_lock
+    with device_lock():
+        main()

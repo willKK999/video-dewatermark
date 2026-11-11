@@ -290,7 +290,12 @@ def validate_segments(playlist, segments, check):
     return first_pts
 
 
-def chunks(durations, fps, context=2, target=24):
+def chunks(durations, fps, context=None, target=None):
+    from .hls_settings import HLSSettings
+
+    settings = HLSSettings.from_env()
+    context = settings.context_seconds if context is None else context
+    target = settings.block_seconds if target is None else target
     """所有边界在同一帧网格，主体按分片对齐；过长分片在帧边界拆开。"""
     total = round(sum(durations) * fps)
     boundaries = [round(sum(durations[: i + 1]) * fps) for i in range(len(durations))]
@@ -583,7 +588,7 @@ def checkpoint_hash(digest, options, engine, low_memory, execution_fingerprint="
     return hashlib.sha256(
         json.dumps(
             dict(
-                strategy="hls-multitrack-consensus-v7",
+                strategy="hls-multitrack-lifetimes-v8",
                 source=digest,
                 options=options,
                 models=os.getenv("MODEL_LOCK_HASH", ""),
@@ -751,6 +756,33 @@ def execute_hls(
             progress(0, len(plans), "detect")
             prior_path = prepare(full, root, check)
             s3.upload_file(str(prior_path), bucket, prior_key)
+    from .hls_settings import reusable_profile
+    from .vision import sha256 as content_sha256
+
+    if os.getenv("HLS_NATIVE_V7", "false").lower() == "true" and reusable_profile(
+        os.getenv("HLS_V7_ASSETS"), content_sha256(full), source_fps
+    ):
+        from .hls_v7 import execute_native
+
+        return execute_native(
+            full,
+            root,
+            options,
+            engine,
+            stage,
+            check,
+            s3,
+            bucket,
+            checkpoint_prefix,
+            progress,
+            prior_path,
+            segments,
+            lines,
+            digest,
+            source_pts,
+            source_fps,
+            started,
+        )
     for i, p in enumerate(plans):
         check()
         progress(i + 1, len(plans), "probe")

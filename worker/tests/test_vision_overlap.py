@@ -152,3 +152,126 @@ def test_single_frame_scene_gets_same_frame_context_without_extra_output(
     assert (
         len(calls) == 1 and len(list((tmp_path / "composite").glob("*.png"))) == count
     )
+
+
+def test_overlap_records_measured_disagreement_without_changing_limit(tmp_path):
+    previous = np.full((12, 12, 3), 50, np.uint8)
+    file, window, references = setup_window(
+        tmp_path,
+        previous,
+        previous,
+        np.full_like(previous, 60),
+        np.full((12, 12), 255, np.uint8),
+    )
+    performance = dict(composite_io_seconds=0, restoration_seconds=0)
+    _composite_window(
+        tmp_path, [file], 0, 1, 8, window, lambda: None, references, performance
+    )
+    assert performance["overlap_samples"] == 1
+    assert performance["overlap_max_mae"] == 10
+
+
+def test_partial_scene_inpaint_does_not_read_masks_outside_requested_range(
+    tmp_path, monkeypatch
+):
+    from worker import vision
+    from pathlib import Path
+    import sys
+
+    for folder in ["frames", "masks"]:
+        (tmp_path / folder).mkdir()
+    image = np.full((20, 20, 3), 80, np.uint8)
+    files = []
+    for i in range(6):
+        path = tmp_path / "frames" / f"{i:06d}.png"
+        cv2.imwrite(str(path), image)
+        files.append(path)
+    for i in [2, 3]:
+        cv2.imwrite(
+            str(tmp_path / "masks" / files[i].name), np.zeros((20, 20), np.uint8)
+        )
+    monkeypatch.setenv("INPAINT_PYTHON", sys.executable)
+    monkeypatch.setenv("PROPAINTER_ROOT", str(tmp_path))
+    monkeypatch.setattr(
+        vision,
+        "CleanReferences",
+        lambda *a: SimpleNamespace(restore=lambda x, m, y: y, stats={}, timings={}),
+    )
+
+    def model(args, check, cwd):
+        dest = Path(args[args.index("--output") + 1]) / "frames/frames"
+        dest.mkdir(parents=True)
+        for i in range(2):
+            cv2.imwrite(str(dest / f"{i:06d}.png"), image)
+
+    monkeypatch.setattr(vision, "run", model)
+    vision.inpaint(tmp_path, files, [(2, 4)], "propainter")
+    assert {p.name for p in (tmp_path / "composite").glob("*.png")} == {
+        "000002.png",
+        "000003.png",
+    }
+
+
+@pytest.mark.parametrize("corrupt_context", [False, True])
+def test_conditioned_overlap_uses_real_clean_frames_and_keeps_disagreement_gate(
+    tmp_path, monkeypatch, corrupt_context
+):
+    from worker import vision
+    from pathlib import Path
+    import sys
+
+    for name in ["frames", "masks"]:
+        (tmp_path / name).mkdir()
+    image = np.full((20, 20, 3), 20, np.uint8)
+    mask = np.zeros((20, 20), np.uint8)
+    mask[5:15, 5:15] = 255
+    files = []
+    for i in range(45):
+        f = tmp_path / "frames" / f"{i:06d}.png"
+        cv2.imwrite(str(f), image)
+        cv2.imwrite(str(tmp_path / "masks" / f.name), mask)
+        files.append(f)
+    monkeypatch.setenv("INPAINT_PYTHON", sys.executable)
+    monkeypatch.setenv("PROPAINTER_ROOT", str(tmp_path))
+    monkeypatch.setattr(
+        vision,
+        "CleanReferences",
+        lambda *a: SimpleNamespace(
+            restore=lambda image, mask, repair: repair, stats={}, timings={}
+        ),
+    )
+    calls = []
+
+    def model(args, check, cwd):
+        frames = Path(args[args.index("--video") + 1])
+        masks = Path(args[args.index("--mask") + 1])
+        out = Path(args[args.index("--output") + 1]) / "frames/frames"
+        out.mkdir(parents=True)
+        for j, f in enumerate(sorted(frames.glob("*.png"))):
+            source = cv2.imread(str(f))
+            m = cv2.imread(str(masks / f.name), 0)
+            if calls and j < 8:
+                previous = cv2.imread(str(tmp_path / "composite" / f"{j+28:06d}.png"))
+                assert not m.any() and np.array_equal(source, previous)
+                predicted = np.zeros_like(source) if corrupt_context else source
+            else:
+                predicted = source.copy()
+                predicted[m > 0] = 200
+            cv2.imwrite(str(out / f.name), predicted)
+        calls.append(1)
+
+    monkeypatch.setattr(vision, "run", model)
+    if corrupt_context:
+        with pytest.raises(PipelineError, match="overlap disagreement"):
+            vision.inpaint(
+                tmp_path, files, [(0, 45)], "propainter", True, condition_overlap=True
+            )
+    else:
+        vision.inpaint(
+            tmp_path, files, [(0, 45)], "propainter", True, condition_overlap=True
+        )
+        assert len(calls) == 2
+        import json
+
+        metrics = json.loads((tmp_path / "performance.json").read_text())
+        assert metrics["overlap_samples"] == 8 and metrics["overlap_max_mae"] == 0

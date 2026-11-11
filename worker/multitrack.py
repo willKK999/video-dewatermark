@@ -1,5 +1,7 @@
 """由跨时段共识建立多水印先验，不使用影片坐标或字幕位置规则。"""
 
+from .hls_settings import is_residual_score
+
 import json
 from pathlib import Path
 import cv2
@@ -494,7 +496,7 @@ def component_scores(template, result, support):
     return records
 
 
-def residual_quality(root, files, detections, check=lambda: None):
+def residual_quality(root, files, detections, check=lambda: None, frame_reader=None):
     """独立检查完整模板（包括图标），避免仅按单个文字框宣称零残留。"""
     from .process import PipelineError
 
@@ -503,19 +505,25 @@ def residual_quality(root, files, detections, check=lambda: None):
     samples = []
     moving_evidence = []
     scores = []
+    moving_by_frame = {}
+    for track in detections["tracks"]:
+        if track["kind"] == "moving":
+            for hint in track["hints"]:
+                moving_by_frame.setdefault(hint["frame"], []).append((track, hint))
     indices = range(len(files))
     for i in indices:
         check()
-        image = cv2.imread(str(root / "composite" / files[i].name))
+        image = (
+            frame_reader(i)
+            if frame_reader
+            else cv2.imread(str(root / "composite" / files[i].name))
+        )
+        if image is None:
+            raise PipelineError("OUTPUT_INVALID", "残留核验帧缺失")
         feature = highpass(cv2.resize(image, (median.shape[1], median.shape[0])))
         if i % 30 == 0:
             samples.append(feature)
-        for track in detections["tracks"]:
-            if track["kind"] != "moving":
-                continue
-            hint = next((p for p in track["hints"] if p["frame"] == i), None)
-            if hint is None:
-                continue
+        for track, hint in moving_by_frame.get(i, []):
             v = next(
                 v
                 for v in templates
@@ -549,7 +557,8 @@ def residual_quality(root, files, detections, check=lambda: None):
             strong_parts = [
                 p
                 for p in partial
-                if p["correlation"] >= 0.55 and p["relative_amplitude"] >= 0.15
+                if abs(p["correlation"]) >= 0.55
+                and abs(p["relative_amplitude"]) >= 0.15
             ]
             if candidates or strong_parts:
                 confidence = max(
@@ -584,10 +593,7 @@ def residual_quality(root, files, detections, check=lambda: None):
                     ),
                 )
             )
-            if any(
-                p["correlation"] >= 0.35 and p["relative_amplitude"] >= 0.15
-                for p in components
-            ):
+            if any(is_residual_score(p) for p in components):
                 fixed.append(region["id"])
     count = len(moving_evidence) + len(fixed)
     quality = dict(
@@ -621,10 +627,7 @@ def refine(root, files, detections, engine, low_memory, fps, stage, check):
         fixed = {
             x["track_id"]
             for x in quality["fixed_template_scores"]
-            if any(
-                p["correlation"] >= 0.35 and p["relative_amplitude"] >= 0.15
-                for p in x.get("components", [x])
-            )
+            if any(is_residual_score(p) for p in x.get("components", [x]))
         }
         moving = {(p["frame"], p["track_id"]) for p in quality["moving_evidence"]}
         affected = {

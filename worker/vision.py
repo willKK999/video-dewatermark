@@ -277,6 +277,12 @@ def masks(root, files, detections, engine, check=lambda: None):
                 x1, y1, x2, y2 = map(lambda x: int(round(x)), box)
                 mask[y1:y2, x1:x2] = 255
                 cv2.imwrite(str(dest / files[i].name), mask)
+    return validate_masks(root, files, detections, check)
+
+
+def validate_masks(root, files, detections, check=lambda: None):
+    """对已完成的 SAM 输出执行同一套完整覆盖及面积校验，供失败阶段续跑。"""
+    dest = root / "masks"
     if len(list(dest.glob("*.png"))) != len(files):
         raise PipelineError("MASK_INVALID", "mask count differs")
     prior = None
@@ -394,6 +400,12 @@ def _composite_window(
     predicted = sorted((window / "out" / "frames" / "frames").glob("*.png"))
     if len(predicted) != end - start:
         raise PipelineError("OUTPUT_INVALID", "ProPainter did not return every frame")
+    conditioned_path = window / "conditioned.json"
+    conditioned = (
+        set(json.loads(conditioned_path.read_text()))
+        if conditioned_path.exists()
+        else set()
+    )
     for j, p in enumerate(predicted, start):
         check()
         started = time.perf_counter()
@@ -404,20 +416,30 @@ def _composite_window(
             raise PipelineError("OUTPUT_INVALID", "repair geometry differs")
         performance["composite_io_seconds"] += time.perf_counter() - started
         started = time.perf_counter()
-        repair = soft_composite(
-            original, references.restore(original, mask, repair), mask
-        )
+        if j not in conditioned:
+            repair = soft_composite(
+                original, references.restore(original, mask, repair), mask
+            )
         performance["restoration_seconds"] += time.perf_counter() - started
         started = time.perf_counter()
         old = dest / files[j].name
         if old.exists():
             previous = read(old)
             region = mask > 0
-            if (
-                region.any()
-                and np.abs(previous.astype(float) - repair.astype(float))[region].mean()
-                > 35
-            ):
+            disagreement = (
+                float(
+                    np.abs(previous.astype(float) - repair.astype(float))[region].mean()
+                )
+                if region.any()
+                else 0.0
+            )
+            performance["overlap_max_mae"] = max(
+                performance.get("overlap_max_mae", 0), disagreement
+            )
+            performance["overlap_samples"] = performance.get("overlap_samples", 0) + 1
+            from .hls_settings import HLSSettings
+
+            if disagreement > HLSSettings.from_env().overlap_mae_limit:
                 raise PipelineError(
                     "SEAM_UNCERTAIN",
                     "overlap disagreement requires review",
@@ -430,7 +452,15 @@ def _composite_window(
     shutil.rmtree(window)
 
 
-def inpaint(root, files, scenes, engine, low_memory=False, check=lambda: None):
+def inpaint(
+    root,
+    files,
+    scenes,
+    engine,
+    low_memory=False,
+    check=lambda: None,
+    condition_overlap=False,
+):
     dest = root / "composite"
     dest.mkdir()
     if engine == "telea-dev":
@@ -442,14 +472,22 @@ def inpaint(root, files, scenes, engine, low_memory=False, check=lambda: None):
             image[mask > 0] = repaired[mask > 0]
             cv2.imwrite(str(dest / f.name), image)
         return
+    processed_indices = [i for start, end in scenes for i in range(start, end)]
     sampled_masks = [
-        read(root / "masks" / files[int(i)].name, True)
-        for i in np.linspace(0, len(files) - 1, min(8, len(files)), dtype=int)
+        read(root / "masks" / files[processed_indices[int(i)]].name, True)
+        for i in np.linspace(
+            0, len(processed_indices) - 1, min(8, len(processed_indices)), dtype=int
+        )
     ]
     mask_fraction = max(np.count_nonzero(mask) / mask.size for mask in sampled_masks)
     # 多目标联合掩膜增加稀疏注意力的活动区域，自动缩短窗口而不降分辨率。
     low_memory = low_memory or mask_fraction > 0.05
-    size, overlap = (36, 8) if low_memory else (60, 12)
+    from .hls_settings import HLSSettings
+
+    settings = HLSSettings.from_env()
+    size, overlap = (
+        (settings.window_frames, settings.overlap_frames) if low_memory else (60, 12)
+    )
     restoration_stats = []
     performance = dict(
         propainter_seconds=0.0,
@@ -458,6 +496,7 @@ def inpaint(root, files, scenes, engine, low_memory=False, check=lambda: None):
         window_frames=size,
         overlap_frames=overlap,
         mask_fraction=mask_fraction,
+        conditioned_overlap=condition_overlap,
         low_memory=low_memory,
     )
 
@@ -491,10 +530,29 @@ def inpaint(root, files, scenes, engine, low_memory=False, check=lambda: None):
                 frames.mkdir()
                 masks_dir = window / "masks"
                 masks_dir.mkdir()
+                conditioned = []
+                if condition_overlap and pending is not None:
+                    pending.result()
+                    pending = None
                 for j in range(start, end):
                     name = f"{j - start:06d}.png"
-                    os.link(files[j], frames / name)
-                    os.link(root / "masks" / files[j].name, masks_dir / name)
+                    previous = dest / files[j].name
+                    if condition_overlap and previous.exists():
+                        # 同时刻已完成画面作为干净上下文，不重新遮住它；真实模型输出仍走35阈值核验。
+                        os.link(previous, frames / name)
+                        cv2.imwrite(
+                            str(masks_dir / name),
+                            np.zeros(
+                                read(root / "masks" / files[j].name, True).shape,
+                                np.uint8,
+                            ),
+                        )
+                        conditioned.append(j)
+                    else:
+                        os.link(files[j], frames / name)
+                        os.link(root / "masks" / files[j].name, masks_dir / name)
+                if conditioned:
+                    (window / "conditioned.json").write_text(json.dumps(conditioned))
                 singleton = end - start == 1
                 if singleton:
                     # 单帧镜头没有跨帧光流；复制同帧，绝不借用转场另一侧的画面。
