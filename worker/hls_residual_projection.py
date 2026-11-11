@@ -8,6 +8,7 @@ from .matte import ink_support
 from .process import PipelineError
 from .vision import sha256
 from scripts.hls_chunk_check import mux_core_audio, audio_hash
+from .hls_settings import is_residual_score
 
 
 def fit_correction(template, consensus, mask):
@@ -89,11 +90,7 @@ def scan(video, prior, regions):
             dict(
                 region=region["id"],
                 components=parts,
-                residual=any(
-                    abs(p["correlation"]) >= 0.35
-                    and abs(p["relative_amplitude"]) >= 0.15
-                    for p in parts
-                ),
+                residual=any(is_residual_score(p) for p in parts),
             )
         )
     return scores, rgb
