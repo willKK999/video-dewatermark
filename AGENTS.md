@@ -38,6 +38,20 @@ export PYTHONPATH=.
 .venv/bin/python -m scripts.hls_chunk_check --source /workspace/dewatermark-data/hls-huangguo/source.mp4 --prior /工作目录/multitrack-prior.npz --output /验收目录 --duration 25 --context 2
 ```
 
+v7 整集内部的原生合成与核验单块续跑命令（传入持久目录中已完成准备与补画的块）：
+
+```sh
+.venv/bin/python -m worker.hls_v7 --native /持久工作目录/chunk-01 --assets /workspace/dewatermark-data/hls-huangguo/v7-assets.json
+```
+
+真实浏览器提交整集且保存任务编号：
+
+```sh
+python3 scripts/hls_browser_check.py --input kelin/hls-test/huangguo-sangni1-ep1/index.m3u8 --output /workspace/user-videos/hls-huangguo/full --submit-only
+```
+
+任务完成后用相同输出目录加 `--existing` 复验播放和下载，避免重复提交。浏览器脚本使用安装了 Playwright 的系统 Python。
+
 原生合成、细节重合成、编码后核验入口为 `scripts.hls_native_chunk`、`scripts.hls_recompose_detail`、`scripts.hls_native_verify`、`scripts.hls_brand_verify`、`scripts.hls_detail_verify`，各模块 `--help` 列出所需中间文件。整集主入口为 API 任务调用 `worker.hls.execute_hls`；导出已成功任务使用：
 
 ```sh
@@ -68,3 +82,13 @@ GOFLAGS= go test ./...
 ```
 
 或运行 `make test`。需要连接实际数据库与存储的集成测试在配置齐全且隔离的数据环境运行 `INTEGRATION=1 .venv/bin/python -m pytest worker/tests -q`。每项通用修复补充针对行为的单元测试。最终记录实际通过、跳过及失败数，检查完成后本地提交，绝不推送。
+
+多水印分层保持每遍20%面积保护，最终联合必须验证图层清单的检测摘要和逐帧掩膜摘要。完整图标低频复检使用全片共识带通模板；发现真实残留须补修，不能以高通检测为零替代实际目检。补修入口为 `worker.hls_graphic_repair`，新视频必须重新核验并绑定新摘要。GPU失败块保留检查点且继续其余块，不通过块不得发布。
+
+## 2026年11月11日23:24后的交付顺序
+
+优先完成整集v0。停止零散多轮补修，保留产物和检查点；正在执行的末尾块原生处理继续。每块统一执行一轮：v7原生处理、低频检查与补修、不透明面板补修、编码后复检。阶段失败只记录并保留当前完整产物，不阻止后续块及v0拼接；未通过的内容不得标为正式验收通过。
+
+先交付1920×1080、60帧的整集v0和720p、30帧小预览，音频复制。逐块进度与v0完成事件追加到本地整集目录。v0交付后才开始第二阶段，并先记录阶段开始事件；第二阶段排查清晰度指标与误报，只重跑未通过块。每个重要步骤本地提交，作者willkk。
+
+最高原则是通用能力：不能按影片或块号写算法特例、固定坐标或帧号；素材派生的轨迹和模板属于内容摘要绑定的缓存，不能作为其他输入的固定规则。参数集中配置；用合成样例验证指标及复检修改。单块诊断脚本及证据不进入主流水线。
