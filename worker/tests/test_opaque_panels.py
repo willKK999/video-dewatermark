@@ -100,3 +100,31 @@ def test_icon_residue_is_not_diluted_by_cleaned_text_panel():
     score = pair_score(source, result, np.full((100, 400), 255, np.uint8))
     assert score["correlation"] > 0.99 and score["relative_amplitude"] > 0.9
     assert any(p["part"] == [0, 0, 100, 50] for p in score["components"])
+
+
+def test_background_in_expansion_is_reported_separately_but_not_silently_cleared():
+    from worker.opaque_panels import measured_supports
+    from worker.hls_settings import is_residual_score
+    rng = np.random.default_rng(56)
+    source = rng.integers(0, 256, (160, 400, 3), dtype=np.uint8)
+    core = np.zeros((160, 400), np.uint8)
+    core[40:120, 140:260] = 255
+    expanded = np.full_like(core, 255)
+    result = source.copy()
+    result[15:145, 115:285] = 128
+    score = measured_supports(source, result, expanded, core)
+    assert is_residual_score(score) and score['仅外扩区触发']
+    assert not is_residual_score(score['完整轮廓测量'])
+
+
+def test_only_icon_left_inside_actual_support_remains_hard_candidate():
+    from worker.opaque_panels import measured_supports
+    from worker.hls_settings import is_residual_score
+    rng = np.random.default_rng(66)
+    source = rng.integers(0, 256, (100, 400, 3), dtype=np.uint8)
+    result = np.full_like(source, 128)
+    result[:50, :100] = source[:50, :100]
+    mask = np.full((100, 400), 255, np.uint8)
+    score = measured_supports(source, result, mask, mask)
+    assert is_residual_score(score) and not score['仅外扩区触发']
+    assert is_residual_score(score['完整轮廓测量'])

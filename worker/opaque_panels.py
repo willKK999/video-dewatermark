@@ -13,7 +13,7 @@ from . import vision
 from scripts.hls_chunk_check import mux_core_audio, audio_hash
 
 
-def panel_support(image, box):
+def panel_support(image, box, expand=True):
     h, w = image.shape[:2]
     x, y, a, b = [round(v) for v in box]
     pad = max(8, round((b - y) * 0.08))
@@ -72,6 +72,8 @@ def panel_support(image, box):
             local |= component
     if np.count_nonzero(out) < area * 0.35:
         return np.zeros_like(out)
+    if not expand:
+        return out
     radius = max(4, round((box[3] - box[1]) * 0.06))
     return cv2.dilate(out, np.ones((radius * 2 + 1, radius * 2 + 1), np.uint8))
 
@@ -153,6 +155,15 @@ def pair_score(source, result, mask):
         relative_amplitude=point["relative_amplitude"],
         components=parts,
     )
+
+
+def measured_supports(source, result, expanded, core):
+    """外扩区包含背景，单独列出复核范围；保留原告警，不以收紧测量区自动清零。"""
+    score = pair_score(source, result, expanded)
+    inner = pair_score(source, result, core)
+    score["完整轮廓测量"] = inner
+    score["仅外扩区触发"] = is_residual_score(score) and not is_residual_score(inner)
+    return score
 
 
 def patch(work, assets_path):
@@ -495,7 +506,10 @@ def verify(result, work, frame_offset=0, check=lambda: None):
             small = cv2.resize(image, (1280, 720))
             for point in by_frame[index]:
                 mask = panel_support(source, point["box"])
-                score = pair_score(source, small, mask)
+                score = measured_supports(
+                    source, small, mask,
+                    panel_support(source, point["box"], expand=False),
+                )
                 item = dict(
                     frame=n,
                     time=n / 60,

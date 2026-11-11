@@ -12,6 +12,15 @@ from .process import PipelineError
 from scripts.hls_chunk_check import mux_core_audio, audio_hash
 
 
+def residual_support(prior, signal, region):
+    """完整圆形部件与真实文字笔画并集；普通文字不应因没有圆形而无法补修。"""
+    from .matte import ink_support
+
+    return complete_play_graphics(prior, signal, region) | ink_support(
+        prior, signal, region["mask"], 3
+    )
+
+
 def verify_low(result, template, regions):
     cap = cv2.VideoCapture(str(result))
     fps = cap.get(5)
@@ -67,7 +76,13 @@ def patch(work, assets_path, low_template_path, complete_ink=False):
     prior, signal, regions, _, _ = load_prior(Path(assets["prior"]))
     low = np.load(low_template_path)["template"]
     root = work / ("residual-ink" if complete_ink else "complete-graphics")
+    method = "当前成品低频笔画补修-2"
+    if root.exists() and any(root.iterdir()):
+        marker = root / "method.json"
+        if not marker.exists() or json.loads(marker.read_text()).get("方法") != method:
+            root.rename(work / (root.name + "-previous-" + str(time.time_ns())))
     root.mkdir(exist_ok=True)
+    (root / "method.json").write_text(json.dumps(dict(方法=method), ensure_ascii=False))
     report_path = root / "report.json"
     if report_path.exists():
         saved = json.loads(report_path.read_text())
@@ -104,16 +119,10 @@ def patch(work, assets_path, low_template_path, complete_ink=False):
         )
         return
     graphics = {
-        r["id"]: complete_play_graphics(prior, signal, r)
+        r["id"]: residual_support(prior, signal, r)
         for r in regions
         if r["id"] in identities
     }
-    if complete_ink:
-        from .matte import ink_support
-
-        for r in regions:
-            if r["id"] in identities:
-                graphics[r["id"]] |= ink_support(prior, signal, r["mask"], 3)
     if any(not graphics[i].any() for i in identities):
         raise PipelineError(
             "RESIDUAL_UNCERTAIN",
@@ -127,35 +136,32 @@ def patch(work, assets_path, low_template_path, complete_ink=False):
         Path(info["graphics"]),
     )
     frames = sorted((coarse / "frames").glob("*.png"))
-    if complete_ink:
-        (root / "frames").mkdir(exist_ok=True)
-        if not (root / "frames-complete.json").exists():
-            cap = cv2.VideoCapture(str(final))
-            mapping = meta["帧映射"]
-            seen = set()
-            for n, index in enumerate(mapping):
-                ok, image = cap.read()
-                if not ok:
-                    raise PipelineError("OUTPUT_INVALID", "残留笔画复修缺少原生帧")
-                if index not in seen:
-                    cv2.imwrite(
-                        str(root / "frames" / f"{index:06d}.png"),
-                        cv2.resize(image, (1280, 720), interpolation=cv2.INTER_CUBIC),
-                    )
-                    seen.add(index)
-            cap.release()
-            missing = []
-            for file in frames:
-                if not (root / "frames" / file.name).exists():
-                    shutil.copyfile(
-                        coarse / "composite" / file.name, root / "frames" / file.name
-                    )
-                    missing.append(file.name)
-            (root / "frames-complete.json").write_text(
-                json.dumps(dict(补齐无原生对应帧=missing))
-            )
-    elif not (root / "frames").exists():
-        (root / "frames").symlink_to(coarse / "composite", target_is_directory=True)
+    (root / "frames").mkdir(exist_ok=True)
+    if not (root / "frames-complete.json").exists():
+        cap = cv2.VideoCapture(str(final))
+        mapping = meta["帧映射"]
+        seen = set()
+        for n, index in enumerate(mapping):
+            ok, image = cap.read()
+            if not ok:
+                raise PipelineError("OUTPUT_INVALID", "残留笔画复修缺少原生帧")
+            if index not in seen:
+                cv2.imwrite(
+                    str(root / "frames" / f"{index:06d}.png"),
+                    cv2.resize(image, (1280, 720), interpolation=cv2.INTER_CUBIC),
+                )
+                seen.add(index)
+        cap.release()
+        missing = []
+        for file in frames:
+            if not (root / "frames" / file.name).exists():
+                shutil.copyfile(
+                    coarse / "composite" / file.name, root / "frames" / file.name
+                )
+                missing.append(file.name)
+        (root / "frames-complete.json").write_text(
+            json.dumps(dict(补齐无原生对应帧=missing))
+        )
     (root / "masks").mkdir(exist_ok=True)
     areas = []
     for i, file in enumerate(frames):
@@ -292,7 +298,7 @@ def patch(work, assets_path, low_template_path, complete_ink=False):
         )
         shape = (na - nx, nb - ny)
         before = cv2.resize(
-            cv2.imread(str(coarse / "composite" / f"{index:06d}.png"))[y:b, x:a],
+            cv2.imread(str(root / "frames" / f"{index:06d}.png"))[y:b, x:a],
             shape,
             interpolation=cv2.INTER_CUBIC,
         ).astype(np.float32)
@@ -360,6 +366,7 @@ def patch(work, assets_path, low_template_path, complete_ink=False):
         raise PipelineError("OUTPUT_INVALID", "低频修复改变压缩音频")
     after = verify_low(patched, low, regions)
     report = dict(
+        方法=method,
         修复区域=sorted(identities),
         真实笔画保护=complete_ink,
         最大补全面积比例=max(areas),
@@ -370,7 +377,7 @@ def patch(work, assets_path, low_template_path, complete_ink=False):
         修复后视频摘要=vision.sha256(patched),
         音频内容一致=True,
         掩膜外像素策略="复用v7成品；中间RGB无损编码，最终HLS统一编码",
-        高频策略="保留v7成品高频，只加减补画基底的标准差3低频差分",
+        高频策略=("真实笔画内使用补画结果" if complete_ink else "保留v7成品高频，只加减当前基底的标准差3低频差分"),
     )
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2))
     patched.replace(final)

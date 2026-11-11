@@ -109,3 +109,28 @@ def test_rgb_lossless_intermediate_keeps_all_existing_pixels(tmp_path):
         assert np.array_equal(actual, expected)
     assert not cap.read()[0]
     cap.release()
+
+
+def test_text_without_circular_icon_has_reliable_residual_support():
+    from worker.hls_graphic_repair import residual_support
+    image = np.full((100, 240), 128, np.uint8)
+    cv2.putText(image, 'Sample', (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 1, 220, 2)
+    feature = image.astype(np.float32) - 128
+    signal = (feature > 0).astype(np.uint8) * 255
+    region = dict(id=1, box=[10, 20, 210, 80], mask=signal.copy())
+    support = residual_support(feature, signal, region)
+    assert np.all(support[signal > 0] > 0)
+    assert not support[90, 230] and np.count_nonzero(support) < support.size * .2
+
+
+def test_low_band_retry_uses_current_baseline_without_reapplying_old_delta():
+    mask = np.full((100, 100), 255, np.uint8)
+    source = np.full((100, 100, 3), 120, np.uint8)
+    source[30:70, 30:70] = 160
+    clean = np.full_like(source, 120)
+    once = repair_low_band(source, source, clean, mask)
+    # 已清理的当前输入和模型输出一致时，不可再次扣除最初源片的水印差分。
+    again = repair_low_band(once, clean, clean, mask)
+    assert np.array_equal(again, once)
+    doubled = repair_low_band(once, source, clean, mask)
+    assert np.abs(doubled.astype(float) - clean).mean() > np.abs(again.astype(float) - clean).mean()
