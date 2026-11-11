@@ -16,7 +16,9 @@ Vast 整集任务结束且确认 GPU 空闲之前，禁止同步代码、禁止�
 
 本地检查：`INTEGRATION= .venv/bin/python -m pytest worker/tests -q --tb=short`。没有虚拟环境时可只读调用主目录 Python，但设置 `PYTHONDONTWRITEBYTECODE=1`，避免向主目录写缓存。
 
-基准入口：`python -m scripts.hls_speedup_bench --help`；完整参数、独立目录的部署及 GPU 空闲后的操作见 `docs/speedup-v2.md`。本次不得在 Vast 执行。基准必须区分预期提速与实测结果，记录检测、分割、补画、合成、细节融合和编码的耗时；复用缓存必须校验输入和参数。
+基准入口：`.venv/bin/python -m scripts.hls_speedup_bench --help`；完整参数、独立目录的部署及 GPU 空闲后的操作见 `docs/speedup-v2.md`。本次不得在 Vast 执行。基准必须区分预期提速与实测结果，记录检测、分割、补画、合成、细节融合和编码的耗时；复用缓存必须校验输入和参数。
+
+提速入口为流水线选项 `speedup_v2=True`，也可分别使用 `PROPAINTER_ROI=true`、`SAM_SPEEDUP=true`。原生脚本使用 `--backend torch-cuda --fused-detail --output-fps 60 --crf 10`；首次对照使用软件编码，显卡编码须先比较质量。基准必须在独立目录运行，使用固定模型清单，单块输入含上下文不超过30秒。标准测试依赖见 `worker/requirements-dev.txt`；完整张量对齐测试另需 `worker/requirements-speedup.txt`，本地使用纯处理器构建，不运行真实模型。
 
 对照已接受 v7，保留原始残留候选及复核依据；残留为零、无修复闪现/闪烁是硬门槛。记录全部清晰度样本及低于 0.7 的样本；相对 v7 的清晰度、SSIM/PSNR 不得明显变差。没有 GPU 基准和目检结果不得宣称达到三倍提速或质量验收通过。输出 1920×1080、60 帧，音频只复制。
 

@@ -36,7 +36,10 @@ def execute(
     short = options.get("max_short_edge", 720)
     if low_memory and options.get("allow_downgrade"):
         short = min(short, 540)
-    info = step("probe", lambda: media.normalize(source, root, short, check))
+    normalizer = (
+        media.normalize_direct if options.get("speedup_v2") else media.normalize
+    )
+    info = step("probe", lambda: normalizer(source, root, short, check))
     source_w, source_h = info["source_width"], info["source_height"]
     baseline_scale = min(
         1,
@@ -51,9 +54,14 @@ def execute(
         "detect",
         lambda: vision.detect(files, vision.shots(files, check), options, root, check),
     )
+    mask_options = {"speedup": True} if options.get("speedup_v2") else {}
+    inpaint_options = {"roi": True} if options.get("speedup_v2") else {}
     try:
         manifest = step(
-            "mask", lambda: vision.masks(root, files, detections, engine, check)
+            "mask",
+            lambda: vision.masks(
+                root, files, detections, engine, check, **mask_options
+            ),
         )
     except PipelineError as exc:
         if exc.code not in ("TRACKING_DRIFT", "MASK_UNCERTAIN") or not (
@@ -69,7 +77,10 @@ def execute(
             ),
         )
         manifest = step(
-            "mask", lambda: vision.masks(root, files, detections, engine, check)
+            "mask",
+            lambda: vision.masks(
+                root, files, detections, engine, check, **mask_options
+            ),
         )
     for frame in manifest:
         frame["pts_ms"] = round(frame["frame_index"] * 1000 / info["fps"], 3)
@@ -85,7 +96,13 @@ def execute(
     step(
         "inpaint",
         lambda: vision.inpaint(
-            root, files, detections["scenes"], engine, low_memory, check
+            root,
+            files,
+            detections["scenes"],
+            engine,
+            low_memory,
+            check,
+            **inpaint_options,
         ),
     )
     dest = step("encode", lambda: media.encode(root, info, check))

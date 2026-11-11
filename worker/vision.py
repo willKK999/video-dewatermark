@@ -247,7 +247,7 @@ def detect(files, scenes, options, root, check=lambda: None, dense=False):
     return result
 
 
-def masks(root, files, detections, engine, check=lambda: None):
+def masks(root, files, detections, engine, check=lambda: None, speedup=False):
     dest = root / "masks"
     dest.mkdir()
     if engine == "propainter":
@@ -257,6 +257,7 @@ def masks(root, files, detections, engine, check=lambda: None):
                 str(Path(__file__).with_name("sam_stage.py")),
                 "--root",
                 root,
+                *(["--speedup"] if speedup else []),
             ],
             check,
         )
@@ -394,7 +395,7 @@ def windows(start, end, size=60, overlap=12):
 
 
 def _composite_window(
-    root, files, start, end, overlap, window, check, references, performance
+    root, files, start, end, overlap, window, check, references, performance, cleanup=True
 ):
     dest = root / "composite"
     predicted = sorted((window / "out" / "frames" / "frames").glob("*.png"))
@@ -440,10 +441,14 @@ def _composite_window(
             repair = cv2.addWeighted(repair, weight, previous, 1 - weight, 0)
         cv2.imwrite(str(old), repair)
         performance["composite_io_seconds"] += time.perf_counter() - started
-    shutil.rmtree(window)
+    if cleanup:
+        shutil.rmtree(window)
 
 
-def inpaint(root, files, scenes, engine, low_memory=False, check=lambda: None):
+def inpaint(root, files, scenes, engine, low_memory=False, check=lambda: None, roi=False):
+    if engine == "propainter" and (roi or os.getenv("PROPAINTER_ROI") == "true"):
+        from .roi_inpaint import inpaint_roi
+        return inpaint_roi(root, files, scenes, low_memory, check)
     dest = root / "composite"
     dest.mkdir()
     if engine == "telea-dev":

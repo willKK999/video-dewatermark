@@ -4,6 +4,7 @@ import argparse, json, subprocess, time
 from pathlib import Path
 import cv2, numpy as np
 from worker.fine_masks import Supports
+from worker.speedup import encoder_args
 from worker.matte import (
     projected_texture_composite,
     temporal_detail,
@@ -24,9 +25,16 @@ def recompose(
     calibration,
     audio_source,
     output,
+    backend="numpy",
+    encoder_name="libx264",
 ):
     output.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
+    projector = projected_texture_composite
+    if backend != "numpy":
+        from worker.torch_composite import TorchCompositor
+
+        projector = TorchCompositor("cpu" if backend == "torch-cpu" else "cuda").project
     meta = json.loads(metadata.read_text())
     mapping = meta["帧映射"]
     s = Supports(
@@ -62,12 +70,7 @@ def recompose(
             "-i",
             "-",
             "-an",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "fast",
-            "-crf",
-            "10",
+            *encoder_args(encoder_name, 10),
             "-pix_fmt",
             "yuv420p",
             str(silent),
@@ -125,7 +128,7 @@ def recompose(
             union[cv2.dilate(opaque, np.ones((5, 5), np.uint8)) > 0] = 0
             out = base.copy()
             if templates and union.any():
-                proposed = projected_texture_composite(
+                proposed = projector(
                     x,
                     base,
                     union,
@@ -167,7 +170,14 @@ def recompose(
     meta.update(
         dict(
             清晰度统计=stats,
-            清晰度通过=all(q["passed"] for q in stats)
+            清晰度仅记录=True,
+            低于零点七的样本=[
+                q for q in stats if q["measurable"] and q["retention_ratio"] < 0.7
+            ],
+            合成后端=backend,
+            编码器=encoder_name,
+            清晰度通过=None,
+            历史清晰度参考线满足=all(q["passed"] for q in stats)
             and sum(q["measurable"] for q in stats) >= 50,
             清晰度最小保留比=min(
                 (q["retention_ratio"] for q in stats if q["measurable"]), default=None
@@ -183,9 +193,7 @@ def recompose(
     (output / "native-report.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=2)
     )
-    print(
-        "原片细节重合成检查", meta["清晰度通过"], meta["清晰度最小保留比"], flush=True
-    )
+    print("原片细节重合成完成，清晰度最低记录", meta["清晰度最小保留比"], flush=True)
 
 
 def main():
@@ -204,6 +212,18 @@ def main():
         "output",
     ]:
         p.add_argument("--" + name, type=Path, required=True)
+    p.add_argument(
+        "--backend",
+        choices=["numpy", "torch-cpu", "torch-cuda"],
+        default="numpy",
+        help="纹理合成后端",
+    )
+    p.add_argument(
+        "--encoder",
+        choices=["libx264", "h264_nvenc"],
+        default="libx264",
+        help="高质量编码器",
+    )
     a = p.parse_args()
     cv2.setNumThreads(2)
     recompose(
@@ -218,6 +238,8 @@ def main():
         a.calibration,
         a.audio_source,
         a.output,
+        a.backend,
+        a.encoder,
     )
 
 

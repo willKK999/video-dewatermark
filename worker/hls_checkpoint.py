@@ -84,7 +84,10 @@ def restore_draft(s3, bucket, key, root, clip, options, low_memory, check):
     short = options.get("max_short_edge", 720)
     if low_memory and options.get("allow_downgrade"):
         short = min(short, 540)
-    media.normalize(clip, root, short, check)
+    normalizer = (
+        media.normalize_direct if options.get("speedup_v2") else media.normalize
+    )
+    normalizer(clip, root, short, check)
     (root / "composite").mkdir()
     run(
         [

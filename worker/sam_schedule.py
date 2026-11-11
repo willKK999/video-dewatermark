@@ -48,3 +48,43 @@ def load_mask_prompt(root, relative, shape):
     if mask is None or mask.shape != shape or not set(np.unique(mask)) <= {0, 255}:
         raise ValueError("自动掩膜提示尺寸或取值无效")
     return mask > 0
+
+
+def adaptive_hints(hints, start, end, stride=30, motion_fraction=0.2):
+    """每条轨迹保留首尾、最长间隔和显著运动提示，不跳过生命周期。"""
+    import math
+
+    if stride < 1 or not 0 < motion_fraction <= 1:
+        raise ValueError("关键帧采样参数无效")
+    groups = {}
+    for point in sorted(hints, key=lambda p: p["frame"]):
+        if start <= point["frame"] < end:
+            groups.setdefault(point.get("track_id", 1), []).append(point)
+    result = []
+    for points in groups.values():
+        previous = None
+        for point in points:
+            keep = previous is None or point is points[-1]
+            if previous is not None:
+                keep |= point["frame"] - previous["frame"] >= stride
+                if "box" in point and "box" in previous:
+                    x, y, a, b = previous["box"]
+                    u, v, c, d = point["box"]
+                    diagonal = max(math.hypot(a - x, b - y), 1)
+                    motion = math.hypot((u + c - x - a) / 2, (v + d - y - b) / 2)
+                    area_ratio = max((c - u) * (d - v), 1) / max((a - x) * (b - y), 1)
+                    keep |= (
+                        motion > diagonal * motion_fraction
+                        or not 0.7 <= area_ratio <= 1.3
+                    )
+            if keep:
+                result.append(point)
+                previous = point
+    return sorted(result, key=lambda p: (p["frame"], p.get("track_id", 1)))
+
+
+def segmentation_shape(height, width, max_edge):
+    if max_edge < 128:
+        raise ValueError("分割准备图像长边不得低于一百二十八像素")
+    scale = min(1, max_edge / max(height, width))
+    return max(1, round(height * scale)), max(1, round(width * scale))

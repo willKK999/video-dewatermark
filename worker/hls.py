@@ -577,6 +577,7 @@ def checkpoint_hash(digest, options, engine, low_memory, execution_fingerprint="
                 "RESTORE_",
                 "SAM_",
                 "PROPAINTER_",
+                "SPEEDUP_",
             )
         )
     }

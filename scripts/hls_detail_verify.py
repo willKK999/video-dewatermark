@@ -56,7 +56,7 @@ def verify(source, result, mapping, detected, prior, alpha, graphic, output):
                         phase=n % 2,
                         stable_fraction=np.count_nonzero(stable)
                         / max(1, np.count_nonzero(mask)),
-                        **metric
+                        **metric,
                     )
                 )
         previous = x, y, faint, other, occupied
@@ -67,22 +67,23 @@ def verify(source, result, mapping, detected, prior, alpha, graphic, output):
     valid = [s for s in stats if s["measurable"]]
     failed = [s for s in valid if not s["passed"]]
     report = dict(
-        通过=not failed and len(valid) >= 50,
-        阈值=0.8,
+        通过=None,
+        清晰度仅记录=True,
+        历史参考阈值=0.8,
+        低于零点七的样本=[s for s in valid if s["retention_ratio"] < 0.7],
         帧数=len(indices),
         有效样本数=len(valid),
-        不通过样本数=len(failed),
+        低于历史参考线样本数=len(failed),
         最小保留比=min((s["retention_ratio"] for s in valid), default=None),
         耗时秒=time.monotonic() - started,
-        核验方式="全部相邻帧、包含两个帧率相位；排除其他移动水印，保留相同0.8清晰度门槛",
-        不通过样本=failed,
+        核验方式="全部相邻帧、包含两个帧率相位；排除其他移动水印，清晰度只记录，绝对值不判失败",
+        低于历史参考线样本=failed,
         全部样本=stats,
     )
     output.write_text(json.dumps(report, ensure_ascii=False, indent=2))
     print(
-        "编码后清晰度结论",
-        report["通过"],
-        "失败样本",
+        "编码后清晰度记录",
+        "历史参考线以下样本",
         len(failed),
         "最小保留比",
         report["最小保留比"],

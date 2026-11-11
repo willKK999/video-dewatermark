@@ -7,13 +7,20 @@ import cv2, numpy as np
 
 class NativeReferences:
     def __init__(
-        self, coarse, source_frames, scenes, match_low_frequency=False, detail_sigma=1.2
+        self,
+        coarse,
+        source_frames,
+        scenes,
+        match_low_frequency=False,
+        detail_sigma=1.2,
+        blur_backend=None,
     ):
         self.coarse = Path(coarse)
         self.source_frames = Path(source_frames)
         self.scenes = scenes
         self.match_low_frequency = match_low_frequency
         self.detail_sigma = detail_sigma
+        self.blur_backend = blur_backend
         self.flow = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_FAST)
 
     @lru_cache(maxsize=64)
@@ -27,13 +34,37 @@ class NativeReferences:
 
     @lru_cache(maxsize=32)
     def source_low(self, index):
-        return cv2.GaussianBlur(
-            self.source(index).astype(np.float32), (0, 0), self.detail_sigma
-        )
+        return self.low_frequency(self.source(index))
 
     @lru_cache(maxsize=64)
     def mask(self, index):
         return cv2.imread(str(self.coarse / "masks" / f"{index:06d}.png"), 0)
+
+    def low_frequency(self, image):
+        if self.blur_backend is None:
+            return cv2.GaussianBlur(image.astype(np.float32), (0, 0), self.detail_sigma)
+        engine = self.blur_backend
+        with engine.torch.inference_mode():
+            return (
+                engine.blur(engine.tensor(image).float(), self.detail_sigma)
+                .cpu()
+                .numpy()
+            )
+
+    @lru_cache(maxsize=64)
+    def color(self, index):
+        return cv2.resize(self.source(index), (640, 360)).astype(np.float32)
+
+    @lru_cache(maxsize=64)
+    def small_mask(self, index):
+        return (
+            cv2.resize(self.mask(index), (640, 360), interpolation=cv2.INTER_NEAREST)
+            > 0
+        )
+
+    @lru_cache(maxsize=128)
+    def motion(self, index, target):
+        return self.flow.calc(self.guide(index), self.guide(target), None)
 
     @lru_cache(maxsize=4)
     def restore(self, index):
@@ -65,16 +96,16 @@ class NativeReferences:
         current = self.guide(index)
         gy, gx = np.indices(current.shape, dtype=np.float32)
         best = np.full(count, 1e6, np.float32)
-        background = cv2.GaussianBlur(
-            base.astype(np.float32), (0, 0), self.detail_sigma
-        )[yy, xx]
+        background = self.low_frequency(base)[yy, xx]
+        current_color = self.color(index)
+        current_occupied = self.small_mask(index)
         for offset in [-5, 5, -10, 10, -20, 20]:
             target = index + offset
             if not a <= target < b:
                 continue
             other = self.guide(target)
-            forward = self.flow.calc(current, other, None)
-            backward = self.flow.calc(other, current, None)
+            forward = self.motion(index, target)
+            backward = self.motion(target, index)
             reverse = cv2.remap(
                 backward,
                 gx + forward[:, :, 0],
@@ -106,8 +137,7 @@ class NativeReferences:
                 > 0
             )
             # 在全部干净邻域像素上校验颜色，避免四个固定采样点恰好都落在其他笔画上。
-            current_color = cv2.resize(original, (640, 360)).astype(np.float32)
-            other_color = cv2.resize(self.source(target), (640, 360)).astype(np.float32)
+            other_color = self.color(target)
             warped_color = cv2.remap(
                 other_color,
                 gx + forward[:, :, 0],
@@ -116,17 +146,9 @@ class NativeReferences:
                 borderMode=cv2.BORDER_CONSTANT,
                 borderValue=1e4,
             )
-            current_occupied = (
-                cv2.resize(
-                    self.mask(index), (640, 360), interpolation=cv2.INTER_NEAREST
-                )
-                > 0
-            )
             other_occupied = (
                 cv2.remap(
-                    cv2.resize(
-                        self.mask(target), (640, 360), interpolation=cv2.INTER_NEAREST
-                    ),
+                    self.small_mask(target).astype(np.uint8),
                     gx + forward[:, :, 0],
                     gy + forward[:, :, 1],
                     cv2.INTER_NEAREST,

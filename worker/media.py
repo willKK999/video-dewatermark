@@ -224,7 +224,7 @@ def encode(root, info, check=lambda: None):
             "-i",
             root / "composite" / "%06d.png",
             "-i",
-            root / "normalized.mp4",
+            info.get("audio_source", root / "normalized.mp4"),
             "-map",
             "0:v:0",
             "-map",
@@ -251,3 +251,48 @@ def encode(root, info, check=lambda: None):
     )
     validate_output(dest, info, check)
     return dest
+
+
+def normalize_direct(source, root, short_edge=720, check=lambda: None):
+    """直接解码为无损帧；音频保留源引用，省去中间视频和音频转码。"""
+    if source.stat().st_size > 200 * 1024 * 1024:
+        raise PipelineError("INVALID_MEDIA", "输入文件超过二百兆字节")
+    info = plan(probe(source, check), short_edge)
+    frames = root / "frames"
+    frames.mkdir()
+    run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-nostdin",
+            "-i",
+            source,
+            "-map",
+            "0:v:0",
+            "-an",
+            "-vf",
+            f"scale={info['width']}:{info['height']},fps={info['fps']}:start_time=0,setsar=1",
+            "-frames:v",
+            "901",
+            "-start_number",
+            "0",
+            frames / "%06d.png",
+        ],
+        check,
+    )
+    files = sorted(frames.glob("*.png"))
+    if not 1 <= len(files) <= 900:
+        raise PipelineError("INVALID_MEDIA", "直接解码的帧数必须为一至九百")
+    info.update(
+        frame_count=len(files),
+        duration_ms=round(len(files) * 1000 / info["fps"]),
+        audio_source=str(source),
+    )
+    info["timeline"] = dict(
+        source_start_ms=info["source_start_ms"],
+        normalized_start_ms=0,
+        fps=info["fps"],
+        mapping="source_start_ms + frame_index * 1000 / fps",
+    )
+    return info
