@@ -18,6 +18,8 @@ Vast 整集任务结束且确认 GPU 空闲之前，禁止同步代码、禁止�
 
 基准入口：`.venv/bin/python -m scripts.hls_speedup_bench --help`；完整参数、独立目录的部署及 GPU 空闲后的操作见 `docs/speedup-v2.md`。本次不得在 Vast 执行。基准必须区分预期提速与实测结果，记录检测、分割、补画、合成、细节融合和编码的耗时；复用缓存必须校验输入和参数。
 
+正式整集入口 `worker.hls.execute_hls` 默认使用 `speedup-v2` 原生路径。接口参数 `hls_native_path: "v7"` 或环境开关 `HLS_NATIVE_PATH=v7` 可一键回退修复与合成算法，同时保持1080p60交付；显式接口参数优先于环境默认。回退必须覆盖所有提速环境变量，不能混用两条路径的检查点。`hls_encoder` 支持 `libx264` 或 `h264_nvenc`，首次对照保留前者，回退固定使用前者。整集与基准共用 `worker.native_chunk.process_chunk`，不另写单片处理逻辑。
+
 提速入口为流水线选项 `speedup_v2=True`，也可分别使用 `PROPAINTER_ROI=true`、`SAM_SPEEDUP=true`。原生脚本使用 `--backend torch-cuda --fused-detail --output-fps 60 --crf 10`；首次对照使用软件编码，显卡编码须先比较质量。基准必须在独立目录运行，使用固定模型清单，单块输入含上下文不超过30秒。标准测试依赖见 `worker/requirements-dev.txt`；完整张量对齐测试另需 `worker/requirements-speedup.txt`，本地使用纯处理器构建，不运行真实模型。
 
 对照已接受 v7，保留原始残留候选及复核依据；残留为零、无修复闪现/闪烁是硬门槛。记录全部清晰度样本及低于 0.7 的样本；相对 v7 的清晰度、SSIM/PSNR 不得明显变差。没有 GPU 基准和目检结果不得宣称达到三倍提速或质量验收通过。输出 1920×1080、60 帧，音频只复制。

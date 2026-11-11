@@ -49,6 +49,16 @@ def fit(
             source, base, mask, native, accumulator=acc, detail_sigma=detail_sigma
         )
         used.append(int(i))
+    if not used:
+        # 没有半透明固定标识时无需固定字形系数；移动和不透明目标仍按原路径处理。
+        output.write_text("{}")
+        output.with_suffix(".samples.json").write_text(
+            json.dumps(
+                dict(模型采样帧=[], 样本数=0, 说明="没有可见的半透明固定标识"),
+                ensure_ascii=False,
+            )
+        )
+        return
     if len(used) < 15:
         raise ValueError("跨背景校准样本不足，禁止逐帧过拟合")
     output.write_text(json.dumps(solve_projection(acc)))

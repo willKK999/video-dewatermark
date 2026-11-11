@@ -16,6 +16,64 @@ from worker.vision import sha256
 from scripts.hls_verify import verify
 
 
+def export_native_artifacts(s3, bucket, prefix, output):
+    """导出原生报告与对比，不回退到旧的模型帧率检查点解释。"""
+    s3.download_file(bucket, prefix + "/report.json", str(output / "report.json"))
+    report = json.loads((output / "report.json").read_text())
+    pairs = report.get("对比产物", {})
+    names = ["progress.log", "merged-from-hls.mp4"]
+    comparisons = [pairs.get("并排视频"), *pairs.get("图片", [])]
+    if any(
+        not isinstance(name, str)
+        or not re.fullmatch(r"comparisons/[^/\\]+\.(?:mp4|png)", name)
+        or ".." in Path(name).parts
+        for name in comparisons
+    ):
+        raise PipelineError("OUTPUT_INVALID", "原生对比产物路径无效")
+    names.extend(comparisons)
+    evidence = []
+    for chunk in report.get("原始残留检查", []):
+        directory = chunk.get("原始证据目录")
+        if not isinstance(directory, str) or not re.fullmatch(
+            r"native-chunk-[0-9]{4}/audit/", directory
+        ):
+            raise PipelineError("OUTPUT_INVALID", "原生核验证据路径无效")
+        evidence.extend(
+            directory + name
+            for name in (
+                "quality.json",
+                "quality-detections.json",
+                "native-quality.json",
+                "raw-residual-candidates.json",
+                "raw-residual-review.json",
+            )
+        )
+    saved, missing = [], []
+    for name in [*names, *evidence]:
+        target = output / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            s3.download_file(bucket, prefix + "/" + name, str(target))
+            saved.append(name)
+        except ClientError as error:
+            if name not in evidence or error.response["Error"]["Code"] not in (
+                "404",
+                "NoSuchKey",
+                "NotFound",
+            ):
+                raise
+            missing.append(name)
+    result = dict(
+        已导出=saved,
+        缺失核验证据=missing,
+        说明="原始报告和候选不改写；缺失证据不得宣称已完成核验",
+    )
+    (output / "export-native.json").write_text(
+        json.dumps(result, ensure_ascii=False, indent=2)
+    )
+    return result
+
+
 def export(job_id, output, detect):
     with store.connect(os.environ["DATABASE_URL"]) as db:
         job = db.execute(
@@ -57,6 +115,8 @@ def export(job_id, output, detect):
         raise PipelineError("OUTPUT_INVALID", "成品播放列表路径不符合输出规范")
     for name in names:
         download(meta["hls_prefix"] + name, hls / name)
+    if meta.get("native_path"):
+        export_native_artifacts(s3, bucket, prefix, output)
     report = json.loads((output / "metrics-hls.json").read_text())
     ref_file = output / "references.json"
     try:

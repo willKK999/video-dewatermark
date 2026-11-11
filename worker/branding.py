@@ -1,6 +1,6 @@
 """以模型定位和自动学习的标识文本验证短时品牌，字幕不能仅因持久而成为水印。"""
 
-import csv, io, re, subprocess
+import re, subprocess
 from difflib import SequenceMatcher
 import cv2, numpy as np
 
@@ -158,6 +158,8 @@ def learn_palette(images, positive_mask, colors=8):
 
 
 def palette_support(image, palette, distance=22):
+    if palette.size == 0:
+        return np.zeros(image.shape[:2], np.uint8)
     colors = cv2.cvtColor(palette.astype(np.uint8)[None], cv2.COLOR_LAB2BGR)[0]
     centers = cv2.cvtColor(colors[None], cv2.COLOR_BGR2HSV)[0].astype(np.float32)
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV).astype(np.float32)

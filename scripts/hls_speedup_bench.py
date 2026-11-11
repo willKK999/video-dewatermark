@@ -7,7 +7,6 @@ import math
 import os
 from pathlib import Path
 import re
-import shutil
 import time
 
 import cv2
@@ -139,7 +138,14 @@ def comparisons(source, candidate, baseline, output, duration, times):
         ],
         timeout=7200,
     )
-    captures = [cv2.VideoCapture(str(path)) for path in (source, baseline, candidate)]
+    captures = [
+        cv2.VideoCapture(str(path))
+        for path in (
+            (source, baseline, candidate)
+            if baseline is not None
+            else (source, candidate)
+        )
+    ]
     images = []
     skipped = []
     try:
@@ -166,7 +172,7 @@ def comparisons(source, candidate, baseline, output, duration, times):
     return dict(
         并排视频=str(output / "source-candidate.mp4"),
         图片=images,
-        图片顺序="原片、七版、提速成品",
+        图片顺序="原片、七版、提速成品" if baseline is not None else "原片、整集成品",
         超出单块时长未生成的时间点=skipped,
     )
 
@@ -212,194 +218,119 @@ def automatic_crops(args):
 
 
 def prepare_run(args, phases):
-    if not os.getenv("DETECTOR") == "yolo":
-        raise ValueError("真实基准必须加载检测环境配置，不能使用开发替代算法")
-    manifest = os.environ.get("MODEL_MANIFEST")
-    if not manifest:
-        raise ValueError("运行基准需要固定模型清单")
-    os.environ["MODEL_LOCK_HASH"] = vision.verify_models(manifest)
-    required = (
-        args.prior,
-        args.alpha,
-        args.template,
-        args.graphic,
-        args.projection_calibration,
-    )
-    if any(p is None or not p.exists() for p in required):
-        raise ValueError("运行基准需要完整自动先验、透明度、模板、品牌覆盖和投影标定")
-    work = args.output / "work"
-    work.mkdir(exist_ok=True)
+    """直接复用整集分块执行器，默认自动准备全片先验与原生素材。"""
+    from worker.hls_native import configuration, validate_source
+    from worker.native_assets import prepare_assets
+    from worker.native_chunk import process_chunk
+    from worker.speedup import encoder_args
+    from scripts.hls_chunk_check import mux_core_audio
+
+    if os.getenv("DETECTOR") != "yolo" or not os.getenv("MODEL_MANIFEST"):
+        raise ValueError("真实基准需要专用检测环境和固定模型清单")
+    os.environ["MODEL_LOCK_HASH"] = vision.verify_models(os.environ["MODEL_MANIFEST"])
     info = media.probe(args.source)
-    v = next(s for s in info["streams"] if s["codec_type"] == "video")
-    source_rate = float(Fraction(v["avg_frame_rate"]))
-    if (v["width"], v["height"]) != (1920, 1080) or abs(source_rate - 60) > 0.001:
-        raise ValueError("本基准要求一九二零乘一零八零、六十帧原片")
+    validate_source(info)
     if args.duration + args.context > min(30, float(info["format"]["duration"])):
-        raise ValueError("主体加上下文超出三十秒或源片时长")
-    # 散列只含输出相关配置，不输出配置值。
-    settings = {
-        k: value
-        for k, value in os.environ.items()
-        if k.startswith(
-            (
-                "SAM_",
-                "PROPAINTER_",
-                "YOLO_",
-                "DETECTION_",
-                "MASK_",
-                "BOX_",
-                "SHOT_",
-                "RESTORE_",
-                "REFERENCE_",
-            )
+        raise ValueError("主体加上下文超过三十秒或源片时长")
+    from worker.roi_inpaint import digest
+
+    source_hash = digest(args.source)
+    config = configuration(
+        dict(
+            hls_native_path=getattr(args, "path", "speedup-v2"),
+            hls_encoder=args.encoder,
         )
-        or k
-        in (
-            "MODEL_LOCK_HASH",
-            "DETECTOR",
-            "DETECT_PYTHON",
-            "TRACK_PYTHON",
-            "INPAINT_PYTHON",
-        )
-    }
-    code = [
-        p
-        for folder in ("worker", "scripts")
-        for p in sorted((Path(__file__).resolve().parents[1] / folder).glob("*.py"))
-    ]
-    identity = fingerprint(
-        [args.source, *required, *code],
-        dict(duration=args.duration, context=args.context, settings=settings),
     )
-    args._input_fingerprint = identity
-    frames = work / "frames"
+    if config["fast"]:
+        config["backend"] = args.backend
+    assets = prepare_assets(
+        args.source, args.output / "native-assets", source_hash, prior=args.prior
+    )
+    asset_times = args.output / "native-assets/stages/timings.json"
+    if asset_times.exists():
+        phases.timings.update(
+            {
+                "assets_" + name: value
+                for name, value in json.loads(asset_times.read_text()).items()
+            }
+        )
+    supplied = [
+        getattr(args, name, None)
+        for name in ("alpha", "template", "graphic", "projection_calibration")
+    ]
+    if any(supplied):
+        if not all(p is not None and p.exists() for p in supplied):
+            raise ValueError("复用七版自动素材时须提供完整透明度、模板、图形与投影标定")
+        assets.update(
+            alpha=args.alpha,
+            template=args.template,
+            graphic=args.graphic,
+            projection=args.projection_calibration,
+        )
+    work = args.output / "work"
+    plan = dict(
+        left=0,
+        right=round((args.duration + args.context) * 60),
+        start=0,
+        end=round(args.duration * 60),
+    )
+    summary = process_chunk(args.source, work, plan, assets, config, source_hash)
+    phases.timings.update(summary["stages"])
+    args._input_fingerprint = fingerprint(
+        list(assets.values()), [source_hash, plan, config["mode"]]
+    )
+    rendered = args.output / "rendered"
+    rendered.mkdir(exist_ok=True)
 
-    def clean_directories(names):
-        for name in names:
-            path = work / name
-            if path.exists():
-                shutil.rmtree(path)
-
-    def decode():
-        frames.mkdir()
+    def encode():
+        silent = rendered / "video.mp4"
         run(
             [
                 "ffmpeg",
                 "-v",
                 "error",
+                "-y",
+                "-framerate",
+                "60",
                 "-i",
-                args.source,
-                "-an",
-                "-vf",
-                "scale=1280:720,fps=30:start_time=0,setsar=1",
+                work / "rendered/frames/%06d.png",
                 "-frames:v",
-                str(round((args.duration + args.context) * 30)),
-                "-start_number",
-                "0",
-                frames / "%06d.png",
+                str(plan["end"]),
+                *encoder_args(config["encoder"], 10),
+                "-pix_fmt",
+                "yuv420p",
+                silent,
             ],
             timeout=7200,
         )
-        if len(list(frames.glob("*.png"))) != round(
-            (args.duration + args.context) * 30
-        ):
-            raise ValueError("模型帧数不足")
+        mux_core_audio(silent, args.source, rendered / "chunk1.mp4", args.duration)
 
-    phases.run(
-        "decode",
-        identity,
-        decode,
-        lambda: [frames],
-        lambda: clean_directories(["frames"]),
+    key = fingerprint(
+        [work / "rendered/native-report.json"], [summary, config["encoder"]]
     )
-    files = sorted(frames.glob("*.png"))
-
-    def detect():
-        vision.detect(
-            files,
-            vision.shots(files),
-            dict(hls=True, multitrack_prior=str(args.prior.resolve())),
-            work,
-        )
-
-    detect_key = fingerprint([], [identity, phases.tokens["decode"]])
-    phases.run(
-        "detect",
-        detect_key,
-        detect,
-        lambda: [
-            work / "detections.json",
-            work / "multitrack-prior.npz",
-            work / "prompts",
-        ],
+    phases.run("encode", key, encode, lambda: [rendered / "chunk1.mp4"])
+    native = dict(summary["native"])
+    native["帧映射"] = native["帧映射"][: plan["end"]]
+    native["原片帧索引"] = native["原片帧索引"][: plan["end"]]
+    native["帧数"] = plan["end"]
+    native["主体秒数"] = args.duration
+    native["编码器"] = config["encoder"]
+    native["最终编码耗时秒"] = phases.timings["encode"]["seconds"]
+    (rendered / "native-report.json").write_text(
+        json.dumps(native, ensure_ascii=False, indent=2)
     )
-    detections = json.loads((work / "detections.json").read_text())
-    sam_key = fingerprint([], [identity, phases.tokens["detect"]])
-    phases.run(
-        "sam",
-        sam_key,
-        lambda: vision.masks(work, files, detections, "propainter"),
-        lambda: [work / "masks", work / "object-masks", work / "metrics.sam.json"],
-        lambda: clean_directories(["masks", "object-masks"]),
+    args.candidate, args.native_report = (
+        rendered / "chunk1.mp4",
+        rendered / "native-report.json",
     )
-    inpaint_key = fingerprint([], [identity, phases.tokens["sam"]])
-    phases.run(
-        "inpaint",
-        inpaint_key,
-        lambda: vision.inpaint(work, files, detections["scenes"], "propainter"),
-        lambda: [work / "composite", work / "performance.json"],
-    )
-    reference = args.output / "native-reference"
-    from scripts.hls_align_reference import align
-
-    align_key = fingerprint([], [identity, phases.tokens["decode"]])
-    phases.run(
-        "align",
-        align_key,
-        lambda: align(args.source, frames, reference),
-        lambda: [reference],
-        lambda: shutil.rmtree(reference) if reference.exists() else None,
-    )
-    from scripts.hls_native_chunk import render
-
-    rendered = args.output / "rendered"
-    render_key = fingerprint(
-        [],
-        [
-            identity,
-            phases.tokens["inpaint"],
-            phases.tokens["align"],
-            args.backend,
-            args.encoder,
-        ],
-    )
-    phases.run(
-        "render",
-        render_key,
-        lambda: render(
-            args.source,
-            work,
-            work / "detections.json",
-            args.prior,
-            args.alpha,
-            args.template,
-            args.graphic,
-            rendered,
-            args.duration,
-            reference,
-            args.projection_calibration,
-            60,
-            1.2,
-            10,
-            args.backend,
-            True,
-            args.encoder,
-        ),
-        lambda: [rendered / "chunk1.mp4", rendered / "native-report.json"],
-    )
-    args.candidate = rendered / "chunk1.mp4"
-    args.native_report = rendered / "native-report.json"
     args.detected = work / "detections.json"
+    args.prior, args.alpha, args.template = (
+        assets["prior"],
+        assets["alpha"],
+        assets["template"],
+    )
+    args.graphic = work / "graphic"
+    args._native_run = dict(work=work, plan=plan, assets=assets)
     return work
 
 
@@ -418,6 +349,9 @@ def assess(args, phases):
         安全对象前缀=None,
     )
     args._partial_report = report
+    verification_started = time.monotonic()
+    verification_times = {}
+    report["核验分步耗时秒"] = verification_times
     candidate_info = media.probe(args.candidate, count=True)
     v = next(s for s in candidate_info["streams"] if s["codec_type"] == "video")
     fps = float(Fraction(v["avg_frame_rate"]))
@@ -448,9 +382,11 @@ def assess(args, phases):
     report["播放器检查"] = "未进行"
     crops = sorted(set([*args.crop, *automatic_crops(args)]))
     report["自动及额外对比区域"] = crops
+    measured = time.monotonic()
     report["相对七版"] = compare(
         args.candidate, args.baseline, args.output / "metrics", args.duration, crops
     )
+    verification_times["SSIM_PSNR"] = time.monotonic() - measured
     report["数值对齐复核提示"] = dict(
         建议SSIM下限=0.98,
         建议PSNR下限分贝=38,
@@ -464,62 +400,92 @@ def assess(args, phases):
     )
     native = json.loads(args.native_report.read_text()) if args.native_report else {}
     for name in ("performance.json", "metrics.sam.json"):
-        path = args.output / "work" / name
+        path = (
+            args.output
+            / "work"
+            / ("tracking/metrics.sam.json" if name == "metrics.sam.json" else name)
+        )
         if path.exists():
             report[name] = json.loads(path.read_text())
     report["渲染分步耗时秒"] = native.get("分步耗时秒")
     report["清晰度"] = clarity_summary(native.get("清晰度统计", []))
     audit = args.output / "audit"
     audit.mkdir(exist_ok=True)
-    if (
-        args.native_report
-        and args.detected
-        and args.prior
-        and args.alpha
-        and args.graphic
-    ):
-        from scripts.hls_detail_verify import verify as detail_verify
-
-        detail_verify(
-            args.source,
-            args.candidate,
-            args.native_report,
-            args.detected,
-            args.prior,
-            args.alpha,
-            args.graphic,
-            audit / "detail.json",
-        )
-        samples = json.loads((audit / "detail.json").read_text())["全部样本"]
-        report["清晰度"] = clarity_summary(samples)
-        # 七版只具备三十帧，另以同相位序列比较相对清晰度。
+    if getattr(args, "_native_run", None):
+        from worker.native_chunk import audit_chunk
         from scripts.hls_speedup_quality import relative_clarity
 
-        report["相对七版清晰度"] = relative_clarity(args, audit)
-    else:
-        report["清晰度检查"] = "未完成：缺少映射或自动支持输入"
-    if args.native_report and args.detected:
-        from scripts.hls_native_verify import verify as native_verify
-
-        native_verify(
+        shared = args._native_run
+        measured = time.monotonic()
+        quality = audit_chunk(
             args.source,
             args.candidate,
-            args.detected,
-            args.native_report,
-            audit / "residual",
+            shared["work"],
+            shared["plan"],
+            shared["assets"],
         )
-        report["原始残留检查"] = json.loads(
-            (audit / "residual/quality.json").read_text()
-        )
-        raw = audit / "residual/quality-detections.json"
-        report["原始残留候选"] = json.loads(raw.read_text()) if raw.exists() else None
-        report["残留复核依据"] = (
-            "保留原始候选；仍须短时图形与全画面新增标识复检和人工目检，不自动改判候选"
-        )
+        verification_times["残留品牌清晰度与闪烁指标"] = time.monotonic() - measured
+        report["清晰度"] = clarity_summary(quality["清晰度统计"])
+        report["原始残留检查"] = quality["原始残留检查"]
+        report["原始品牌残留候选"] = quality["品牌残留候选"]
+        report["全画面模型复检"] = quality.get("全画面模型复检")
+        report["闪烁指标"] = quality["闪烁指标"]
+        report["品牌图形独立检查"] = "已执行编码后完整部件复检，仍需目检"
+        measured = time.monotonic()
+        report["相对七版清晰度"] = relative_clarity(args, audit)
+        verification_times["相对七版清晰度"] = time.monotonic() - measured
     else:
-        report["原始残留检查"] = None
-        report["残留复核依据"] = "未完成：缺少检测与映射"
-    report["品牌图形独立检查"] = "待运行品牌图形复检入口，未宣称零残留"
+        if (
+            args.native_report
+            and args.detected
+            and args.prior
+            and args.alpha
+            and args.graphic
+        ):
+            from scripts.hls_detail_verify import verify as detail_verify
+
+            detail_verify(
+                args.source,
+                args.candidate,
+                args.native_report,
+                args.detected,
+                args.prior,
+                args.alpha,
+                args.graphic,
+                audit / "detail.json",
+            )
+            samples = json.loads((audit / "detail.json").read_text())["全部样本"]
+            report["清晰度"] = clarity_summary(samples)
+            # 七版只具备三十帧，另以同相位序列比较相对清晰度。
+            from scripts.hls_speedup_quality import relative_clarity
+
+            report["相对七版清晰度"] = relative_clarity(args, audit)
+        else:
+            report["清晰度检查"] = "未完成：缺少映射或自动支持输入"
+        if args.native_report and args.detected:
+            from scripts.hls_native_verify import verify as native_verify
+
+            native_verify(
+                args.source,
+                args.candidate,
+                args.detected,
+                args.native_report,
+                audit / "residual",
+            )
+            report["原始残留检查"] = json.loads(
+                (audit / "residual/quality.json").read_text()
+            )
+            raw = audit / "residual/quality-detections.json"
+            report["原始残留候选"] = (
+                json.loads(raw.read_text()) if raw.exists() else None
+            )
+            report["残留复核依据"] = (
+                "保留原始候选；仍须短时图形与全画面新增标识复检和人工目检，不自动改判候选"
+            )
+        else:
+            report["原始残留检查"] = None
+            report["残留复核依据"] = "未完成：缺少检测与映射"
+        report["品牌图形独立检查"] = "待运行品牌图形复检入口，未宣称零残留"
     if args.make_comparisons:
         report["对比产物"] = comparisons(
             args.source,
@@ -531,6 +497,10 @@ def assess(args, phases):
         )
     else:
         report["对比产物"] = "未生成，使用并排输出参数生成"
+    report["独立核验耗时秒"] = time.monotonic() - verification_started
+    report["提速比较范围"] = (
+        "原生块准备至最终编码；独立核验与七版对照耗时另记，不能冒称完整验收耗时"
+    )
     return report
 
 
@@ -567,6 +537,12 @@ def parser():
         ("detected", "已有多轨迹检测报告"),
     ]:
         p.add_argument("--" + name, type=Path, help=label)
+    p.add_argument(
+        "--path",
+        choices=["speedup-v2", "v7"],
+        default="speedup-v2",
+        help="共用整集原生路径；七版开关同时恢复整帧补画与软件合成编码",
+    )
     p.add_argument("--duration", type=float, default=25, help="主体秒数")
     p.add_argument(
         "--context", type=float, default=2, help="末尾上下文秒数，总输入不得超过三十秒"

@@ -1,0 +1,429 @@
+"""七版原生交付的自动素材；只从源片、模型与时域先验提取，不接受人工框。"""
+
+import json
+import os
+import shutil
+from pathlib import Path
+import cv2
+import numpy as np
+from .branding import learn_palette, palette_support
+from .matte import fit_overlay
+from .multitrack import load_prior
+from .process import PipelineError, run
+from .speedup_cache import StageCache, fingerprint
+
+
+def prepare_assets(source, root, source_hash, check=lambda: None, prior=None):
+    """全片只准备一次原生模板和透明度类别，不进行透明反解。"""
+    from .media import probe
+    from .multitrack import prepare
+    from scripts.hls_template import build
+
+    root.mkdir(parents=True, exist_ok=True)
+    cache = StageCache(root / "stages")
+    from .roi_inpaint import digest
+
+    code = [
+        digest(Path(__file__).with_name(n))
+        for n in ("native_assets.py", "matte.py", "multitrack.py", "branding.py")
+    ]
+    key = fingerprint(
+        [prior] if prior else [], [source_hash, os.getenv("MODEL_LOCK_HASH"), code]
+    )
+    target = root / "multitrack-prior.npz"
+
+    def make_prior():
+        if prior:
+            shutil.copyfile(prior, target)
+        else:
+            prepare(source, root, check)
+
+    cache.run("prior", key, make_prior, lambda: [target])
+    duration = float(probe(source, check)["format"]["duration"])
+    count = min(60, int(duration))
+    if count < 15:
+        raise PipelineError(
+            "TEMPORAL_UNCERTAIN", "全片原生校准不足十五个独立秒级样本", review=True
+        )
+    samples = root / "native-samples"
+
+    def sample():
+        if samples.exists():
+            shutil.rmtree(samples)
+        samples.mkdir()
+        run(
+            [
+                "ffmpeg",
+                "-v",
+                "error",
+                "-i",
+                source,
+                "-vf",
+                f"fps={count / duration}",
+                "-frames:v",
+                str(count),
+                "-q:v",
+                "2",
+                samples / "%06d.jpg",
+            ],
+            check,
+            timeout=7200,
+        )
+        if len(list(samples.glob("*.jpg"))) != count:
+            raise PipelineError("OUTPUT_INVALID", "全片原生采样帧数不足")
+
+    key = fingerprint([], [key, cache.tokens["prior"], count])
+    cache.run("samples", key, sample, lambda: [samples])
+
+    def calibrate():
+        median, signal, regions, _, _ = load_prior(target)
+        mask = np.zeros(median.shape, np.uint8)
+        for region in regions:
+            mask |= region["mask"]
+        images = [
+            cv2.resize(cv2.imread(str(p)), (median.shape[1], median.shape[0]))
+            for p in sorted(samples.glob("*.jpg"))
+        ]
+        alpha, _ = fit_overlay(images, mask)
+        np.savez_compressed(root / "alpha.npz", alpha=alpha)
+        # 颜色只用于确认完整品牌的前景支持，无法学到时不伪造颜色。
+        try:
+            palette = learn_palette(images, mask)
+        except ValueError:
+            palette = np.empty((0, 3), np.float32)
+        np.save(root / "palette.npy", palette)
+        build(samples, root / "template.npz", 3)
+
+    cache.run(
+        "calibrate",
+        fingerprint([], [key, cache.tokens["samples"]]),
+        calibrate,
+        lambda: [root / "alpha.npz", root / "template.npz", root / "palette.npy"],
+    )
+    return dict(
+        prior=target,
+        alpha=root / "alpha.npz",
+        template=root / "template.npz",
+        palette=root / "palette.npy",
+    )
+
+
+def prepare_graphics(work, detections, assets, fast, check=lambda: None):
+    """完整保留候选；短时文字须经自动品牌文本确认，其他字幕不会加入掩膜。"""
+    from .short_brand import discover, fraction_inside
+    from .brand_templates import variants, match, mask_for
+
+    files = sorted((work / "frames").glob("*.png"))
+    graphic = work / "graphic"
+    graphic.mkdir(exist_ok=True)
+    (graphic / "masks").mkdir(exist_ok=True)
+    (graphic / "seeds").mkdir(exist_ok=True)
+    indices = graphic / "indices.json"
+    indices.write_text(json.dumps(list(range(len(files)))))
+    run(
+        [
+            os.environ["DETECT_PYTHON"],
+            Path(__file__).with_name("yolo_stage.py"),
+            "--frames",
+            work / "frames",
+            "--weights",
+            os.environ["YOLO_WEIGHTS"],
+            "--indices",
+            indices,
+            "--all-candidates",
+            "--output",
+            graphic / "raw-candidates.json",
+        ],
+        check,
+    )
+    rows = json.loads((graphic / "raw-candidates.json").read_text())
+    if len(rows) != len(files) or [p["frame"] for p in rows] != list(range(len(files))):
+        raise PipelineError(
+            "DETECTION_UNCERTAIN", "完整品牌检测帧数不一致", review=True
+        )
+    palette = np.load(assets["palette"])
+    seeds = []
+    # 每个镜头独立发现短时品牌；同一镜头的多个位置逐个去重发现。
+    for start, end in detections["scenes"]:
+        remaining = [
+            dict(row, boxes=list(row["boxes"]))
+            for row in rows
+            if start <= row["frame"] < end
+        ]
+        for _ in range(32):
+            target = graphic / f"short-{len(seeds)}"
+            target.mkdir(exist_ok=True)
+            found = discover(
+                files,
+                dict(detections, scenes=[[start, end]]),
+                assets["prior"],
+                remaining,
+                palette,
+                target,
+            )
+            if not found:
+                shutil.rmtree(target)
+                break
+            seeds.append(found)
+            box = found["hints"][0]["box"]
+            for row in remaining:
+                row["boxes"] = [
+                    p for p in row["boxes"] if fraction_inside(p["box"], box) <= 0.5
+                ]
+            found["hints"][0]["mask_prompt"] = str(
+                (target / "prompts/seed.png").relative_to(graphic)
+            )
+        else:
+            raise PipelineError(
+                "DETECTION_UNCERTAIN", "单镜头品牌候选过多，需要复核", review=True
+            )
+    # 独立图标使用专用模型高置信提示并按轨迹分组，不用文字位置规则。
+    for start, end in detections["scenes"]:
+        groups = []
+        for row in rows[start:end]:
+            check()
+            known = cv2.imread(
+                str(work / "tracking/masks" / files[row["frame"]].name), 0
+            )
+            for point in row["boxes"]:
+                if point["class_id"] not in (0, 1) or point["confidence"] < 0.65:
+                    continue
+                x, y, a, b = map(round, point["box"])
+                x, y, a, b = (
+                    max(0, x),
+                    max(0, y),
+                    min(known.shape[1], a),
+                    min(known.shape[0], b),
+                )
+                if a <= x or b <= y:
+                    continue
+                if np.count_nonzero(known[y:b, x:a]) > (a - x) * (b - y) * 0.85:
+                    continue
+                if any(
+                    s["scenes"][0][0] <= row["frame"] < s["scenes"][0][1]
+                    and fraction_inside(point["box"], s["hints"][0]["box"]) > 0.5
+                    for s in seeds
+                ):
+                    continue
+                item = dict(point, frame=row["frame"])
+                for group in groups:
+                    if (
+                        row["frame"] - group[-1]["frame"] <= 30
+                        and fraction_inside(point["box"], group[-1]["box"]) > 0.5
+                    ):
+                        group.append(item)
+                        break
+                else:
+                    groups.append([item])
+        for group in groups:
+            seeds.append(
+                dict(
+                    scenes=[[group[0]["frame"], min(end, group[-1]["frame"] + 31)]],
+                    hints=group,
+                )
+            )
+    if len(seeds) > 64:
+        raise PipelineError(
+            "DETECTION_UNCERTAIN", "品牌轨迹数超出有界调度上限", review=True
+        )
+    h, w = cv2.imread(str(files[0])).shape[:2]
+    for file in files:
+        cv2.imwrite(str(graphic / "masks" / file.name), np.zeros((h, w), np.uint8))
+    records = []
+    for identity, seed in enumerate(seeds):
+        check()
+        tracker = graphic / f"track-{identity}"
+        tracker.mkdir(exist_ok=True)
+        (tracker / "frames").symlink_to(
+            (work / "frames").resolve(), target_is_directory=True
+        )
+        (tracker / "masks").mkdir(exist_ok=True)
+        hints = []
+        for p in seed["hints"]:
+            p = dict(p, track_id=identity + 1)
+            if p.get("mask_prompt"):
+                (tracker / "prompts").mkdir(exist_ok=True)
+                shutil.copyfile(
+                    graphic / p["mask_prompt"], tracker / "prompts/seed.png"
+                )
+                p["mask_prompt"] = "prompts/seed.png"
+            hints.append(p)
+        (tracker / "detections.json").write_text(
+            json.dumps(dict(scenes=seed["scenes"], hints=hints))
+        )
+        run(
+            [
+                os.environ["TRACK_PYTHON"],
+                Path(__file__).with_name("sam_stage.py"),
+                "--root",
+                tracker,
+                "--speedup" if fast else "--no-speedup",
+            ],
+            check,
+        )
+        point = max(hints, key=lambda p: p["confidence"])
+        mask = cv2.imread(str(tracker / "masks" / f"{point['frame']:06d}.png"), 0)
+        if mask is None or not mask.any():
+            raise PipelineError(
+                "TRACKING_DRIFT", "完整品牌分割没有可靠前景", review=True
+            )
+        image = cv2.imread(str(files[point["frame"]]))
+        foreground = palette_support(image, palette) & mask if len(palette) else mask
+        if not foreground.any():
+            raise PipelineError("MASK_UNCERTAIN", "完整品牌的颜色前景不足", review=True)
+        seed_image = graphic / "seeds" / f"{identity}-image.png"
+        seed_mask = graphic / "seeds" / f"{identity}-mask.png"
+        cv2.imwrite(str(seed_image), image)
+        cv2.imwrite(str(seed_mask), foreground)
+        bank = variants(image, foreground, [0.95, 1, 1.05])
+        matches = []
+        for index, file in enumerate(files):
+            check()
+            current = cv2.imread(str(file))
+            points = match(current, bank, 0.5, 2, allow_partial=True)
+            shape = mask_for((h, w), bank, points)
+            tracked = cv2.imread(str(tracker / "masks" / file.name), 0)
+            if tracked is not None:
+                # 保留模型确认的完整图标，不因颜色或模板漏掉淡出边缘。
+                shape |= tracked
+            target = graphic / "masks" / file.name
+            union = cv2.imread(str(target), 0) | cv2.dilate(
+                shape, np.ones((5, 5), np.uint8)
+            )
+            cv2.imwrite(str(target), union)
+            matches.append(points)
+        records.append(dict(id=identity, seed_frame=point["frame"], matches=matches))
+    for index, file in enumerate(files):
+        mask = cv2.imread(str(graphic / "masks" / file.name), 0)
+        if np.count_nonzero(mask) > mask.size * 0.2:
+            raise PipelineError(
+                "MASK_UNCERTAIN", "品牌联合支持超过原有面积门槛", review=True
+            )
+        cv2.imwrite(str(graphic / "masks" / f"{index:06d}.png"), mask)
+    scenes = [s["scenes"][0] for s in seeds]
+    supplied = assets.get("graphic")
+    if supplied:
+        for index, file in enumerate(files):
+            path = supplied / "masks" / file.name
+            if path.exists():
+                mask = cv2.imread(str(path), 0)
+                if (
+                    mask is None
+                    or mask.shape != (h, w)
+                    or not set(np.unique(mask)) <= {0, 255}
+                ):
+                    raise PipelineError("MASK_INVALID", "外部七版自动图形支持无效")
+                target = graphic / "masks" / file.name
+                union = cv2.imread(str(target), 0) | mask
+                if np.count_nonzero(union) > union.size * 0.2:
+                    raise PipelineError(
+                        "MASK_UNCERTAIN", "完整品牌联合支持超出原门槛", review=True
+                    )
+                cv2.imwrite(str(target), union)
+        if (supplied / "detections.json").exists():
+            scenes.extend(
+                json.loads((supplied / "detections.json").read_text())["scenes"]
+            )
+    (graphic / "detections.json").write_text(json.dumps(dict(scenes=scenes)))
+    (graphic / "brands.json").write_text(json.dumps(records))
+    # 临时分割输入可重建，保留证据、种子和掩膜即可。
+    for path in graphic.glob("track-*"):
+        shutil.rmtree(path)
+    return graphic
+
+
+def residual_candidates(audit, work, assets, check=lambda: None):
+    """对全部编码帧保留原始模型候选；字幕仍须品牌文本印证，不能直接计作水印。"""
+    from .branding import recognize, same_brand
+    from .workflow import setting
+
+    files = sorted((audit / "composite").glob("*.png"))
+    indices = audit / "raw-indices.json"
+    indices.write_text(json.dumps(list(range(len(files)))))
+    threshold = min(
+        setting("RESIDUAL_CONFIDENCE", 0.35), setting("HLS_RESIDUAL_CONFIDENCE", 0.15)
+    )
+    target = audit / "raw-residual-candidates.json"
+    run(
+        [
+            os.environ["DETECT_PYTHON"],
+            Path(__file__).with_name("yolo_stage.py"),
+            "--frames",
+            audit / "composite",
+            "--weights",
+            os.environ["YOLO_WEIGHTS"],
+            "--indices",
+            indices,
+            "--all-candidates",
+            "--confidence",
+            str(threshold),
+            "--output",
+            target,
+        ],
+        check,
+        timeout=7200,
+    )
+    rows = json.loads(target.read_text())
+    if len(rows) != len(files) or [r["frame"] for r in rows] != list(range(len(files))):
+        raise PipelineError("OUTPUT_INVALID", "编码后全画面复检候选帧数不符")
+    median, _, regions, _, _ = load_prior(assets["prior"])
+    references = []
+    for region in regions:
+        x, y, a, b = region["box"]
+        patch = np.clip(median[y:b, x:a] * 12 + 128, 0, 255).astype(np.uint8)
+        references.append(recognize(cv2.resize(patch, None, fx=3, fy=3), 11))
+    confirmed, review = [], []
+    cache = {}
+    import hashlib
+
+    for row in rows:
+        check()
+        image = None
+        for candidate in row["boxes"]:
+            if candidate["class_id"] in (0, 1):
+                confirmed.append(
+                    dict(
+                        candidate,
+                        frame=row["frame"],
+                        basis="专用模型图标候选，须与原始证据复核",
+                    )
+                )
+            else:
+                if image is None:
+                    image = cv2.imread(str(files[row["frame"]]))
+                x, y, a, b = map(round, candidate["box"])
+                patch = image[
+                    max(0, y) : min(image.shape[0], b),
+                    max(0, x) : min(image.shape[1], a),
+                ]
+                if not patch.size:
+                    raise PipelineError("OUTPUT_INVALID", "文字候选超出编码画面")
+                key = hashlib.sha256(patch.tobytes()).hexdigest()
+                if key not in cache:
+                    if len(cache) >= 256:
+                        cache.pop(next(iter(cache)))
+                    cache[key] = recognize(cv2.resize(patch, None, fx=3, fy=3))
+                is_brand = same_brand(cache[key], references)
+                if is_brand:
+                    confirmed.append(
+                        dict(candidate, frame=row["frame"], basis="自动品牌文本一致")
+                    )
+                else:
+                    review.append(
+                        dict(
+                            candidate,
+                            frame=row["frame"],
+                            basis="文字不匹配已知品牌，不能把字幕直接计作水印",
+                        )
+                    )
+    result = dict(
+        原始候选文件=target.name,
+        全帧数=len(files),
+        检测置信度=threshold,
+        残留候选=confirmed,
+        文字复核依据=review,
+    )
+    (audit / "raw-residual-review.json").write_text(
+        json.dumps(result, ensure_ascii=False, indent=2)
+    )
+    return result

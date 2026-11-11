@@ -23,15 +23,25 @@ from sam_schedule import (
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
-    parser.add_argument(
-        "--speedup", action="store_true", help="启用关键提示与有界数据准备优化"
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--speedup",
+        dest="speedup",
+        action="store_true",
+        default=None,
+        help="启用分割提速",
+    )
+    mode.add_argument(
+        "--no-speedup", dest="speedup", action="store_false", help="明确恢复七版分割"
     )
     args = parser.parse_args()
     root = Path(args.root)
     detections = json.loads((root / "detections.json").read_text())
-    fast = args.speedup or os.getenv("SAM_SPEEDUP") == "true"
-    max_edge = int(os.getenv("SAM_PREPARE_MAX_EDGE", "1024"))
-    stride = int(os.getenv("SAM_HINT_STRIDE", "30"))
+    fast = (
+        args.speedup if args.speedup is not None else os.getenv("SAM_SPEEDUP") == "true"
+    )
+    max_edge = int(os.getenv("SAM_PREPARE_MAX_EDGE", "1024")) if fast else 1024
+    stride = int(os.getenv("SAM_HINT_STRIDE", "30")) if fast else 30
     torch.cuda.reset_peak_memory_stats()
     started = time.perf_counter()
     predictor = build_sam2_video_predictor(

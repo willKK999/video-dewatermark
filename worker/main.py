@@ -188,6 +188,13 @@ def process(job, dsn, s3, bucket, workdir, engine):
             result_key = prefix + "/result.mp4"
             if result.get("hls"):
                 progress(result["chunk_count"], result["chunk_count"], "publish")
+                report_path = root / "report.json"
+                if report_path.exists():
+                    report = json.loads(report_path.read_text())
+                    report["安全对象前缀"] = prefix + "/"
+                    report_path.write_text(
+                        json.dumps(report, ensure_ascii=False, indent=2)
+                    )
                 for path in [
                     *sorted((root / "hls").glob("*.ts")),
                     root / "hls" / "index.m3u8",
@@ -202,6 +209,18 @@ def process(job, dsn, s3, bucket, workdir, engine):
                     *sorted(root.glob("seam-*.jpg")),
                     *sorted(root.glob("multitrack-*.npz")),
                     *sorted(root.glob("multitrack-*.json")),
+                    *[
+                        p
+                        for p in (
+                            root / "report.json",
+                            root / "progress.log",
+                            root / "merged-from-hls.mp4",
+                        )
+                        if p.exists()
+                    ],
+                    *sorted((root / "comparisons").glob("*.mp4")),
+                    *sorted((root / "comparisons").glob("*.png")),
+                    *sorted(root.glob("native-chunk-*/audit/*.json")),
                 ]:
                     relative = path.relative_to(root).as_posix()
                     content_type = {
@@ -212,6 +231,8 @@ def process(job, dsn, s3, bucket, workdir, engine):
                         "json": "application/json",
                         "jpg": "image/jpeg",
                         "npz": "application/octet-stream",
+                        "png": "image/png",
+                        "log": "text/plain; charset=utf-8",
                     }[path.suffix[1:]]
                     s3.upload_file(
                         str(path),
@@ -268,7 +289,7 @@ def process(job, dsn, s3, bucket, workdir, engine):
             error = exc
             result_key = None
             result = None
-        except (BotoCoreError, ClientError, S3UploadFailedError, OSError) as exc:
+        except (BotoCoreError, ClientError, S3UploadFailedError, OSError):
             error = PipelineError(
                 "STORAGE_UNAVAILABLE", "storage or local IO failed", retryable=True
             )

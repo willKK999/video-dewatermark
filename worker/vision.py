@@ -247,7 +247,7 @@ def detect(files, scenes, options, root, check=lambda: None, dense=False):
     return result
 
 
-def masks(root, files, detections, engine, check=lambda: None, speedup=False):
+def masks(root, files, detections, engine, check=lambda: None, speedup=None):
     dest = root / "masks"
     dest.mkdir()
     if engine == "propainter":
@@ -257,7 +257,13 @@ def masks(root, files, detections, engine, check=lambda: None, speedup=False):
                 str(Path(__file__).with_name("sam_stage.py")),
                 "--root",
                 root,
-                *(["--speedup"] if speedup else []),
+                *(
+                    ["--speedup"]
+                    if speedup is True
+                    else ["--no-speedup"]
+                    if speedup is False
+                    else []
+                ),
             ],
             check,
         )
@@ -395,7 +401,16 @@ def windows(start, end, size=60, overlap=12):
 
 
 def _composite_window(
-    root, files, start, end, overlap, window, check, references, performance, cleanup=True
+    root,
+    files,
+    start,
+    end,
+    overlap,
+    window,
+    check,
+    references,
+    performance,
+    cleanup=True,
 ):
     dest = root / "composite"
     predicted = sorted((window / "out" / "frames" / "frames").glob("*.png"))
@@ -445,9 +460,14 @@ def _composite_window(
         shutil.rmtree(window)
 
 
-def inpaint(root, files, scenes, engine, low_memory=False, check=lambda: None, roi=False):
-    if engine == "propainter" and (roi or os.getenv("PROPAINTER_ROI") == "true"):
+def inpaint(
+    root, files, scenes, engine, low_memory=False, check=lambda: None, roi=None
+):
+    if engine == "propainter" and (
+        roi is True or (roi is None and os.getenv("PROPAINTER_ROI") == "true")
+    ):
         from .roi_inpaint import inpaint_roi
+
         return inpaint_roi(root, files, scenes, low_memory, check)
     dest = root / "composite"
     dest.mkdir()

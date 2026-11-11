@@ -7,20 +7,39 @@ import cv2, numpy as np
 from worker.media import probe
 
 
-def align(source, frames, output, model_fps=30):
+def align(
+    source,
+    frames,
+    output,
+    model_fps=30,
+    source_start_frame=0,
+    check=lambda: None,
+    source_end_frame=None,
+):
     output.mkdir(parents=True, exist_ok=True)
     video = next(s for s in probe(source)["streams"] if s["codec_type"] == "video")
     ratio = float(Fraction(video["avg_frame_rate"])) / model_fps
     cap = cv2.VideoCapture(str(source))
+    if source_start_frame and (
+        not cap.set(cv2.CAP_PROP_POS_FRAMES, source_start_frame)
+        or abs(cap.get(cv2.CAP_PROP_POS_FRAMES) - source_start_frame) > 0.01
+    ):
+        cap.release()
+        raise ValueError("原生参考无法精确定位块起点")
     cache = {}
     read = -1
     last = 0
     records = []
     started = time.monotonic()
     for i, path in enumerate(sorted(frames.glob("*.png"))):
+        check()
         center = round(i * ratio)
         lo = max(last, center - 6)
-        hi = center + 6
+        hi = (
+            min(center + 6, source_end_frame - source_start_frame - 1)
+            if source_end_frame is not None
+            else center + 6
+        )
         while read < hi:
             ok, image = cap.read()
             if not ok:
@@ -49,6 +68,7 @@ def align(source, frames, output, model_fps=30):
     cap.release()
     report = dict(
         帧对应=records,
+        原片起始帧=source_start_frame,
         耗时秒=time.monotonic() - started,
         方法="有限时域窗口逐帧内容匹配，保留原始解码像素，帧号单调不减",
     )

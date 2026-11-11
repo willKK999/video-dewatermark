@@ -141,6 +141,8 @@ components:
       additionalProperties: false
       properties:
         hls_bandwidth: {type: integer, minimum: 0, default: 0, description: 主播放列表码率上限 bit/s；0 选择最高码率}
+        hls_native_path: {type: string, enum: [speedup-v2, v7], description: 仅整集有效；省略时遵循工作进程默认；七版回退仍保持原生六十帧交付}
+        hls_encoder: {type: string, enum: [libx264, h264_nvenc], description: 仅整集有效；显卡编码需独立画质对照；七版回退固定使用软件编码}
         max_short_edge: {type: integer, enum: [720, 540], default: 720}
         allow_downgrade: {type: boolean, default: false}
         prompts:
@@ -178,6 +180,8 @@ components:
           nullable: true
           properties:
             hls: {type: boolean}
+            native_path: {type: string, enum: [speedup-v2, v7]}
+            quality_review_required: {type: boolean}
             chunk_count: {type: integer}
             audio_copy_verified: {type: boolean}
             residual_count: {type: integer}

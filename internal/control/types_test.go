@@ -38,3 +38,29 @@ func TestAuthentication(t *testing.T) {
 		t.Fatal(w.Code, w.Body.String())
 	}
 }
+
+func Test原生交付开关(t *testing.T) {
+	for _, mode := range []string{"", "speedup-v2", "v7"} {
+		for _, encoder := range []string{"", "libx264", "h264_nvenc"} {
+			o := Options{HLS: true, HLSNativePath: mode, HLSEncoder: encoder}
+			if err := o.Validate(); err != nil {
+				t.Fatal("合法原生交付选项被拒绝", err)
+			}
+		}
+	}
+	for _, o := range []Options{
+		{HLS: true, HLSNativePath: "invalid"},
+		{HLS: true, HLSEncoder: "invalid"},
+		{HLSNativePath: "v7"},
+		{HLSEncoder: "h264_nvenc"},
+	} {
+		if o.Validate() == nil {
+			t.Fatal("非法原生交付选项未被拒绝")
+		}
+	}
+	r := httptest.NewRequest("POST", "/", strings.NewReader(`{"hls":true,"hls_native_path":"v7","hls_encoder":"libx264"}`))
+	var o Options
+	if decode(httptest.NewRecorder(), r, &o) != nil || o.Validate() != nil || o.HLSNativePath != "v7" {
+		t.Fatal("回退开关未能完整通过接口解析")
+	}
+}

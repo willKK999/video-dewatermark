@@ -19,12 +19,20 @@ type Prompt struct {
 type Options struct {
 	HLS            bool     `json:"hls,omitempty"`
 	HLSBandwidth   int      `json:"hls_bandwidth,omitempty"`
+	HLSNativePath  string   `json:"hls_native_path,omitempty"`
+	HLSEncoder     string   `json:"hls_encoder,omitempty"`
 	MaxShortEdge   int      `json:"max_short_edge"`
 	AllowDowngrade bool     `json:"allow_downgrade"`
 	Prompts        []Prompt `json:"prompts,omitempty"`
 }
 
 func (o *Options) Validate() error {
+	if (o.HLSNativePath != "" && o.HLSNativePath != "speedup-v2" && o.HLSNativePath != "v7") || (o.HLSEncoder != "" && o.HLSEncoder != "libx264" && o.HLSEncoder != "h264_nvenc") {
+		return errors.New("整集原生路径或编码器无效")
+	}
+	if !o.HLS && (o.HLSNativePath != "" || o.HLSEncoder != "") {
+		return errors.New("原生交付开关仅用于整集任务")
+	}
 	if o.HLSBandwidth < 0 || (o.HLS && len(o.Prompts) > 0) {
 		return errors.New("HLS 码率必须非负，且只支持自动检测")
 	}

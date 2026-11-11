@@ -41,7 +41,12 @@ def render(
     backend="numpy",
     fused_detail=False,
     encoder_name="libx264",
+    frames_only=False,
+    source_start_frame=0,
+    check=lambda: None,
 ):
+    if not 0 < duration <= 30 or source_start_frame < 0:
+        raise ValueError("原生块必须为三十秒以内且起始帧非负")
     output.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
     projector = projected_texture_composite
@@ -108,33 +113,45 @@ def render(
 
     silent = output / "native-video.mp4"
     errors = (output / "encode.log").open("wb")
-    encoder = subprocess.Popen(
-        [
-            "ffmpeg",
-            "-v",
-            "error",
-            "-y",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "bgr24",
-            "-s",
-            f"{width}x{height}",
-            "-r",
-            str(fps),
-            "-i",
-            "-",
-            "-an",
-            *encoder_args(encoder_name, video_crf),
-            "-pix_fmt",
-            "yuv420p",
-            str(silent),
-        ],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.DEVNULL,
-        stderr=errors,
+    if frames_only:
+        (output / "frames").mkdir(exist_ok=True)
+    encoder = (
+        None
+        if frames_only
+        else subprocess.Popen(
+            [
+                "ffmpeg",
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "bgr24",
+                "-s",
+                f"{width}x{height}",
+                "-r",
+                str(fps),
+                "-i",
+                "-",
+                "-an",
+                *encoder_args(encoder_name, video_crf),
+                "-pix_fmt",
+                "yuv420p",
+                str(silent),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=errors,
+        )
     )
     cap = cv2.VideoCapture(str(source))
+    if source_start_frame and (
+        not cap.set(cv2.CAP_PROP_POS_FRAMES, source_start_frame)
+        or abs(cap.get(cv2.CAP_PROP_POS_FRAMES) - source_start_frame) > 0.01
+    ):
+        cap.release()
+        raise ValueError("无法精确定位原片块起点")
     stats = []
     reference_counts = []
     previous = None
@@ -158,6 +175,7 @@ def render(
     decoded = bounded_map(decode, range(count), depth=2)
     try:
         for frame, source_index, original in decoded:
+            check()
             source_indices.append(source_index)
             frame_started = time.monotonic()
             small = cv2.resize(original, (mw, mh))
@@ -265,7 +283,15 @@ def render(
                 result[faint_union > 0] = proposed[faint_union > 0]
                 timings["detail"] += time.monotonic() - detail_started
             encode_started = time.monotonic()
-            encoder.stdin.write(result.tobytes())
+            if frames_only:
+                if not cv2.imwrite(
+                    str(output / "frames" / f"{frame:06d}.png"),
+                    result,
+                    [cv2.IMWRITE_PNG_COMPRESSION, 2],
+                ):
+                    raise ValueError("原生帧检查点写入失败")
+            else:
+                encoder.stdin.write(result.tobytes())
             timings["encode"] += time.monotonic() - encode_started
             if previous is not None and frame % 6 == 0:
                 old_source, old_result, old_faint, old_others = previous
@@ -297,34 +323,47 @@ def render(
             if frame % 60 == 0:
                 print("高清合成帧数：" + str(frame) + "/" + str(count), flush=True)
         encode_started = time.monotonic()
-        encoder.stdin.close()
-        if encoder.wait() != 0:
+        if encoder:
+            encoder.stdin.close()
+        if encoder and encoder.wait() != 0:
             raise ValueError("原规格视频编码失败")
         timings["encode"] += time.monotonic() - encode_started
     finally:
         decoded.close()
         cap.release()
         errors.close()
-        if encoder.poll() is None:
+        if encoder and encoder.poll() is None:
             encoder.terminate()
             encoder.wait()
+        if torch_engine is not None and torch_engine.device.type == "cuda":
+            # 原生渲染结束即归还缓存显存，给下一块串行模型留足空间。
+            torch_engine.torch.cuda.synchronize()
+            torch_engine.torch.cuda.empty_cache()
     final = output / "chunk1.mp4"
     mux_started = time.monotonic()
-    mux_core_audio(silent, source, final, duration)
+    if not frames_only:
+        mux_core_audio(silent, source, final, duration)
     timings["mux"] = time.monotonic() - mux_started
+    if frames_only:
+        timings["frame_cache_io"] = timings["encode"]
+        timings["encode"] = 0.0
     report = dict(
         视频规格=[width, height, fps],
         分步耗时秒=timings,
         合成后端=backend,
         内存连续细节融合=fused_detail,
-        编码器=encoder_name,
+        编码器=None if frames_only else encoder_name,
         清晰度仅记录=True,
         低于零点七的样本=[
             s for s in stats if s["measurable"] and s["retention_ratio"] < 0.7
         ],
         主体秒数=duration,
         帧数=count,
-        音频内容一致=audio_hash(source, duration) == audio_hash(final),
+        音频内容一致=None
+        if frames_only
+        else audio_hash(source, duration) == audio_hash(final),
+        无损帧交付=frames_only,
+        原片起始帧=source_start_frame,
         清晰度阈值=0.8,
         清晰度统计=stats,
         清晰度通过=None,

@@ -4,7 +4,6 @@ import json
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
-import cv2
 import numpy as np
 import pytest
 from scripts import hls_speedup_bench as bench
@@ -227,29 +226,31 @@ def test_pipeline_speedup_option_uses_lossless_decode_and_copies_audio(
 def test_benchmark_resume_never_repeats_models_for_an_encoder_change(
     tmp_path, monkeypatch
 ):
-    from scripts import hls_align_reference, hls_native_chunk
+    from worker import native_assets, native_chunk
 
     source = tmp_path / "source.mp4"
-    source.write_bytes(b"\x00\x00")
-    paths = {}
-    for name in ("prior", "alpha", "template", "projection_calibration"):
-        path = tmp_path / (name + ".npz")
-        path.write_bytes(b"\x01\x02")
-        paths[name] = path
-    graphic = tmp_path / "graphic"
-    graphic.mkdir()
+    source.write_bytes(b"source")
+    output = tmp_path / "result"
+    output.mkdir()
     args = SimpleNamespace(
         source=source,
-        output=tmp_path / "result",
+        output=output,
         duration=0.1,
         context=0.1,
-        graphic=graphic,
+        prior=None,
+        alpha=None,
+        template=None,
+        graphic=None,
+        projection_calibration=None,
         backend="numpy",
         encoder="libx264",
-        **paths,
+        path="speedup-v2",
     )
-    args.output.mkdir()
-    phases = StageCache(args.output / "stages")
+    assets = {}
+    for name in ("prior", "alpha", "template", "palette"):
+        path = tmp_path / (name + ".npz")
+        path.write_bytes(b"auto")
+        assets[name] = path
     monkeypatch.setenv("DETECTOR", "yolo")
     monkeypatch.setenv("MODEL_MANIFEST", str(tmp_path / "models.json"))
     monkeypatch.setenv("MODEL_LOCK_HASH", "固定模型测试指纹")
@@ -264,68 +265,38 @@ def test_benchmark_resume_never_repeats_models_for_an_encoder_change(
             "format": {"duration": "1"},
         },
     )
-    calls = dict(decode=0, detect=0, sam=0, inpaint=0, align=0, render=0)
+    monkeypatch.setattr(native_assets, "prepare_assets", lambda *a, **kw: assets)
+    calls = []
 
-    def decode(command, **kwargs):
-        calls["decode"] += 1
-        for n in range(6):
-            cv2.imwrite(
-                str(Path(command[-1]).parent / f"{n:06d}.png"),
-                np.full((32, 48, 3), n, np.uint8),
-            )
+    def shared(source, work, plan, assets, config, source_hash):
+        # 验证基准只调用共用执行器，编码器没有进入模型配置身份。
+        calls.append((plan, config["mode"]))
+        (work / "rendered").mkdir(parents=True, exist_ok=True)
+        report = dict(帧映射=[0] * 12, 原片帧索引=list(range(12)), 清晰度统计=[])
+        (work / "rendered/native-report.json").write_text(json.dumps(report))
+        return dict(native=report, stages={"detect": dict(seconds=0, reused=True)})
 
-    monkeypatch.setattr(bench, "run", decode)
-    monkeypatch.setattr(bench.vision, "shots", lambda *a: [[0, 6]])
+    monkeypatch.setattr(native_chunk, "process_chunk", shared)
 
-    def detect(files, scenes, options, root):
-        calls["detect"] += 1
-        (root / "detections.json").write_text(
-            json.dumps(dict(scenes=scenes, tracks=[], hints=[]))
-        )
-        (root / "multitrack-prior.npz").write_bytes(b"\x01\x02")
+    def encode(command, **kw):
+        Path(command[-1]).write_bytes(b"encoded")
 
-    def masks(root, files, *a):
-        calls["sam"] += 1
-        (root / "masks").mkdir()
-        for path in files:
-            cv2.imwrite(
-                str(root / "masks" / path.name), np.full((32, 48), 255, np.uint8)
-            )
-        (root / "metrics.sam.json").write_text("{}")
+    monkeypatch.setattr(bench, "run", encode)
+    from scripts import hls_chunk_check
 
-    def inpaint(root, files, *a):
-        calls["inpaint"] += 1
-        (root / "composite").mkdir(exist_ok=True)
-        for path in files:
-            (root / "composite" / path.name).write_bytes(path.read_bytes())
-        (root / "performance.json").write_text("{}")
-
-    def align(source, frames, output):
-        calls["align"] += 1
-        output.mkdir()
-        (output / "alignment.json").write_text("{}")
-
-    def render(*values):
-        calls["render"] += 1
-        output = values[7]
-        output.mkdir(exist_ok=True)
-        (output / "chunk1.mp4").write_bytes(b"\x00\x01")
-        (output / "native-report.json").write_text("{}")
-
-    monkeypatch.setattr(bench.vision, "detect", detect)
-    monkeypatch.setattr(bench.vision, "masks", masks)
-    monkeypatch.setattr(bench.vision, "inpaint", inpaint)
-    monkeypatch.setattr(hls_align_reference, "align", align)
-    monkeypatch.setattr(hls_native_chunk, "render", render)
+    monkeypatch.setattr(
+        hls_chunk_check,
+        "mux_core_audio",
+        lambda a, b, out, d: out.write_bytes(a.read_bytes()),
+    )
+    phases = StageCache(output / "stages")
     bench.prepare_run(args, phases)
-    bench.prepare_run(args, phases)
-    assert all(n == 1 for n in calls.values())
+    args.alpha = args.template = args.graphic = args.projection_calibration = None
     args.encoder = "h264_nvenc"
     bench.prepare_run(args, phases)
-    assert calls["render"] == 2
-    assert all(
-        calls[name] == 1 for name in ("decode", "detect", "sam", "inpaint", "align")
-    )
+    assert len(calls) == 2 and calls[0] == calls[1]
+    assert args._native_run["plan"]["end"] == 6
+    assert json.loads(args.native_report.read_text())["帧数"] == 6
 
 
 def test_output_cannot_overwrite_baseline_or_running_directories(tmp_path):

@@ -382,7 +382,7 @@ def seam_metrics(
                     "-i",
                     result_path,
                     "-vf",
-                    f"select=between(n\\,{n-1}\\,{n})",
+                    f"select=between(n\\,{n - 1}\\,{n})",
                     "-fps_mode",
                     "passthrough",
                     "-frames:v",
@@ -403,7 +403,7 @@ def seam_metrics(
                 "-i",
                 source,
                 "-vf",
-                f"fps={fps},select=between(n\\,{n-1}\\,{n}),scale={a.shape[1]}:{a.shape[0]}",
+                f"fps={fps},select=between(n\\,{n - 1}\\,{n}),scale={a.shape[1]}:{a.shape[0]}",
                 "-fps_mode",
                 "passthrough",
                 "-frames:v",
@@ -720,6 +720,27 @@ def execute_hls(
         or abs(float(Fraction(video["r_frame_rate"])) - source_fps) > 0.001
     ):
         raise invalid("HLS 仅支持帧率不超过 240 的恒定帧率 H.264 视频")
+    if engine == "propainter":
+        from .hls_native import execute_native_hls
+
+        return execute_native_hls(
+            full,
+            info,
+            lines,
+            segments,
+            digest,
+            source_pts,
+            root,
+            options,
+            stage,
+            check,
+            s3,
+            bucket,
+            checkpoint_prefix,
+            progress,
+            execution_fingerprint,
+            started,
+        )
     fps = min(source_fps, 30)
     if any(
         x["codec_type"] == "audio" and x["codec_name"] != "aac" for x in info["streams"]
@@ -1023,11 +1044,67 @@ def execute_hls(
 
             detections = combine_tracks(detections, prior_path)
         (root / "detections.json").write_text(json.dumps(detections))
+    return deliver_hls(
+        full,
+        info,
+        lines,
+        segments,
+        plans,
+        fps,
+        frames,
+        references,
+        times,
+        digest,
+        cache_hash,
+        source_pts,
+        root,
+        check,
+        stage,
+        progress,
+        started,
+    )
+
+
+def deliver_hls(
+    full,
+    info,
+    lines,
+    segments,
+    plans,
+    fps,
+    frames,
+    references,
+    times,
+    digest,
+    cache_hash,
+    source_pts,
+    root,
+    check,
+    stage,
+    progress,
+    started,
+    native=None,
+    verify_encoded=None,
+):
+    """共享最终编码、原分片时间轴、音频复制、播放及接缝核验。"""
+    from .vision import sha256
+    from . import vision
+    from fractions import Fraction
+
+    source_fps = float(
+        Fraction(
+            next(v for v in info["streams"] if v["codec_type"] == "video")[
+                "avg_frame_rate"
+            ]
+        )
+    )
+    durations = [d for d, _ in segments]
     stage("encode")
     progress(len(plans), len(plans), "encode")
     cuts = [sum(durations[:i]) for i in range(1, len(durations))]
     output = root / "result.mp4"
     keyframes = ",".join(str(x) for x in [0] + cuts)
+    encode_started = time.monotonic()
     run(
         [
             "ffmpeg",
@@ -1044,12 +1121,11 @@ def execute_hls(
             "0:v:0",
             "-map",
             "1:a:0?",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "fast",
-            "-crf",
-            "18",
+            *(
+                native["encoder_args"]
+                if native
+                else ["-c:v", "libx264", "-preset", "fast", "-crf", "18"]
+            ),
             "-pix_fmt",
             "yuv420p",
             "-force_key_frames",
@@ -1064,7 +1140,11 @@ def execute_hls(
         ],
         check,
     )
-    if os.getenv("DETECTOR") == "yolo":
+    if native:
+        native["encode_seconds"] = time.monotonic() - encode_started
+    if verify_encoded:
+        verify_encoded(output)
+    if not native and os.getenv("DETECTOR") == "yolo":
         stage("detect")
         progress(len(plans), len(plans), "quality")
         encoded_frames = root / "encoded-quality"
@@ -1086,6 +1166,7 @@ def execute_hls(
         (root / "composite").unlink()
         (root / "composite").symlink_to(encoded_frames, target_is_directory=True)
         files = sorted(encoded_frames.glob("*.png"))
+        detections = json.loads((root / "detections.json").read_text())
         vision.residual_quality(root, files, detections, check)
         quality = json.loads((root / "quality.json").read_text())
         if quality["residual_count"] or quality["needs_review"]:
@@ -1269,7 +1350,8 @@ def execute_hls(
     seams = seam_metrics(full, frames, plans, fps, root, check, references, output)
     report = dict(
         source_fps=source_fps,
-        processing_fps=fps,
+        processing_fps=30 if native else fps,
+        output_fps=fps,
         chunks=times,
         seams=seams,
         elapsed_ms=round((time.monotonic() - started) * 1000),
@@ -1280,7 +1362,12 @@ def execute_hls(
         residual_count=0,
         audio_copy_verified=audio_copy,
         **audio_timing,
+        native_delivery=native["mode"] if native else None,
     )
+    if native:
+        from .hls_native import finish_report
+
+        finish_report(root, output, delivery, info, report, native, check)
     (root / "metrics-hls.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2)
     )
@@ -1301,4 +1388,7 @@ def execute_hls(
         audio_copy_verified=audio_copy,
         residual_count=0,
     )
+    if native:
+        result["native_path"] = native["mode"]
+        result["quality_review_required"] = True
     return output, result, {"hls_total": report["elapsed_ms"]}

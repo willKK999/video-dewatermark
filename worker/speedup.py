@@ -48,5 +48,9 @@ def encoder_args(encoder="libx264", crf=10):
             "1",
             "-temporal-aq",
             "1",
+            "-forced-idr",
+            "1",
+            "-no-scenecut",
+            "1",
         ]
     raise ValueError("仅支持软件编码或显卡高质量编码")

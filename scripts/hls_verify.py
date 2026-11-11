@@ -53,7 +53,7 @@ def temporal_windows(source, result, plans, fps, references, output):
                     "-i",
                     path,
                     "-vf",
-                    f"fps={fps},select=between(n\\,{first}\\,{first+30}),scale={width}:{height}",
+                    f"fps={fps},select=between(n\\,{first}\\,{first + 30}),scale={width}:{height}",
                     "-fps_mode",
                     "passthrough",
                     "-frames:v",
@@ -171,7 +171,7 @@ def sample_sheets(source, result, plans, fps, references, output):
                     cv2.imwrite(
                         str(
                             output
-                            / f"对比-{round(frame/fps):03d}秒-轨迹{track['id']:02d}.jpg"
+                            / f"对比-{round(frame / fps):03d}秒-轨迹{track['id']:02d}.jpg"
                         ),
                         np.hstack([original[y:b, x:r], clean[y:b, x:r]]),
                     )
@@ -182,7 +182,7 @@ def sample_sheets(source, result, plans, fps, references, output):
             tile[22 : 22 + pair.shape[0], : pair.shape[1]] = pair
             cv2.putText(
                 tile,
-                f"{frame/fps:.2f}s",
+                f"{frame / fps:.2f}s",
                 (8, 16),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.45,
@@ -209,7 +209,7 @@ def sample_sheets(source, result, plans, fps, references, output):
                     ] = thumb
                 cv2.putText(
                     full,
-                    f"{frame/fps:.2f}s",
+                    f"{frame / fps:.2f}s",
                     (8, 16),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.45,
@@ -227,14 +227,14 @@ def sample_sheets(source, result, plans, fps, references, output):
         sheet = np.vstack(
             [np.hstack(tiles[i : i + 2]) for i in range(0, len(tiles), 2)]
         )
-        cv2.imwrite(str(output / f"block-{index+1:02d}-samples.jpg"), sheet)
+        cv2.imwrite(str(output / f"block-{index + 1:02d}-samples.jpg"), sheet)
     for index, tiles in full_rows.items():
         if len(tiles) % 2:
             tiles.append(np.zeros_like(tiles[0]))
         sheet = np.vstack(
             [np.hstack(tiles[i : i + 2]) for i in range(0, len(tiles), 2)]
         )
-        cv2.imwrite(str(output / f"block-{index+1:02d}-full-samples.jpg"), sheet)
+        cv2.imwrite(str(output / f"block-{index + 1:02d}-full-samples.jpg"), sheet)
     return total
 
 
@@ -252,9 +252,9 @@ def verify(source, result, playlist, report, references, output, detect=False):
         == int(hv["nb_read_frames"])
         == report["chunks"][-1]["end"]
     ), "成品帧数不一致"
-    assert (
-        abs(float(rv["duration"]) - float(sv["duration"])) <= 1 / fps + 0.001
-    ), "成品时长不一致"
+    assert abs(float(rv["duration"]) - float(sv["duration"])) <= 1 / fps + 0.001, (
+        "成品时长不一致"
+    )
     for path in (result, playlist):
         run(["ffmpeg", "-v", "error", "-xerror", "-i", path, "-f", "null", "-"])
 
@@ -286,9 +286,9 @@ def verify(source, result, playlist, report, references, output, detect=False):
         ]
 
     mp4_hashes, hls_hashes = decoded_hashes(result), decoded_hashes(playlist)
-    assert mp4_hashes == hls_hashes and len(mp4_hashes) == int(
-        rv["nb_read_frames"]
-    ), "HLS 切分改变了解码像素"
+    assert mp4_hashes == hls_hashes and len(mp4_hashes) == int(rv["nb_read_frames"]), (
+        "HLS 切分改变了解码像素"
+    )
     video_digest = hashlib.sha256("".join(mp4_hashes).encode()).hexdigest()
     timing = {}
     if any(x["codec_type"] == "audio" for x in source_info["streams"]):
@@ -341,14 +341,16 @@ def verify(source, result, playlist, report, references, output, detect=False):
         (output / "detections.json").write_text(json.dumps(references))
         references = {
             **references,
-            "scenes": vision.shots(sorted(frames.glob("*.png"))),
+            "scenes": references["scenes"]
+            if report.get("native_delivery")
+            else vision.shots(sorted(frames.glob("*.png"))),
         }
         (output / "detections.json").write_text(json.dumps(references))
         vision.residual_quality(output, sorted(frames.glob("*.png")), references)
         quality = json.loads((output / "quality.json").read_text())
-        assert (
-            quality["residual_count"] == 0 and not quality["needs_review"]
-        ), "编码成品存在残留证据"
+        assert quality["residual_count"] == 0 and not quality["needs_review"], (
+            "编码成品存在残留证据"
+        )
     seams = seam_metrics(
         source,
         frames,
