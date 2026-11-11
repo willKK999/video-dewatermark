@@ -549,7 +549,8 @@ def residual_quality(root, files, detections, check=lambda: None):
             strong_parts = [
                 p
                 for p in partial
-                if p["correlation"] >= 0.55 and p["relative_amplitude"] >= 0.15
+                if abs(p["correlation"]) >= 0.55
+                and abs(p["relative_amplitude"]) >= 0.15
             ]
             if candidates or strong_parts:
                 confidence = max(
@@ -585,7 +586,7 @@ def residual_quality(root, files, detections, check=lambda: None):
                 )
             )
             if any(
-                p["correlation"] >= 0.35 and p["relative_amplitude"] >= 0.15
+                abs(p["correlation"]) >= 0.35 and abs(p["relative_amplitude"]) >= 0.15
                 for p in components
             ):
                 fixed.append(region["id"])
@@ -622,7 +623,7 @@ def refine(root, files, detections, engine, low_memory, fps, stage, check):
             x["track_id"]
             for x in quality["fixed_template_scores"]
             if any(
-                p["correlation"] >= 0.35 and p["relative_amplitude"] >= 0.15
+                abs(p["correlation"]) >= 0.35 and abs(p["relative_amplitude"]) >= 0.15
                 for p in x.get("components", [x])
             )
         }

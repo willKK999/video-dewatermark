@@ -277,6 +277,12 @@ def masks(root, files, detections, engine, check=lambda: None):
                 x1, y1, x2, y2 = map(lambda x: int(round(x)), box)
                 mask[y1:y2, x1:x2] = 255
                 cv2.imwrite(str(dest / files[i].name), mask)
+    return validate_masks(root, files, detections, check)
+
+
+def validate_masks(root, files, detections, check=lambda: None):
+    """对已完成的 SAM 输出执行同一套完整覆盖及面积校验，供失败阶段续跑。"""
+    dest = root / "masks"
     if len(list(dest.glob("*.png"))) != len(files):
         raise PipelineError("MASK_INVALID", "mask count differs")
     prior = None
@@ -413,11 +419,18 @@ def _composite_window(
         if old.exists():
             previous = read(old)
             region = mask > 0
-            if (
-                region.any()
-                and np.abs(previous.astype(float) - repair.astype(float))[region].mean()
-                > 35
-            ):
+            disagreement = (
+                float(
+                    np.abs(previous.astype(float) - repair.astype(float))[region].mean()
+                )
+                if region.any()
+                else 0.0
+            )
+            performance["overlap_max_mae"] = max(
+                performance.get("overlap_max_mae", 0), disagreement
+            )
+            performance["overlap_samples"] = performance.get("overlap_samples", 0) + 1
+            if disagreement > 35:
                 raise PipelineError(
                     "SEAM_UNCERTAIN",
                     "overlap disagreement requires review",
@@ -442,9 +455,12 @@ def inpaint(root, files, scenes, engine, low_memory=False, check=lambda: None):
             image[mask > 0] = repaired[mask > 0]
             cv2.imwrite(str(dest / f.name), image)
         return
+    processed_indices = [i for start, end in scenes for i in range(start, end)]
     sampled_masks = [
-        read(root / "masks" / files[int(i)].name, True)
-        for i in np.linspace(0, len(files) - 1, min(8, len(files)), dtype=int)
+        read(root / "masks" / files[processed_indices[int(i)]].name, True)
+        for i in np.linspace(
+            0, len(processed_indices) - 1, min(8, len(processed_indices)), dtype=int
+        )
     ]
     mask_fraction = max(np.count_nonzero(mask) / mask.size for mask in sampled_masks)
     # 多目标联合掩膜增加稀疏注意力的活动区域，自动缩短窗口而不降分辨率。

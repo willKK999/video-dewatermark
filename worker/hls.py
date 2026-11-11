@@ -583,7 +583,7 @@ def checkpoint_hash(digest, options, engine, low_memory, execution_fingerprint="
     return hashlib.sha256(
         json.dumps(
             dict(
-                strategy="hls-multitrack-consensus-v7",
+                strategy="hls-multitrack-lifetimes-v8",
                 source=digest,
                 options=options,
                 models=os.getenv("MODEL_LOCK_HASH", ""),

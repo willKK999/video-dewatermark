@@ -152,3 +152,61 @@ def test_single_frame_scene_gets_same_frame_context_without_extra_output(
     assert (
         len(calls) == 1 and len(list((tmp_path / "composite").glob("*.png"))) == count
     )
+
+
+def test_overlap_records_measured_disagreement_without_changing_limit(tmp_path):
+    previous = np.full((12, 12, 3), 50, np.uint8)
+    file, window, references = setup_window(
+        tmp_path,
+        previous,
+        previous,
+        np.full_like(previous, 60),
+        np.full((12, 12), 255, np.uint8),
+    )
+    performance = dict(composite_io_seconds=0, restoration_seconds=0)
+    _composite_window(
+        tmp_path, [file], 0, 1, 8, window, lambda: None, references, performance
+    )
+    assert performance["overlap_samples"] == 1
+    assert performance["overlap_max_mae"] == 10
+
+
+def test_partial_scene_inpaint_does_not_read_masks_outside_requested_range(
+    tmp_path, monkeypatch
+):
+    from worker import vision
+    from pathlib import Path
+    import sys
+
+    for folder in ["frames", "masks"]:
+        (tmp_path / folder).mkdir()
+    image = np.full((20, 20, 3), 80, np.uint8)
+    files = []
+    for i in range(6):
+        path = tmp_path / "frames" / f"{i:06d}.png"
+        cv2.imwrite(str(path), image)
+        files.append(path)
+    for i in [2, 3]:
+        cv2.imwrite(
+            str(tmp_path / "masks" / files[i].name), np.zeros((20, 20), np.uint8)
+        )
+    monkeypatch.setenv("INPAINT_PYTHON", sys.executable)
+    monkeypatch.setenv("PROPAINTER_ROOT", str(tmp_path))
+    monkeypatch.setattr(
+        vision,
+        "CleanReferences",
+        lambda *a: SimpleNamespace(restore=lambda x, m, y: y, stats={}, timings={}),
+    )
+
+    def model(args, check, cwd):
+        dest = Path(args[args.index("--output") + 1]) / "frames/frames"
+        dest.mkdir(parents=True)
+        for i in range(2):
+            cv2.imwrite(str(dest / f"{i:06d}.png"), image)
+
+    monkeypatch.setattr(vision, "run", model)
+    vision.inpaint(tmp_path, files, [(2, 4)], "propainter")
+    assert {p.name for p in (tmp_path / "composite").glob("*.png")} == {
+        "000002.png",
+        "000003.png",
+    }

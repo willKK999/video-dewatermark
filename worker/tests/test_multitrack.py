@@ -1,5 +1,6 @@
 """多目标与时域共识必须独立覆盖图标，且不能把变化字幕纳入。"""
 
+import pytest
 import cv2, numpy as np
 from worker.multitrack import (
     temporal_consensus,
@@ -114,7 +115,8 @@ def test_multiple_moving_copies_have_independent_tracks(tmp_path, monkeypatch):
     assert merge_masks(parts.values(), (80, 120))[48, 85] == 255
 
 
-def test_full_icon_remnant_is_detected_without_text_detector(tmp_path):
+@pytest.mark.parametrize("polarity", [1, -1])
+def test_full_icon_remnant_is_detected_without_text_detector(tmp_path, polarity):
     from worker import multitrack
 
     rng = np.random.default_rng(6)
@@ -130,7 +132,7 @@ def test_full_icon_remnant_is_detected_without_text_detector(tmp_path):
     for i in range(3):
         path = tmp_path / f"{i:06d}.png"
         files.append(path)
-        image = np.clip(median + 128, 0, 255).astype(np.uint8)
+        image = np.clip(polarity * median + 128, 0, 255).astype(np.uint8)
         cv2.imwrite(str(tmp_path / "composite" / path.name), image)
     detections = dict(
         prior=str(prior), tracks=[dict(id=1, kind="fixed", region=1, hints=[])]
@@ -192,3 +194,45 @@ def test_small_icon_residual_cannot_be_diluted_by_removed_text():
     assert any(
         p["correlation"] > 0.99 and p["relative_amplitude"] > 0.99 for p in scores[1:]
     )
+
+
+def test_resumed_sam_validation_covers_every_track_and_keeps_area_limit(
+    tmp_path, monkeypatch
+):
+    from worker.multitrack import save_prior
+    from worker.vision import validate_masks
+    from worker.process import PipelineError
+    import pytest
+
+    monkeypatch.setenv("DETECTOR", "yolo")
+    for folder in ["frames", "masks"]:
+        (tmp_path / folder).mkdir()
+    image = np.full((100, 200, 3), 100, np.uint8)
+    file = tmp_path / "frames/000000.png"
+    cv2.imwrite(str(file), image)
+    cv2.imwrite(str(tmp_path / "masks/000000.png"), np.zeros((100, 200), np.uint8))
+    median = np.zeros((100, 200), np.float32)
+    regions = []
+    tracks = []
+    hints = []
+    for identity, box in enumerate([[10, 10, 30, 20], [140, 60, 160, 70]], 1):
+        mask = np.zeros((100, 200), np.uint8)
+        x, y, r, b = box
+        mask[y:b, x:r] = 255
+        regions.append(dict(id=identity, box=box, mask=mask, confidence=0.9))
+        hint = dict(frame=0, box=box, confidence=0.9, track_id=identity)
+        hints.append(hint)
+        tracks.append(dict(id=identity, region=identity, kind="fixed", hints=[hint]))
+    prior = tmp_path / "prior.npz"
+    save_prior(prior, median, np.zeros_like(median, np.uint8), regions, [], {})
+    d = dict(
+        multitrack=True, prior=str(prior), tracks=tracks, hints=hints, scenes=[[0, 1]]
+    )
+    manifest = validate_masks(tmp_path, [file], d)
+    mask = cv2.imread(str(tmp_path / "masks/000000.png"), 0)
+    assert mask[15, 20] and mask[65, 150] and not mask[45, 90]
+    assert len(manifest) == 1
+    regions[0]["mask"][:80, :150] = 255
+    save_prior(prior, median, np.zeros_like(median, np.uint8), regions, [], {})
+    with pytest.raises(PipelineError, match="20%"):
+        validate_masks(tmp_path, [file], d)
