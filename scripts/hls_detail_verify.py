@@ -8,6 +8,20 @@ from worker.fine_masks import Supports
 from worker.matte import temporal_detail, stable_detail_mask
 
 
+def occluder_mask(roots, index, shape):
+    """独立不透明图层优先于旧静态透明度分类，不能把去掉的滚动字当作皮肤细节。"""
+    mask = np.zeros(shape, np.uint8)
+    for root in roots:
+        path = Path(root) / "masks" / f"{index:06d}.png"
+        if not path.exists():
+            continue
+        part = cv2.imread(str(path), 0)
+        if part is None:
+            raise ValueError("清晰度核验的不透明图层掩膜不可读")
+        mask |= cv2.resize(part, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST)
+    return mask
+
+
 def sample_pairs(indices, detected, stride=30):
     if stride < 1:
         raise ValueError("采样步长必须为正数")
@@ -25,7 +39,8 @@ def sample_pairs(indices, detected, stride=30):
 
 
 def verify(
-    source, result, mapping, detected, prior, alpha, graphic, output, sample_stride=30
+    source, result, mapping, detected, prior, alpha, graphic, output, sample_stride=30,
+    occluder_roots=(),
 ):
     started = time.monotonic()
     indices = json.loads(mapping.read_text())["帧映射"]
@@ -44,8 +59,8 @@ def verify(
 
     def masks(i, x):
         faint = {}
-        occupied = np.zeros((h, w), np.uint8)
-        other = np.zeros_like(occupied)
+        other = occluder_mask(occluder_roots, i, (h, w))
+        occupied = other.copy()
         for p in supports.at(i, cv2.resize(x, (mw, mh))):
             mask = cv2.resize(p["mask"], (w, h), interpolation=cv2.INTER_NEAREST)
             occupied |= mask
@@ -97,6 +112,8 @@ def verify(
         采样步长=sample_stride,
         选择帧号=sorted(selected),
         耗时秒=time.monotonic() - started,
+        方法="透明轨迹排除独立不透明图层-2",
+        不透明排除图层=[str(p) for p in occluder_roots],
         核验方式="每半秒相邻两对覆盖帧率两个相位，并加采转场、移动目标生命周期边界；清晰度只记录，低于0.7单列；残留和闪烁另做全帧复检"
     )
     output.write_text(json.dumps(report, ensure_ascii=False, indent=2))
@@ -123,6 +140,10 @@ def main():
     ]:
         p.add_argument("--" + name, type=Path, required=True)
     p.add_argument(
+        "--occluder-root", type=Path, action="append", default=[],
+        help="自动不透明图层目录，可重复；只排除受其遮挡的纹理样本，不改变残留检查",
+    )
+    p.add_argument(
         "--sample-stride",
         type=int,
         default=30,
@@ -140,6 +161,7 @@ def main():
         a.graphic,
         a.output,
         a.sample_stride,
+        a.occluder_root,
     )
 
 

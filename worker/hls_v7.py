@@ -540,6 +540,7 @@ def verify_block(work, assets, info):
             Path(assets["alpha"]),
             Path(info["graphics"]),
             audit / "clarity.json",
+            occluder_roots=[Path(info["color"]), Path(info["variant"]), work / "opaque-panels"],
         )
     quality = json.loads((audit / "quality.json").read_text())
     brand = json.loads((audit / "brand.json").read_text())
