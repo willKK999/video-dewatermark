@@ -110,3 +110,31 @@ def test_residual_configuration_can_only_become_stricter(monkeypatch):
     monkeypatch.setenv("HLS_RESIDUAL_CORRELATION", ".36")
     with pytest.raises(ValueError):
         is_residual_score(sample)
+
+
+def test_evidence_export_keeps_v0_values_and_failure_state(tmp_path):
+    from scripts.hls_v0_evidence import enrich
+    import json
+
+    root = tmp_path / "work"
+    delivery = tmp_path / "delivery"
+    delivery.mkdir()
+    work = root / "chunk-03"
+    (work / "audit").mkdir(parents=True)
+    (work / "native").mkdir()
+    original = dict(
+        通过=False, 各块=[dict(块号=3, 是否通过=False, 清晰度最低值=0.0, 残留=37)]
+    )
+    (delivery / "report.json").write_text(json.dumps(original))
+    (work / "audit/clarity.json").write_text(
+        json.dumps({"全部样本": [dict(retention_ratio=0.0, measurable=True)]})
+    )
+    (work / "native/native-report.json").write_text(json.dumps({"清晰度统计": []}))
+    result = enrich(root, delivery)
+    assert (
+        not result["通过"]
+        and result["各块"][0]["残留"] == 37
+        and result["各块"][0]["清晰度最低值"] == 0
+    )
+    assert result["各块"][0]["清晰度原始记录"]["全部样本"][0]["retention_ratio"] == 0
+    assert json.loads((delivery / "report-v0-原始.json").read_text()) == original
