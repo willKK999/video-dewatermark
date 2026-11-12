@@ -224,6 +224,27 @@ def confirmed_template(image, box, assets, banks):
     )
 
 
+def graphic_prompt(image, box, palette):
+    """只用自动检测范围内、源片可验证的品牌颜色引导分割，不能把矩形当作前景。"""
+    from .branding import palette_support
+
+    h, w = image.shape[:2]
+    x, y, a, b = map(round, box)
+    x, y, a, b = max(0, x), max(0, y), min(w, a), min(h, b)
+    mask = np.zeros((h, w), np.uint8)
+    if a > x and b > y:
+        # 颜色支持在整帧计算，不能把检测框边界误当作原片画面边界。
+        support = palette_support(image, palette)
+        mask[y:b, x:a] = support[y:b, x:a]
+    if np.count_nonzero(mask) < 64:
+        raise PipelineError(
+            "MASK_UNCERTAIN",
+            "图形缺少源片可验证的像素提示，不能用检测框代替前景",
+            review=True,
+        )
+    return mask
+
+
 def prepare_graphics(work, detections, assets, fast, check=lambda: None):
     """完整保留候选；短时文字须经自动品牌文本确认，其他字幕不会加入掩膜。"""
     from .short_brand import discover, fraction_inside
@@ -379,14 +400,29 @@ def prepare_graphics(work, detections, assets, fast, check=lambda: None):
         )
         (tracker / "masks").mkdir(exist_ok=True)
         hints = []
-        for p in seed["hints"]:
+        observations = seed["hints"]
+        last_observation = max(p["frame"] for p in observations)
+        if fast:
+            from .sam_schedule import adaptive_hints
+
+            observations = adaptive_hints(
+                observations, seed["scenes"][0][0], seed["scenes"][0][1]
+            )
+        for p in observations:
             p = dict(p, track_id=identity + 1)
+            (tracker / "prompts").mkdir(exist_ok=True)
+            prompt_name = f"prompts/{p['frame']:06d}.png"
             if p.get("mask_prompt"):
-                (tracker / "prompts").mkdir(exist_ok=True)
-                shutil.copyfile(
-                    graphic / p["mask_prompt"], tracker / "prompts/seed.png"
-                )
-                p["mask_prompt"] = "prompts/seed.png"
+                shutil.copyfile(graphic / p["mask_prompt"], tracker / prompt_name)
+            else:
+                image = cv2.imread(str(files[p["frame"]]))
+                prompt = graphic_prompt(image, p["box"], palette)
+                cv2.imwrite(str(tracker / prompt_name), prompt)
+            # 原始像素提示单独留证，跟踪临时目录清理后仍可审计。
+            evidence = graphic / "prompts" / str(identity)
+            evidence.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(tracker / prompt_name, evidence / Path(prompt_name).name)
+            p["mask_prompt"] = prompt_name
             hints.append(p)
         (tracker / "detections.json").write_text(
             json.dumps(dict(scenes=seed["scenes"], hints=hints))
@@ -410,20 +446,15 @@ def prepare_graphics(work, detections, assets, fast, check=lambda: None):
                 check()
                 file = tracker / "masks" / files[index].name
                 component = cv2.imread(str(file), 0)
-                image = cv2.imread(str(files[index]))
                 if (
                     component is None
                     or component.shape != (h, w)
                     or not set(np.unique(component)) <= {0, 255}
                 ):
                     raise PipelineError("MASK_INVALID", "图形分割输出无效")
-                component = bounded_mask(
-                    component, interpolated_box(hints, index), image
-                )
+                component = bounded_mask(component, interpolated_box(hints, index))
                 area = np.count_nonzero(component) / component.size
-                if not valid_area(
-                    previous_area, area, index, max(p["frame"] for p in hints)
-                ):
+                if not valid_area(previous_area, area, index, last_observation):
                     raise PipelineError(
                         "MASK_UNCERTAIN", "图形分割超过面积或漂移门槛", review=True
                     )

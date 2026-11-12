@@ -1032,14 +1032,14 @@ def test_graphic_matching_respects_lifetimes_and_reinitializes_new_shot(
     support = np.zeros(shape, np.uint8)
     support[10:20, 20:35] = 255
     for i in range(8):
-        cv2.imwrite(
-            str(work / "frames" / f"{i:06d}.png"), np.full((*shape, 3), i, np.uint8)
-        )
+        image = np.full((*shape, 3), i, np.uint8)
+        image[support > 0] = (0, 255, 0)
+        cv2.imwrite(str(work / "frames" / f"{i:06d}.png"), image)
         cv2.imwrite(
             str(work / "tracking/masks" / f"{i:06d}.png"), np.zeros(shape, np.uint8)
         )
     palette = tmp_path / "palette.npy"
-    np.save(palette, np.empty((0, 3)))
+    np.save(palette, cv2.cvtColor(np.uint8([[[0, 255, 0]]]), cv2.COLOR_BGR2LAB)[0])
     rows = [
         dict(
             frame=i,
@@ -1058,6 +1058,9 @@ def test_graphic_matching_respects_lifetimes_and_reinitializes_new_shot(
             root = Path(args[args.index("--root") + 1])
             seed = json.loads((root / "detections.json").read_text())
             initializations.append(seed["scenes"])
+            for point in seed["hints"]:
+                prompt = cv2.imread(str(root / point["mask_prompt"]), 0)
+                assert np.array_equal(prompt, support)
             for start, end in seed["scenes"]:
                 for i in range(start, end):
                     cv2.imwrite(
@@ -1144,3 +1147,20 @@ def test_profile_graphics_survive_checkpoint_and_require_each_digest(tmp_path):
     manifest.write_text(json.dumps(profile))
     with pytest.raises(PipelineError, match="内容摘要"):
         prepare_assets(None, root, "冻结片源", profile=manifest)
+
+
+def test_graphic_pixel_prompt_excludes_background_and_rejects_missing_support():
+    from worker.native_assets import graphic_prompt
+
+    image = np.zeros((80, 120, 3), np.uint8)
+    image[15:25, 25:40] = (0, 255, 0)
+    image[40:70, 70:100] = (0, 255, 0)
+    palette = cv2.cvtColor(np.uint8([[[0, 255, 0]]]), cv2.COLOR_BGR2LAB)[0]
+    prompt = graphic_prompt(image, [20, 10, 50, 30], palette)
+    assert np.count_nonzero(prompt) == 150
+    assert not prompt[40:70, 70:100].any()
+    assert not prompt[10, 20]
+    with pytest.raises(PipelineError, match="像素提示"):
+        graphic_prompt(image, [0, 30, 40, 70], palette)
+    with pytest.raises(PipelineError, match="像素提示"):
+        graphic_prompt(image, [20, 10, 50, 30], np.empty((0, 3)))

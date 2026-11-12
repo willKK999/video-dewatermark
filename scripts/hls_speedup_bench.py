@@ -124,18 +124,29 @@ def compare(candidate, baseline, output, duration, crops=()):
 def comparisons(source, candidate, baseline, output, duration, times):
     """并排视频及自动角部截图仅供查看，不参与水印框规划。"""
     output.mkdir(parents=True, exist_ok=True)
+    inputs = (
+        [source, baseline, candidate] if baseline is not None else [source, candidate]
+    )
+    width = 1280 // len(inputs)
+    width -= width % 2
+    filters = ";".join(
+        f"[{i}:v]fps=30,setpts=PTS-STARTPTS,scale={width}:720:force_original_aspect_ratio=decrease,"
+        f"pad={width}:720:(ow-iw)/2:(oh-ih)/2,setsar=1[v{i}]"
+        for i in range(len(inputs))
+    )
+    filters += ";" + "".join(f"[v{i}]" for i in range(len(inputs)))
+    filters += f"hstack=inputs={len(inputs)}:shortest=1,pad=1280:720:0:0[v]"
+    video = output / "source-candidate.mp4"
+    rate = min(6_000_000, int(45_000_000 * 8 / max(duration, 1)))
     run(
         [
             "ffmpeg",
             "-v",
             "error",
             "-y",
-            "-i",
-            source,
-            "-i",
-            candidate,
+            *[item for path in inputs for item in ("-i", path)],
             "-filter_complex",
-            "[0:v]fps=60,setpts=PTS-STARTPTS[a];[1:v]setpts=PTS-STARTPTS[b];[a][b]hstack=shortest=1[v]",
+            filters,
             "-map",
             "[v]",
             "-an",
@@ -146,11 +157,21 @@ def comparisons(source, candidate, baseline, output, duration, times):
             "-preset",
             "fast",
             "-crf",
-            "10",
-            output / "source-candidate.mp4",
+            "20",
+            "-maxrate",
+            str(rate),
+            "-bufsize",
+            str(rate * 2),
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            video,
         ],
         timeout=7200,
     )
+    if video.stat().st_size >= 50_000_000:
+        raise ValueError("七百二十行对比视频超过五千万字节上限")
     captures = [
         cv2.VideoCapture(str(path))
         for path in (
@@ -183,7 +204,10 @@ def comparisons(source, candidate, baseline, output, duration, times):
         for cap in captures:
             cap.release()
     return dict(
-        并排视频=str(output / "source-candidate.mp4"),
+        并排视频=str(video),
+        视频规格=[1280, 720, 30],
+        视频字节数=video.stat().st_size,
+        视频列顺序="原片、七版、提速成品" if baseline is not None else "原片、整集成品",
         图片=images,
         图片顺序="原片、七版、提速成品" if baseline is not None else "原片、整集成品",
         超出单块时长未生成的时间点=skipped,
@@ -647,6 +671,11 @@ def parser():
         help="已解密的原片",
     )
     p.add_argument(
+        "--cold-start",
+        action="store_true",
+        help="完整冷启动：只允许空输出目录，禁止旧先验、素材、环境素材和检查点",
+    )
+    p.add_argument(
         "--asset-manifest",
         type=Path,
         help="已接受的自动素材清单，须与源片及逐文件摘要一致；不复用分块处理结果",
@@ -717,7 +746,7 @@ def parser():
     p.add_argument(
         "--make-comparisons",
         action="store_true",
-        help="生成原片与成品并排视频及三列角部截图",
+        help="生成原片、七版与成品三列七百二十行视频（小于五千万字节）和角部截图",
     )
     p.add_argument(
         "--times",
@@ -731,6 +760,23 @@ def parser():
 
 def validate_output(args):
     output = args.output.resolve()
+    if getattr(args, "cold_start", False):
+        if not args.run or (output.exists() and any(output.iterdir())):
+            raise ValueError("完整冷启动必须使用运行模式与全新空输出目录")
+        if os.getenv("HLS_V7_ASSETS") or any(
+            getattr(args, key, None) is not None
+            for key in (
+                "asset_manifest",
+                "prior",
+                "alpha",
+                "template",
+                "graphic",
+                "projection_calibration",
+                "detected",
+                "native_report",
+            )
+        ):
+            raise ValueError("完整冷启动禁止复用旧先验、素材、检测及环境素材清单")
     protected = [args.source, args.baseline]
     if args.run:
         protected += [

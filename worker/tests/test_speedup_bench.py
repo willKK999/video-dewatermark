@@ -476,3 +476,66 @@ def test_resumed_processing_never_reports_cold_speed_factors(tmp_path, monkeypat
     assert report["复用检查点"] and not report["可用于冷启动提速结论"]
     assert report["三倍提速目标达成"] is None
     assert report["相对分项基线倍数"] is None and report["相对整集首块倍数"] is None
+
+
+def test_cold_start_rejects_all_reused_material_and_nonempty_directory(
+    tmp_path, monkeypatch
+):
+    args = bench.parser().parse_args(
+        ["--run", "--cold-start", "--output", str(tmp_path / "fresh")]
+    )
+    monkeypatch.delenv("HLS_V7_ASSETS", raising=False)
+    bench.validate_output(args)
+    args.prior = tmp_path / "old-prior.npz"
+    with pytest.raises(ValueError, match="禁止复用"):
+        bench.validate_output(args)
+    args.prior = None
+    monkeypatch.setenv("HLS_V7_ASSETS", "旧素材清单")
+    with pytest.raises(ValueError, match="禁止复用"):
+        bench.validate_output(args)
+    monkeypatch.delenv("HLS_V7_ASSETS")
+    args.output.mkdir()
+    (args.output / "report.json").write_text("{}")
+    with pytest.raises(ValueError, match="全新空"):
+        bench.validate_output(args)
+
+
+def test_three_column_comparison_is_720p_and_under_size_limit(tmp_path):
+    import cv2
+
+    videos = []
+    for name, color in [
+        ("source", "red"),
+        ("baseline", "green"),
+        ("candidate", "blue"),
+    ]:
+        path = tmp_path / (name + ".mp4")
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                f"color={color}:size=128x96:rate=30:duration=0.2",
+                "-c:v",
+                "libx264",
+                str(path),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        videos.append(path)
+    report = bench.comparisons(
+        videos[0], videos[2], videos[1], tmp_path / "compare", 0.2, []
+    )
+    cap = cv2.VideoCapture(report["并排视频"])
+    ok, frame = cap.read()
+    cap.release()
+    assert ok and frame.shape[:2] == (720, 1280)
+    assert frame[360, 200, 2] > 200
+    assert frame[360, 600, 1] > 100
+    assert frame[360, 1000, 0] > 200
+    assert report["视频字节数"] < 50_000_000
+    assert report["视频列顺序"] == "原片、七版、提速成品"
