@@ -1,6 +1,6 @@
 """模型确认的不透明面板独立补修；位置、轮廓和生命周期全部来自源片。"""
 
-from .hls_settings import is_residual_score
+from .hls_settings import is_residual_score, HLSSettings
 
 import json, os, shutil, time, subprocess
 from functools import lru_cache
@@ -13,7 +13,51 @@ from . import vision
 from scripts.hls_chunk_check import mux_core_audio, audio_hash
 
 
+def adjacent_panel_box(image, box):
+    """从模型品牌框邻域补齐同高度的闭合图形，不依赖另一个图标检测框。"""
+    settings = HLSSettings.from_env()
+    height, width = image.shape[:2]
+    x, y, a, b = map(float, box)
+    bh = b - y
+    if bh <= 0:
+        return list(box)
+    reach = bh * settings.panel_neighbor_reach
+    left, top = max(0, int(x - reach)), max(0, int(y - bh * .15))
+    right, bottom = min(width, round(a + reach)), min(height, round(b + bh * .15))
+    patch = image[top:bottom, left:right]
+    if not patch.size:
+        return list(box)
+    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+    edges = cv2.Canny(patch, 40, 100)
+    for contour in cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)[0]:
+        cx, cy, cw, ch = cv2.boundingRect(contour)
+        area = cv2.contourArea(contour)
+        if not (bh * settings.panel_neighbor_min_height <= ch <= bh * settings.panel_neighbor_max_height
+                and .5 <= cw / max(ch, 1) <= 2.2 and area >= .6 * cw * ch):
+            continue
+        xx, yy, aa, bb = left + cx, top + cy, left + cx + cw, top + cy + ch
+        gap = max(0, max(xx, x) - min(aa, a))
+        if gap > settings.panel_neighbor_gap * min(ch, bh) or abs((yy + bb - y - b) / 2) > .5 * bh:
+            continue
+        if x - bh * .05 <= xx and aa <= a + bh * .05:
+            continue
+        # 明亮的中性边框包围暗色填充，区别于附近肤色、字幕笔画或纯色物体。
+        rim = np.zeros(edges.shape, np.uint8)
+        cv2.drawContours(rim, [contour], -1, 255, 3)
+        inside = np.zeros_like(rim)
+        cv2.drawContours(inside, [contour], -1, 255, -1)
+        inside = cv2.erode(inside, np.ones((7, 7), np.uint8)) > 0
+        bright = (hsv[:, :, 1] < 70) & (hsv[:, :, 2] > 160)
+        dark = (hsv[:, :, 1] < 80) & (hsv[:, :, 2] < 80)
+        if (not inside.any() or np.mean(bright[rim > 0]) < settings.panel_neighbor_bright_rim
+                or np.mean(dark[inside]) < settings.panel_neighbor_dark_fill):
+            continue
+        x, y, a, b = min(x, xx), min(y, yy), max(a, aa), max(b, bb)
+    return [x, y, a, b]
+
+
 def panel_support(image, box, expand=True):
+    box = adjacent_panel_box(image, box)
     h, w = image.shape[:2]
     x, y, a, b = [round(v) for v in box]
     pad = max(8, round((b - y) * 0.08))
@@ -119,6 +163,7 @@ def observations(rows, files):
             if (box[2] - box[0]) * (box[3] - box[1]) > 1280 * 720 * 0.2:
                 continue
             image = cv2.imread(str(file))
+            box = adjacent_panel_box(image, box)
             mask = panel_support(image, box)
             if mask.any():
                 selected.append(dict(box=box, confidence=seed["confidence"]))
@@ -174,7 +219,7 @@ def patch(work, assets_path):
     native = work / "native"
     final = native / "chunk1.mp4"
     root = work / "opaque-panels"
-    method = "完整面板分部件与时域包络-4"
+    method = "完整面板邻接图形与时域包络-5"
     if root.exists() and any(root.iterdir()):
         marker = root / "method.json"
         if not marker.exists() or json.loads(marker.read_text()).get("方法") != method:

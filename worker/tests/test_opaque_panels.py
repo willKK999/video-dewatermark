@@ -128,3 +128,29 @@ def test_only_icon_left_inside_actual_support_remains_hard_candidate():
     score = measured_supports(source, result, mask, mask)
     assert is_residual_score(score) and not score['仅外扩区触发']
     assert is_residual_score(score['完整轮廓测量'])
+
+
+def test_icon_without_its_own_yolo_box_is_included_by_adjacent_panel_geometry(tmp_path):
+    from worker.opaque_panels import observations
+    image = np.full((160, 400, 3), (140, 170, 190), np.uint8)
+    for left, right in [(20, 100), (105, 370)]:
+        cv2.rectangle(image, (left, 20), (right, 95), (10, 10, 10), -1)
+        cv2.rectangle(image, (left, 20), (right, 95), (240, 240, 240), 3)
+    cv2.circle(image, (60, 57), 23, (0, 220, 250), -1)
+    cv2.putText(image, 'Brand', (120, 65), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 220, 250), 2)
+    cv2.putText(image, 'caption', (30, 145), cv2.FONT_HERSHEY_SIMPLEX, .7, (255, 255, 255), 2)
+    file = tmp_path / '000000.png'
+    cv2.imwrite(str(file), image)
+    rows = observations([dict(frame=0, boxes=[dict(box=[105, 20, 370, 95], class_id=0, confidence=.8)])], [file])
+    box = rows[0]['color_matches'][0]['box']
+    mask = panel_support(image, box)
+    assert box[0] < 25 and mask[57, 60]
+    assert not mask[140, 60] and not mask[120, 200]
+
+
+def test_nearby_skin_or_plain_coloured_object_cannot_grow_brand_box():
+    from worker.opaque_panels import adjacent_panel_box
+    image = np.full((160, 400, 3), (140, 170, 190), np.uint8)
+    cv2.rectangle(image, (20, 20), (100, 95), (0, 220, 250), -1)
+    box = [105, 20, 370, 95]
+    assert adjacent_panel_box(image, box) == box

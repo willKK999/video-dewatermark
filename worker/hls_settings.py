@@ -18,6 +18,12 @@ class HLSSettings:
     residual_correlation: float = 0.35
     residual_amplitude: float = 0.15
     clarity_record_threshold: float = 0.7
+    panel_neighbor_reach: float = 1.5
+    panel_neighbor_gap: float = 0.35
+    panel_neighbor_min_height: float = 0.45
+    panel_neighbor_max_height: float = 1.4
+    panel_neighbor_bright_rim: float = 0.25
+    panel_neighbor_dark_fill: float = 0.2
 
     @classmethod
     def from_env(cls):
@@ -48,6 +54,15 @@ class HLSSettings:
             raise ValueError("当前模型配置使用30帧采样")
         if settings.clarity_record_threshold != 0.7:
             raise ValueError("清晰度单列阈值固定为0.7，且不参与否决")
+        if not (
+            0 < settings.panel_neighbor_reach <= 2
+            and 0 < settings.panel_neighbor_gap <= .5
+            and 0 < settings.panel_neighbor_min_height < 1
+            and 1 <= settings.panel_neighbor_max_height <= 2
+            and 0 < settings.panel_neighbor_bright_rim <= 1
+            and 0 < settings.panel_neighbor_dark_fill <= 1
+        ):
+            raise ValueError("相邻面板几何配置无效")
         return settings
 
 
