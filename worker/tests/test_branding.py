@@ -81,3 +81,13 @@ def test_changed_color_residual_is_checked_without_original_pixel_match():
     ]
     mask = residual_components(image, palette, target)
     assert mask[50, 80] and not mask[10, 170]
+
+
+def test_dark_play_triangle_on_light_translucent_body_is_also_a_complete_icon():
+    from worker.branding import play_icons
+    image=np.full((240,320,3),180,np.uint8)
+    cv2.circle(image,(180,120),55,(230,230,230),-1)
+    cv2.fillPoly(image,[np.array([[163,90],[163,150],[210,120]],np.int32)],(20,20,20))
+    assert play_icons(image)
+    cv2.circle(image,(180,120),55,(230,230,230),-1)
+    assert not play_icons(image)

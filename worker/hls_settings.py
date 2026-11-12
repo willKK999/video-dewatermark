@@ -31,6 +31,10 @@ class HLSSettings:
     opaque_palette_margin: float = 12
     opaque_ink_radius: int = 4
     opaque_brand_padding: float = .1
+    graphic_search_padding: float = 1
+    graphic_size_min_ratio: float = .35
+    graphic_size_max_ratio: float = 2
+    graphic_anchor_overlap: float = .2
 
     @classmethod
     def from_env(cls):
@@ -74,6 +78,8 @@ class HLSSettings:
             raise ValueError("源片字形可见性配置无效")
         if not (0 < settings.opaque_white_saturation <= 255 and 0 < settings.opaque_white_min_value <= 255 and 0 <= settings.opaque_palette_margin <= 255 and 1 <= settings.opaque_ink_radius <= 12 and 0 <= settings.opaque_brand_padding <= .25):
             raise ValueError("不透明品牌笔画配置无效")
+        if not (0 < settings.graphic_search_padding <= 3 and 0 < settings.graphic_size_min_ratio < settings.graphic_size_max_ratio <= 3 and 0 < settings.graphic_anchor_overlap <= 1):
+            raise ValueError("完整移动图形几何配置无效")
         return settings
 
 

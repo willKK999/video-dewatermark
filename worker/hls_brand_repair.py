@@ -53,14 +53,8 @@ def patch(work, assets_path):
         if mask.any():active.append(index)
         cv2.imwrite(str(root/'masks'/file.name),mask)
     if not active:raise PipelineError('MASK_UNCERTAIN','品牌残留缺少可靠前景笔画',review=True)
-    from .hls_layers import write_manifest,VerifiedLayers
-    write_manifest(root,Path(info['detected']),[root/'masks'],files)
-    validated=VerifiedLayers(root/'layers.json',Path(info['detected']))
-    missing=capture(video,mapping,root/'frames',files)
-    ranges=intervals(active,detected['scenes'],len(files),settings.model_fps)
-    vision.inpaint(root,sorted((root/'frames').glob('*.png')),ranges,'propainter',True,condition_overlap=True)
-    output=blend(video,Path(info['source']),mapping,root/'masks',root/'composite',root/'patched.mp4',validated)
-    if audio_hash(video)!=audio_hash(output):raise PipelineError('OUTPUT_INVALID','独立品牌补修改变了音频')
+    from .hls_mask_pass import process
+    output,ranges,missing=process(work,root,info,mapping,files,detected['scenes'],active,settings)
     result_digest=vision.sha256(output)
     (root/'report.json').write_text(json.dumps(dict(方法='当前成品独立不透明笔画补修-1',输入摘要=digest,输出摘要=result_digest,原始证据=audit['证据'],目标模型帧=sorted(targets),实际补修帧=active,上下文区间=ranges,最大面积比例=maximum,补齐未映射帧=missing,掩膜来源清单摘要=vision.sha256(root/'layers.json'),耗时秒=time.monotonic()-started,音频原样复制=True),ensure_ascii=False,indent=2))
     output.replace(video)
