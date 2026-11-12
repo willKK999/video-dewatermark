@@ -226,7 +226,7 @@ def confirmed_template(image, box, assets, banks):
 
 def graphic_prompt(image, box, palette):
     """只用自动检测范围内、源片可验证的品牌颜色引导分割，不能把矩形当作前景。"""
-    from .branding import palette_support
+    from .branding import palette_support, grow_brand_components
 
     h, w = image.shape[:2]
     x, y, a, b = map(round, box)
@@ -236,6 +236,8 @@ def graphic_prompt(image, box, palette):
         # 颜色支持在整帧计算，不能把检测框边界误当作原片画面边界。
         support = palette_support(image, palette)
         mask[y:b, x:a] = support[y:b, x:a]
+        # 检测器可能只框住图标的一部分；复用七版短时品牌的相邻笔画补全。
+        mask |= grow_brand_components(support, [box])
     if np.count_nonzero(mask) < 64:
         raise PipelineError(
             "MASK_UNCERTAIN",
@@ -243,6 +245,19 @@ def graphic_prompt(image, box, palette):
             review=True,
         )
     return mask
+
+
+def bounded_graphic_mask(mask, box):
+    """图形只作范围限制；沿用七版后续固定核补边，不能叠加文字框高度外扩。"""
+    from .workflow import expand_box
+
+    h, w = mask.shape
+    x, y, a, b = expand_box(box, w, h)
+    bounded = np.zeros_like(mask)
+    bounded[int(y) : int(np.ceil(b)), int(x) : int(np.ceil(a))] = mask[
+        int(y) : int(np.ceil(b)), int(x) : int(np.ceil(a))
+    ]
+    return bounded
 
 
 def prepare_graphics(work, detections, assets, fast, check=lambda: None):
@@ -402,27 +417,38 @@ def prepare_graphics(work, detections, assets, fast, check=lambda: None):
         hints = []
         observations = seed["hints"]
         last_observation = max(p["frame"] for p in observations)
-        if fast:
-            from .sam_schedule import adaptive_hints
+        from .sam_schedule import adaptive_mask_hints
 
-            observations = adaptive_hints(
-                observations, seed["scenes"][0][0], seed["scenes"][0][1]
-            )
-        for p in observations:
+        def load_prompt(p):
+            if p.get("mask_prompt"):
+                from .sam_schedule import load_mask_prompt
+
+                return (
+                    load_mask_prompt(graphic, p["mask_prompt"], (h, w)).astype(np.uint8)
+                    * 255
+                )
+            return graphic_prompt(cv2.imread(str(files[p["frame"]])), p["box"], palette)
+
+        for p, prompt in adaptive_mask_hints(
+            observations, *seed["scenes"][0], load_prompt, fast=fast
+        ):
             p = dict(p, track_id=identity + 1)
             (tracker / "prompts").mkdir(exist_ok=True)
             prompt_name = f"prompts/{p['frame']:06d}.png"
-            if p.get("mask_prompt"):
-                shutil.copyfile(graphic / p["mask_prompt"], tracker / prompt_name)
-            else:
-                image = cv2.imread(str(files[p["frame"]]))
-                prompt = graphic_prompt(image, p["box"], palette)
-                cv2.imwrite(str(tracker / prompt_name), prompt)
+            cv2.imwrite(str(tracker / prompt_name), prompt)
             # 原始像素提示单独留证，跟踪临时目录清理后仍可审计。
             evidence = graphic / "prompts" / str(identity)
             evidence.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(tracker / prompt_name, evidence / Path(prompt_name).name)
             p["mask_prompt"] = prompt_name
+            yy, xx = np.where(prompt > 0)
+            p["source_box"] = p["box"]
+            p["box"] = [
+                int(xx.min()),
+                int(yy.min()),
+                int(xx.max() + 1),
+                int(yy.max() + 1),
+            ]
             hints.append(p)
         (tracker / "detections.json").write_text(
             json.dumps(dict(scenes=seed["scenes"], hints=hints))
@@ -437,7 +463,7 @@ def prepare_graphics(work, detections, assets, fast, check=lambda: None):
             ],
             check,
         )
-        from .workflow import bounded_mask, interpolated_box, abrupt_area
+        from .workflow import interpolated_box, abrupt_area
         from .graphic_tracks import valid_area
 
         for start, end in seed["scenes"]:
@@ -452,7 +478,9 @@ def prepare_graphics(work, detections, assets, fast, check=lambda: None):
                     or not set(np.unique(component)) <= {0, 255}
                 ):
                     raise PipelineError("MASK_INVALID", "图形分割输出无效")
-                component = bounded_mask(component, interpolated_box(hints, index))
+                component = bounded_graphic_mask(
+                    component, interpolated_box(hints, index)
+                )
                 area = np.count_nonzero(component) / component.size
                 if not valid_area(previous_area, area, index, last_observation):
                     raise PipelineError(

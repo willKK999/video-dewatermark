@@ -1164,3 +1164,15 @@ def test_graphic_pixel_prompt_excludes_background_and_rejects_missing_support():
         graphic_prompt(image, [0, 30, 40, 70], palette)
     with pytest.raises(PipelineError, match="像素提示"):
         graphic_prompt(image, [20, 10, 50, 30], np.empty((0, 3)))
+
+
+def test_graphic_range_guard_does_not_add_background_or_repeat_text_dilation():
+    from worker.native_assets import bounded_graphic_mask
+
+    mask = np.zeros((100, 160), np.uint8)
+    mask[25:30, 55:80] = 255
+    assert np.array_equal(bounded_graphic_mask(mask, [50, 20, 90, 40]), mask)
+    assert np.array_equal(bounded_graphic_mask(mask, [40, 10, 100, 80]), mask)
+    assert not bounded_graphic_mask(np.zeros_like(mask), [40, 10, 100, 80]).any()
+    mask[85:95, 130:150] = 255
+    assert not bounded_graphic_mask(mask, [50, 20, 90, 40])[85:95].any()

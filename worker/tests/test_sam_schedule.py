@@ -45,3 +45,25 @@ def test_generated_mask_prompt_checks_path_shape_and_values(tmp_path):
             load_mask_prompt(tmp_path, path, (20, 30))
     with pytest.raises(ValueError):
         load_mask_prompt(tmp_path, "prompts/seed.png", (10, 10))
+
+
+def test_mask_deformation_adds_prompt_when_box_does_not_move():
+    import numpy as np
+    from worker.sam_schedule import adaptive_mask_hints
+
+    hints = [dict(frame=i, box=[0, 0, 20, 20]) for i in range(6)]
+    masks = []
+    for i in range(6):
+        mask = np.zeros((20, 20), np.uint8)
+        mask[2:10, 2:10] = 255
+        if i >= 2:
+            mask[12:18, 12:18] = 255
+        masks.append(mask)
+    selected = list(adaptive_mask_hints(hints, 0, 6, lambda p: masks[p["frame"]]))
+    assert [p["frame"] for p, mask in selected] == [0, 2, 5]
+    assert [
+        p["frame"]
+        for p, mask in adaptive_mask_hints(
+            hints, 0, 6, lambda p: masks[p["frame"]], fast=False
+        )
+    ] == list(range(6))

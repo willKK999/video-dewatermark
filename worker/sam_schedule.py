@@ -83,6 +83,25 @@ def adaptive_hints(hints, start, end, stride=30, motion_fraction=0.2):
     return sorted(result, key=lambda p: (p["frame"], p.get("track_id", 1)))
 
 
+def adaptive_mask_hints(hints, start, end, load_mask, fast=True):
+    """框内形变也需要新提示；只在相对上次提示的像素形状稳定时稀疏传播。"""
+    import numpy as np
+
+    ordered = sorted(hints, key=lambda p: p["frame"])
+    required = {p["frame"] for p in adaptive_hints(ordered, start, end)}
+    previous = None
+    for point in ordered:
+        mask = load_mask(point)
+        active = mask > 0
+        changed = previous is None
+        if previous is not None:
+            union = np.count_nonzero(previous | active)
+            changed = np.count_nonzero(previous & active) / max(1, union) < 0.7
+        if not fast or point["frame"] in required or changed:
+            yield point, mask
+            previous = active
+
+
 def segmentation_shape(height, width, max_edge):
     if max_edge < 128:
         raise ValueError("分割准备图像长边不得低于一百二十八像素")
