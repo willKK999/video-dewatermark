@@ -520,6 +520,8 @@ def verify_block(work, assets, info):
                 raise
         finally:
             cap.release()
+    if (audit / "brand.json").exists() and json.loads((audit / "brand.json").read_text()).get("核验方法") != "完整独立部件支持-2":
+        (audit / "brand.json").rename(audit / f"brand-before-complete-{time.time_ns()}.json")
     if not (audit / "brand.json").exists():
         brand_verify(
             result,
@@ -529,6 +531,7 @@ def verify_block(work, assets, info):
             Path(info["variant"]),
             Path(assets["palette"]),
             audit / "brand.json",
+            extra_support=work/"brand-ink-repair/masks",
         )
     if not (audit / "clarity.json").exists():
         detail_verify(

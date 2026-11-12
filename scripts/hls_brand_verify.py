@@ -9,6 +9,13 @@ from worker.brand_templates import variants
 from worker.branding import palette_support
 
 
+def graphic_support(image, sam, colors, extra=None):
+    mask=palette_support(image,colors)&sam
+    if extra is not None:
+        mask|=extra
+    return cv2.dilate(mask,np.ones((3,3),np.uint8))
+
+
 def clipped_scores(feature, template, mask, box):
     x, y, a, b = box
     left, top, right, bottom = (
@@ -27,7 +34,8 @@ def clipped_scores(feature, template, mask, box):
 
 
 def verify(
-    encoded, source_frames, mapping, short_brand, brand, palette, output, frame_offset=0
+    encoded, source_frames, mapping, short_brand, brand, palette, output, frame_offset=0,
+    extra_support=None,
 ):
     native = json.loads(mapping.read_text())
     indices = native["帧映射"]
@@ -44,19 +52,20 @@ def verify(
 
     @lru_cache(maxsize=8)
     def source(i):
-        return cv2.imread(str(source_frames / f"{i:06d}.png"))
+        image=cv2.imread(str(source_frames / f"{i:06d}.png"))
+        if image is None:raise ValueError("完整品牌核验源片帧缺失")
+        return image
 
     @lru_cache(maxsize=8)
     def graphic(i):
         path = short_brand / "masks" / f"{i:06d}.png"
-        if not path.exists():
-            return None
-        sam = cv2.imread(str(path), 0)
-        if not np.any(sam):
-            return None
         image = source(i)
-        mask = palette_support(image, colors) & sam
-        mask = cv2.dilate(mask, np.ones((3, 3), np.uint8))
+        sam = cv2.imread(str(path), 0) if path.exists() else np.zeros(image.shape[:2],np.uint8)
+        extra_path=extra_support/f'{i:06d}.png' if extra_support is not None else None
+        extra=cv2.imread(str(extra_path),0) if extra_path is not None and extra_path.exists() else None
+        if not np.any(sam) and (extra is None or not extra.any()):
+            return None
+        mask = graphic_support(image,sam,colors,extra)
         yy, xx = np.where(mask > 0)
         if not len(xx):
             return None
@@ -112,6 +121,7 @@ def verify(
     if cap is not None:
         cap.release()
     report = dict(
+        核验方法="完整独立部件支持-2",
         帧数=len(indices),
         图形检查次数=checked,
         残留证据数=len(evidence),

@@ -8,7 +8,7 @@ from .process import PipelineError
 from scripts.hls_chunk_check import mux_core_audio
 
 
-def blend(video, source, mapping, masks, repaired, output):
+def blend(video, source, mapping, masks, repaired, output, mask_validator=None):
     cap=cv2.VideoCapture(str(video))
     width,height,fps=round(cap.get(3)),round(cap.get(4)),cap.get(5)
     silent=output.with_name(output.stem+'-video.mp4')
@@ -18,6 +18,7 @@ def blend(video, source, mapping, masks, repaired, output):
     def repair(index):
         mask=cv2.imread(str(masks/f'{index:06d}.png'),0)
         if mask is None:raise PipelineError('OUTPUT_INVALID','补修掩膜缺帧')
+        if mask_validator is not None:mask_validator.validate(index,mask)
         if not mask.any():return None
         image=cv2.imread(str(repaired/f'{index:06d}.png'))
         if image is None:raise PipelineError('OUTPUT_INVALID','模型补修结果缺帧')

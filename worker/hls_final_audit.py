@@ -50,7 +50,7 @@ def audit(full, result, references, works, plans, assets, persistent, check):
     if (
         cached.exists()
         and json.loads(cached.read_text()).get("视频摘要") == digest
-        and json.loads(cached.read_text()).get("核验版本") == "v7-panels-low-2"
+        and json.loads(cached.read_text()).get("核验版本") == "v7-complete-ink-3"
     ):
         summary = json.loads(cached.read_text())
     else:
@@ -147,6 +147,7 @@ def audit(full, result, references, works, plans, assets, persistent, check):
                 Path(assets["palette"]),
                 target,
                 frame_offset=plan["left"],
+                extra_support=work/"brand-ink-repair/masks",
             )
             brands.append(dict(index=i + 1, **json.loads(target.read_text())))
         from .opaque_panels import verify as panel_verify
@@ -187,7 +188,7 @@ def audit(full, result, references, works, plans, assets, persistent, check):
         ).hexdigest()
         summary = dict(
             视频摘要=digest,
-            核验版本="v7-panels-low-2",
+            核验版本="v7-complete-ink-3",
             不透明面板核验=panels,
             低频先验摘要=current_assets["low_band_sha256"],
             低频复检=low_records,
