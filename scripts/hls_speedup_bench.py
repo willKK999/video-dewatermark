@@ -688,6 +688,11 @@ def parser():
         help="首次质量对齐建议软件编码；显卡编码须另行对照",
     )
     p.add_argument(
+        "--sam-state-on-gpu",
+        action="store_true",
+        help="将分割状态保留在显卡；单模型串行使用，须核对显存与掩膜一致性",
+    )
+    p.add_argument(
         "--sam-prepare-max-edge",
         type=int,
         default=1024,
@@ -791,6 +796,7 @@ def main():
                 PROPAINTER_ROI="true",
                 PROPAINTER_ROI_MARGIN=str(args.roi_margin),
                 SAM_SPEEDUP="true",
+                SAM_STATE_ON_GPU="true" if args.sam_state_on_gpu else "false",
                 SAM_PREPARE_MAX_EDGE=str(args.sam_prepare_max_edge),
                 SAM_HINT_STRIDE=str(args.sam_hint_stride),
             )

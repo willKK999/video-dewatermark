@@ -219,8 +219,9 @@ def test_roi_runner_caches_model_work_and_invalidates_changed_masks(
         assert cv2.imread(str(path)).shape == image.shape
 
 
+@pytest.mark.parametrize("gpu_state", [False, True])
 def test_sam_runner_scales_prompts_reinitializes_and_prepares_jpeg_once(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, gpu_state
 ):
     import importlib.util
     import sys
@@ -248,6 +249,7 @@ def test_sam_runner_scales_prompts_reinitializes_and_prepares_jpeg_once(
         image_size = 1024
 
         def init_state(self, video_path, **kwargs):
+            assert kwargs["offload_state_to_cpu"] is (not gpu_state)
             paths = sorted(Path(video_path).glob("*.jpg"))
             assert cv2.imread(str(paths[0])).shape[:2] == (72, 128)
             state = dict(count=len(paths), objects=set())
@@ -286,6 +288,7 @@ def test_sam_runner_scales_prompts_reinitializes_and_prepares_jpeg_once(
         monkeypatch.setattr(torch.cuda, name, lambda: 0)
     for key, value in dict(
         SAM_SPEEDUP="true",
+        SAM_STATE_ON_GPU="true" if gpu_state else "false",
         SAM_PREPARE_MAX_EDGE="128",
         SAM_CONFIG="测试配置",
         SAM_CHECKPOINT="测试模型",

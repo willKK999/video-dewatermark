@@ -297,60 +297,46 @@ def prepare_graphics(work, detections, assets, fast, check=lambda: None):
             raise PipelineError(
                 "DETECTION_UNCERTAIN", "单镜头品牌候选过多，需要复核", review=True
             )
-    # 独立图标使用专用模型高置信提示并按轨迹分组，不用文字位置规则。
-    for start, end in detections["scenes"]:
-        groups = []
-        for row in rows[start:end]:
-            check()
-            known = cv2.imread(
-                str(work / "tracking/masks" / files[row["frame"]].name), 0
+    # 原始观测先做已有主轨迹排重，再按对象、镜头和形态生命周期关联。
+    from .graphic_tracks import associate
+
+    remaining = []
+    for row in rows:
+        check()
+        known = cv2.imread(str(work / "tracking/masks" / files[row["frame"]].name), 0)
+        candidates = []
+        for point in row["boxes"]:
+            if point["class_id"] not in (0, 1) or point["confidence"] < 0.65:
+                continue
+            x, y, a, b = map(round, point["box"])
+            x, y, a, b = (
+                max(0, x),
+                max(0, y),
+                min(known.shape[1], a),
+                min(known.shape[0], b),
             )
-            for point in row["boxes"]:
-                if point["class_id"] not in (0, 1) or point["confidence"] < 0.65:
-                    continue
-                x, y, a, b = map(round, point["box"])
-                x, y, a, b = (
-                    max(0, x),
-                    max(0, y),
-                    min(known.shape[1], a),
-                    min(known.shape[0], b),
-                )
-                if a <= x or b <= y:
-                    continue
-                if primary_covers(point["box"], primary_points.get(row["frame"], [])):
-                    covered_points.append(
-                        dict(
-                            frame=row["frame"],
-                            box=point["box"],
-                            依据="同帧主轨迹双向覆盖；不重复初始化",
-                        )
+            if a <= x or b <= y:
+                continue
+            if primary_covers(point["box"], primary_points.get(row["frame"], [])):
+                covered_points.append(
+                    dict(
+                        frame=row["frame"],
+                        box=point["box"],
+                        依据="同帧主轨迹双向覆盖；不重复初始化",
                     )
-                    continue
-                if np.count_nonzero(known[y:b, x:a]) > (a - x) * (b - y) * 0.85:
-                    continue
-                if any(
-                    s["scenes"][0][0] <= row["frame"] < s["scenes"][0][1]
-                    and fraction_inside(point["box"], s["hints"][0]["box"]) > 0.5
-                    for s in seeds
-                ):
-                    continue
-                item = dict(point, frame=row["frame"])
-                for group in groups:
-                    if (
-                        row["frame"] - group[-1]["frame"] <= 30
-                        and fraction_inside(point["box"], group[-1]["box"]) > 0.5
-                    ):
-                        group.append(item)
-                        break
-                else:
-                    groups.append([item])
-        for group in groups:
-            seeds.append(
-                dict(
-                    scenes=[[group[0]["frame"], min(end, group[-1]["frame"] + 31)]],
-                    hints=group,
                 )
-            )
+                continue
+            if np.count_nonzero(known[y:b, x:a]) > (a - x) * (b - y) * 0.85:
+                continue
+            if any(
+                seed["scenes"][0][0] <= row["frame"] < seed["scenes"][0][1]
+                and fraction_inside(point["box"], seed["hints"][0]["box"]) > 0.5
+                for seed in seeds
+            ):
+                continue
+            candidates.append(point)
+        remaining.append(dict(frame=row["frame"], boxes=candidates))
+    seeds.extend(associate(remaining, detections["scenes"]))
     if len(seeds) > 64:
         raise PipelineError(
             "DETECTION_UNCERTAIN", "品牌轨迹数超出有界调度上限", review=True

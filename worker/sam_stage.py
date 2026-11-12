@@ -166,6 +166,7 @@ def main():
                 "model_load_seconds": load_seconds,
                 "speedup": fast,
                 "prepare_max_edge": max_edge if fast else None,
+                "state_on_gpu": fast and os.getenv("SAM_STATE_ON_GPU") == "true",
                 "hint_stride": stride if fast else 30,
                 "internal_image_size": predictor.image_size,
                 "segmentation_seconds": time.perf_counter() - started,
