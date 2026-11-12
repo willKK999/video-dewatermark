@@ -746,6 +746,24 @@ def validate_output(args):
             raise ValueError("输出目录不得位于正在使用的运行或主工作目录")
 
 
+def recover_timings(output, timings):
+    """处理提前失败时也汇总独立执行器的计时，明确区分已完成与部分耗时。"""
+    for directory, prefix in (("native-assets", "assets_"), ("work", "")):
+        root = output / directory / "stages"
+        path = root / "timings.json"
+        if not path.is_file():
+            continue
+        values = json.loads(path.read_text())
+        for name, entry in values.items():
+            timings[prefix + name] = {
+                k: entry[k]
+                for k in ("seconds", "reused", "original_seconds")
+                if k in entry
+            }
+            timings[prefix + name]["completed"] = (root / (name + ".json")).is_file()
+    return timings
+
+
 def main():
     p = parser()
     args = p.parse_args()
@@ -802,6 +820,8 @@ def main():
         raise SystemExit("基准未完成，阶段记录已保留，请检查独立输出目录") from None
     finally:
         if report is not None:
+            recover_timings(args.output, phases.timings)
+            report["分步计时"] = phases.timings
             report["本次总耗时秒"] = time.monotonic() - started
             report["分步耗时累计秒"] = sum(
                 v["seconds"] for v in phases.timings.values()

@@ -416,3 +416,20 @@ def test_temporal_check_reports_repair_flash_without_counting_source_cut(
     )
     assert {r["frame"] for r in report["异常候选"]} == {4, 5}
     assert any(r["frame"] == 6 and r["source_scene_cut"] for r in report["全体样本"])
+
+
+def test_failure_report_keeps_completed_and_partial_stage_times(tmp_path):
+    root = tmp_path / "work/stages"
+    root.mkdir(parents=True)
+    (root / "timings.json").write_text(
+        json.dumps(
+            dict(
+                detect=dict(seconds=34, reused=False),
+                inpaint=dict(seconds=17, reused=False),
+            )
+        )
+    )
+    (root / "detect.json").write_text("{}")
+    values = bench.recover_timings(tmp_path, {})
+    assert values["detect"] == dict(seconds=34, reused=False, completed=True)
+    assert values["inpaint"] == dict(seconds=17, reused=False, completed=False)
