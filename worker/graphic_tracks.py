@@ -4,6 +4,15 @@ from .short_brand import fraction_inside
 from .yolo_stage import compatible_scale
 
 
+def compatible(a, b):
+    return (
+        a["class_id"] == b["class_id"]
+        and compatible_scale(a["box"], b["box"])
+        and fraction_inside(a["box"], b["box"]) > 0.5
+        and fraction_inside(b["box"], a["box"]) > 0.5
+    )
+
+
 def associate(rows, scenes):
     result = []
     for start, end in scenes:
@@ -21,10 +30,7 @@ def associate(rows, scenes):
                     if k not in used
                     and track.get("closed") is None
                     and frame - track["points"][-1]["frame"] <= 30
-                    and point["class_id"] == track["points"][-1]["class_id"]
-                    and compatible_scale(point["box"], track["points"][-1]["box"])
-                    and fraction_inside(point["box"], track["points"][-1]["box"]) > 0.5
-                    and fraction_inside(track["points"][-1]["box"], point["box"]) > 0.5
+                    and compatible(point, track["points"][-1])
                 ]
                 if options:
                     k = max(
@@ -51,12 +57,13 @@ def associate(rows, scenes):
                 for new in created:
                     point = tracks[new]["points"][0]
                     if (
-                        not compatible_scale(previous["box"], point["box"])
-                        or previous["class_id"] != point["class_id"]
-                    ) and max(
-                        fraction_inside(previous["box"], point["box"]),
-                        fraction_inside(point["box"], previous["box"]),
-                    ) > 0.5:
+                        not compatible(previous, point)
+                        and max(
+                            fraction_inside(previous["box"], point["box"]),
+                            fraction_inside(point["box"], previous["box"]),
+                        )
+                        > 0.5
+                    ):
                         track["closed"] = frame
                         break
         for track in tracks:

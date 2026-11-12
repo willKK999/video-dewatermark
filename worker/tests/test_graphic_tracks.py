@@ -35,3 +35,11 @@ def test_source_cut_and_mid_scene_birth_keep_separate_initializers():
         [[0, 4], [4, 8]],
     )
     assert [t["scenes"] for t in tracks] == [[[1, 4]], [[5, 8]]]
+
+
+def test_reciprocal_extent_change_uses_same_rule_for_matching_and_closing():
+    large, small = point([0, 0, 400, 100]), point([0, 0, 185, 94])
+    tracks = associate(
+        [dict(frame=0, boxes=[large]), dict(frame=1, boxes=[small])], [[0, 10]]
+    )
+    assert [t["scenes"] for t in tracks] == [[[0, 1]], [[1, 10]]]

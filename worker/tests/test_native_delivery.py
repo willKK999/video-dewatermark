@@ -469,6 +469,18 @@ def test_shared_chunk_reuses_models_and_preserves_mode_on_backend_change(
     assert counters["render"] == 2 and all(
         counters[name] == 1 for name in counters if name != "render"
     )
+    if mode == "speedup-v2":
+        monkeypatch.setenv("PROPAINTER_ROI_MARGIN", "112")
+        native_chunk.process_chunk(source, work, plan, assets, config, "源片")
+        assert (
+            counters["inpaint"] == 2
+            and counters["projection"] == 2
+            and counters["render"] == 3
+        )
+        assert all(
+            counters[name] == 1
+            for name in ("decode", "detect", "sam", "graphics", "fine_masks", "align")
+        )
 
 
 def test_no_translucent_fixed_mark_does_not_require_fake_calibration(

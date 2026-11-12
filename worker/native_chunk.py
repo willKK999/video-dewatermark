@@ -9,7 +9,6 @@ import numpy as np
 from . import vision
 from .fine_masks import Supports
 from .process import PipelineError, run
-from .roi_inpaint import digest
 from .speedup_cache import StageCache, fingerprint
 from .native_assets import prepare_graphics
 
@@ -84,13 +83,6 @@ def process_chunk(
 
     work.mkdir(parents=True, exist_ok=True)
     cache = StageCache(work / "stages")
-    code = [digest(p) for p in sorted(Path(__file__).parent.glob("*.py"))]
-    code += [
-        digest(p)
-        for p in sorted(
-            Path(__file__).parent.parent.joinpath("scripts").glob("hls_*.py")
-        )
-    ]
     settings = {
         k: v
         for k, v in os.environ.items()
@@ -109,20 +101,139 @@ def process_chunk(
             )
         )
     }
+    import sys
+    import importlib.metadata
+
+    try:
+        torch_version = importlib.metadata.version("torch")
+    except importlib.metadata.PackageNotFoundError:
+        torch_version = None
     key = fingerprint(
-        list(assets.values()),
+        [],
         [
             source_hash,
             plan,
             config["mode"],
             os.getenv("MODEL_LOCK_HASH"),
-            code,
-            settings,
+            list(sys.version_info[:3]),
+            cv2.__version__,
+            np.__version__,
+            torch_version,
+            "stage-dependencies-2",
         ],
     )
+    dependencies = {
+        "decode": ([], ["process.py"]),
+        "detect": (
+            ["prior"],
+            [
+                "vision.py",
+                "multitrack.py",
+                "workflow.py",
+                "yolo_stage.py",
+                "hls_settings.py",
+            ],
+        ),
+        "sam": (
+            ["prior"],
+            [
+                "vision.py",
+                "sam_stage.py",
+                "sam_schedule.py",
+                "workflow.py",
+                "multitrack.py",
+            ],
+        ),
+        "graphics": (
+            [
+                "prior",
+                "palette",
+                "color_seed_image",
+                "color_seed_mask",
+                "variant_seed_image",
+                "variant_seed_mask",
+            ],
+            [
+                "native_assets.py",
+                "branding.py",
+                "short_brand.py",
+                "brand_templates.py",
+                "brand_foreground.py",
+                "graphic_tracks.py",
+                "yolo_stage.py",
+                "sam_stage.py",
+                "sam_schedule.py",
+                "workflow.py",
+            ],
+        ),
+        "fine_masks": (
+            ["prior", "alpha"],
+            ["fine_masks.py", "matte.py", "multitrack.py"],
+        ),
+        "inpaint": (
+            [],
+            [
+                "vision.py",
+                "roi.py",
+                "roi_inpaint.py",
+                "restoration.py",
+                "torch_stage.py",
+                "propainter_offline.py",
+                "speedup.py",
+            ],
+        ),
+        "align": ([], ["scripts/hls_align_reference.py"]),
+        "projection": (
+            ["prior", "alpha", "template", "projection"],
+            ["scripts/hls_fit_projection.py", "matte.py", "fine_masks.py"],
+        ),
+        "render": (
+            ["prior", "alpha", "template"],
+            [
+                "scripts/hls_native_chunk.py",
+                "scripts/hls_recompose_detail.py",
+                "matte.py",
+                "fine_masks.py",
+                "texture_refs.py",
+                "torch_composite.py",
+                "speedup.py",
+                "gpu_lock.py",
+            ],
+        ),
+    }
+    prefixes = {
+        "decode": (),
+        "detect": ("SHOT_", "DETECTION_", "YOLO_"),
+        "sam": ("BOX_", "MASK_", "SAM_"),
+        "graphics": ("BOX_", "MASK_", "SAM_", "YOLO_", "DETECTION_"),
+        "fine_masks": ("BOX_", "MASK_"),
+        "inpaint": ("PROPAINTER_", "REFERENCE_", "RESTORE_", "MASK_"),
+        "align": (),
+        "projection": ("REFERENCE_", "RESTORE_"),
+        "render": ("REFERENCE_", "RESTORE_", "MASK_"),
+    }
 
     def step(name, identity, operation, outputs, clean=lambda: None):
         check()
+        asset_names, modules = dependencies[name]
+        base = Path(__file__).parent
+        code_paths = [
+            Path(__file__),
+            base / "speedup_cache.py",
+            base / "process.py",
+            base / "media.py",
+        ] + [
+            base.parent / module if module.startswith("scripts/") else base / module
+            for module in modules
+        ]
+        paths = [assets[item] for item in asset_names if assets.get(item)] + code_paths
+        identity = fingerprint(
+            paths,
+            [
+                identity,
+                {k: v for k, v in settings.items() if k.startswith(prefixes[name])},
+            ],
+        )
         stage(
             {
                 "sam": "mask",
