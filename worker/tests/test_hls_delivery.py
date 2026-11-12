@@ -1,5 +1,5 @@
 import pytest
-from worker.hls_delivery import best_version
+from worker.hls_delivery import best_version, verified_stages
 
 
 def candidate(name, residual, **kw):
@@ -25,3 +25,11 @@ def test_unknown_does_not_beat_measured_and_incomplete_is_excluded():
     assert best_version([incomplete, unknown, measured]) is measured
     with pytest.raises(ValueError):
         best_version([incomplete])
+
+
+def test_verified_stages_require_bound_complete_zero_result():
+    q = dict(视频摘要="视频甲", 候选摘要="候选甲", 通过=True, 残留=0, 低频残留=0)
+    assert len(verified_stages(q, "视频甲")) == 3
+    assert not verified_stages(q, "视频乙")
+    assert not verified_stages(dict(q, 低频残留=1), "视频甲")
+    assert not verified_stages(dict(q, 通过=False), "视频甲")

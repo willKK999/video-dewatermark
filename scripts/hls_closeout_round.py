@@ -5,7 +5,7 @@ import os
 import time
 from pathlib import Path
 from worker.gpu_lock import device_lock
-from worker.hls_delivery import best_version
+from worker.hls_delivery import best_version, verified_stages
 from worker.hls_round import execute_round
 from worker.hls_v7 import load_assets, verify_block
 from worker.hls_graphic_repair import patch as graphics
@@ -50,6 +50,7 @@ def closeout(root, assets_path, blocks):
                 candidates.append(record)
 
             snapshot("本轮前")
+            reused = verified_stages(candidates[-1]["核验"], candidates[-1]["视频摘要"])
             report = execute_round(target, [
                 ("v7原生去水印", lambda: None),
                 ("低频检查与补修", lambda: graphics(work, assets_path, Path(assets["low_band_template"]))),
@@ -57,6 +58,7 @@ def closeout(root, assets_path, blocks):
                 ("编码后复检", lambda: verify_block(work, assets, info)),
             ], work / "native/chunk1.mp4", {
                 "v7原生去水印": dict(通过=True, 证据文件=str(work / "native/native-report.json")),
+                **reused,
             })
             try:
                 snapshot("本轮后")
