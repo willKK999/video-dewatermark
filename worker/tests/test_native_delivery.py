@@ -451,8 +451,21 @@ def test_shared_chunk_reuses_models_and_preserves_mode_on_backend_change(
     config["encoder"] = "h264_nvenc"
     native_chunk.process_chunk(source, work, plan, assets, config, "源片")
     assert all(n == 1 for n in counters.values())
-    config["backend"] = "torch-cpu"
+    from contextlib import contextmanager
+    from worker import gpu_lock
+
+    locks = []
+
+    @contextmanager
+    def lock(**kwargs):
+        locks.append("进入")
+        yield
+        locks.append("退出")
+
+    monkeypatch.setattr(gpu_lock, "device_lock", lock)
+    config["backend"] = "torch-cuda"
     native_chunk.process_chunk(source, work, plan, assets, config, "源片")
+    assert locks == ["进入", "退出"]
     assert counters["render"] == 2 and all(
         counters[name] == 1 for name in counters if name != "render"
     )
@@ -989,3 +1002,72 @@ def test_verified_profile_reuses_only_global_assets_and_rejects_changed_content(
     Path(profile["alpha"]).write_bytes(b"changed")
     with pytest.raises(PipelineError, match="摘要"):
         prepare_assets(None, tmp_path / "copied", "冻结原片", profile=manifest)
+
+
+@pytest.mark.parametrize("fast", [False, True])
+def test_graphic_matching_respects_lifetimes_and_reinitializes_new_shot(
+    tmp_path, monkeypatch, fast
+):
+    from worker import native_assets, short_brand, brand_templates
+
+    work = tmp_path / "work"
+    for name in ["frames", "tracking/masks"]:
+        (work / name).mkdir(parents=True)
+    shape = (80, 120)
+    support = np.zeros(shape, np.uint8)
+    support[10:20, 20:35] = 255
+    for i in range(8):
+        cv2.imwrite(
+            str(work / "frames" / f"{i:06d}.png"), np.full((*shape, 3), i, np.uint8)
+        )
+        cv2.imwrite(
+            str(work / "tracking/masks" / f"{i:06d}.png"), np.zeros(shape, np.uint8)
+        )
+    palette = tmp_path / "palette.npy"
+    np.save(palette, np.empty((0, 3)))
+    rows = [
+        dict(
+            frame=i,
+            boxes=[dict(class_id=0, confidence=0.9, box=[20, 10, 35, 20])]
+            if i in [1, 2, 5, 6]
+            else [],
+        )
+        for i in range(8)
+    ]
+    initializations = []
+
+    def run(args, *a, **kw):
+        if "yolo_stage.py" in str(args[1]):
+            Path(args[-1]).write_text(json.dumps(rows))
+        else:
+            root = Path(args[args.index("--root") + 1])
+            seed = json.loads((root / "detections.json").read_text())
+            initializations.append(seed["scenes"])
+            for start, end in seed["scenes"]:
+                for i in range(start, end):
+                    cv2.imwrite(str(root / "masks" / f"{i:06d}.png"), support)
+
+    seen = []
+    monkeypatch.setenv("DETECT_PYTHON", "检测")
+    monkeypatch.setenv("TRACK_PYTHON", "分割")
+    monkeypatch.setenv("YOLO_WEIGHTS", "模型")
+    monkeypatch.setattr(native_assets, "run", run)
+    monkeypatch.setattr(short_brand, "discover", lambda *a, **kw: None)
+    monkeypatch.setattr(brand_templates, "variants", lambda *a: [])
+    monkeypatch.setattr(
+        brand_templates,
+        "match",
+        lambda image, *a, **kw: seen.append(int(image[0, 0, 0]))
+        or [dict(variant=0, box=[20, 10, 35, 20], confidence=0.9)],
+    )
+    monkeypatch.setattr(brand_templates, "mask_for", lambda *a: support.copy())
+    native_assets.prepare_graphics(
+        work,
+        dict(scenes=[[0, 4], [4, 8]], hints=[]),
+        dict(palette=palette, prior=tmp_path / "prior"),
+        fast,
+    )
+    assert initializations == [[[1, 4]], [[5, 8]]]
+    assert sorted(seen) == ([1, 2, 3, 5, 6, 7] if fast else sorted(list(range(8)) * 2))
+    assert json.loads((work / "graphic/raw-candidates.json").read_text()) == rows
+    assert bool(cv2.imread(str(work / "graphic/masks/000000.png"), 0).any()) != fast

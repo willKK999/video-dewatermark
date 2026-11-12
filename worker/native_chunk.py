@@ -261,31 +261,44 @@ def process_chunk(
     render_key = fingerprint(
         [], [projection_key, cache.tokens["projection"], config["backend"]]
     )
+
+    def render_native():
+        from contextlib import nullcontext
+        from .gpu_lock import device_lock
+
+        lock = (
+            device_lock(check=check)
+            if config["backend"] == "torch-cuda"
+            else nullcontext()
+        )
+        with lock:
+            render(
+                source,
+                work,
+                work / "detections.json",
+                assets["prior"],
+                assets["alpha"],
+                assets["template"],
+                work / "graphic",
+                rendered,
+                (plan["right"] - plan["left"]) / 60,
+                reference,
+                work / "projection.json",
+                60,
+                1.2,
+                10,
+                config["backend"],
+                True,
+                "libx264",
+                frames_only=True,
+                source_start_frame=plan["left"],
+                check=check,
+            )
+
     step(
         "render",
         render_key,
-        lambda: render(
-            source,
-            work,
-            work / "detections.json",
-            assets["prior"],
-            assets["alpha"],
-            assets["template"],
-            work / "graphic",
-            rendered,
-            (plan["right"] - plan["left"]) / 60,
-            reference,
-            work / "projection.json",
-            60,
-            1.2,
-            10,
-            config["backend"],
-            True,
-            "libx264",
-            frames_only=True,
-            source_start_frame=plan["left"],
-            check=check,
-        ),
+        render_native,
         lambda: [rendered / "frames", rendered / "native-report.json"],
         lambda: remove("rendered"),
     )

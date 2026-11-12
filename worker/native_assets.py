@@ -338,6 +338,10 @@ def prepare_graphics(work, detections, assets, fast, check=lambda: None):
         def render_match(item):
             index, file = item
             check()
+            # 每个新镜头或新出现的标识已独立初始化；只扩展该次确认的生命周期。
+            # 不把短期轨迹的模板无依据传播到整块，原始全帧检测仍完整保留。
+            if fast and not any(a <= index < b for a, b in seed["scenes"]):
+                return []
             current = cv2.imread(str(file))
             points = match(current, bank, 0.5, 2, allow_partial=True)
             shape = mask_for((h, w), bank, points)
