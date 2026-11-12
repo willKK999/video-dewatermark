@@ -161,3 +161,13 @@ def test_same_candidate_count_cannot_reuse_a_different_candidate_review(tmp_path
     path = tmp_path / "review.json"
     path.write_text(json.dumps(dict(视频摘要="same-video", 候选摘要="old-candidates", 逐项复核=[dict(候选序号=0, 结论="误报", 证据文件=str(proof))])))
     assert not approved_review(path, "same-video", "new-candidates", 1)
+
+
+def test_review_evidence_digest_detects_replaced_screenshot(tmp_path):
+    from worker.hls_final_audit import approved_review
+    proof=tmp_path/'proof.png';proof.write_bytes(b'original')
+    path=tmp_path/'review.json'
+    path.write_text(json.dumps(dict(视频摘要='v',候选摘要='c',逐项复核=[dict(候选序号=0,结论='误报',证据文件=str(proof),证据摘要=hashlib.sha256(b'original').hexdigest())])))
+    assert approved_review(path,'v','c',1)
+    proof.write_bytes(b'changed')
+    assert not approved_review(path,'v','c',1)

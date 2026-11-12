@@ -26,6 +26,7 @@ def approved_review(path, video_digest, candidate_digest, count):
             p.get("结论") == "误报"
             and p.get("证据文件")
             and Path(p["证据文件"]).is_file()
+            and (not p.get("证据摘要") or sha256(Path(p["证据文件"])) == p["证据摘要"])
             for p in items
         )
     )
