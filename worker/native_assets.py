@@ -39,6 +39,16 @@ def prepare_assets(
                 raise PipelineError("OUTPUT_INVALID", "低频素材摘要不一致")
             supplied["sha256"]["low_band_template"] = supplied["low_band_sha256"]
             names += ("low_band_template",)
+        graphics = (
+            "color_seed_image",
+            "color_seed_mask",
+            "variant_seed_image",
+            "variant_seed_mask",
+        )
+        if any(supplied.get(name) for name in graphics):
+            if not all(supplied.get(name) for name in graphics):
+                raise PipelineError("OUTPUT_INVALID", "完整图形模板必须成组提供")
+            names += graphics
         # 所有复用项必须有内容校验，不能只验证清单中碰巧列出的文件。
         if any(name not in supplied.get("sha256", {}) for name in names):
             raise PipelineError("OUTPUT_INVALID", "自动素材清单缺少必要内容摘要")
@@ -49,6 +59,10 @@ def prepare_assets(
             palette="palette.npy",
             projection="projection.json",
             low_band_template="low-band.npz",
+            color_seed_image="color-seed-image.png",
+            color_seed_mask="color-seed-mask.png",
+            variant_seed_image="variant-seed-image.png",
+            variant_seed_mask="variant-seed-mask.png",
         )
         targets = {name: root / filenames[name] for name in names}
         if len(set(targets.values())) != len(names):
@@ -177,6 +191,39 @@ def brand_references(prior):
     return references
 
 
+def primary_covers(box, points):
+    from .short_brand import fraction_inside
+
+    return any(
+        fraction_inside(box, p["box"]) >= 0.85 and fraction_inside(p["box"], box) >= 0.5
+        for p in points
+    )
+
+
+def confirmed_template(image, box, assets, banks):
+    from .brand_templates import variants, match
+    from .short_brand import fraction_inside
+
+    if not banks:
+        for prefix, scales, threshold in (
+            ("color", [0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.75, 1], 0.55),
+            ("variant", [0.95, 1, 1.05], 0.5),
+        ):
+            key = prefix + "_seed_"
+            if assets.get(key + "image") and assets.get(key + "mask"):
+                bank = variants(
+                    cv2.imread(str(assets[key + "image"])),
+                    cv2.imread(str(assets[key + "mask"]), 0),
+                    scales,
+                )
+                banks.append((bank, threshold))
+    return any(
+        fraction_inside(box, point["box"]) >= 0.85
+        for bank, threshold in banks
+        for point in match(image, bank, threshold, 2)
+    )
+
+
 def prepare_graphics(work, detections, assets, fast, check=lambda: None):
     """完整保留候选；短时文字须经自动品牌文本确认，其他字幕不会加入掩膜。"""
     from .short_brand import discover, fraction_inside
@@ -212,6 +259,10 @@ def prepare_graphics(work, detections, assets, fast, check=lambda: None):
         )
     palette = np.load(assets["palette"])
     seeds = []
+    primary_points = {}
+    for point in detections["hints"]:
+        primary_points.setdefault(point["frame"], []).append(point)
+    covered_points = []
     # 每个镜头独立发现短时品牌；同一镜头的多个位置逐个去重发现。
     for start, end in detections["scenes"]:
         remaining = [
@@ -266,6 +317,15 @@ def prepare_graphics(work, detections, assets, fast, check=lambda: None):
                 )
                 if a <= x or b <= y:
                     continue
+                if primary_covers(point["box"], primary_points.get(row["frame"], [])):
+                    covered_points.append(
+                        dict(
+                            frame=row["frame"],
+                            box=point["box"],
+                            依据="同帧主轨迹双向覆盖；不重复初始化",
+                        )
+                    )
+                    continue
                 if np.count_nonzero(known[y:b, x:a]) > (a - x) * (b - y) * 0.85:
                     continue
                 if any(
@@ -300,6 +360,7 @@ def prepare_graphics(work, detections, assets, fast, check=lambda: None):
         cv2.imwrite(str(graphic / "masks" / file.name), np.zeros((h, w), np.uint8))
     records, text_review, accepted_intervals = [], [], []
     references = None
+    known_banks = []
     for identity, seed in enumerate(seeds):
         check()
         from .branding import recognize, readable_text, same_brand
@@ -310,10 +371,12 @@ def prepare_graphics(work, detections, assets, fast, check=lambda: None):
         crop = source[max(0, y) : min(h, b), max(0, x) : min(w, a)]
         if crop.size and not seed.get("automatic_short_brand"):
             text = recognize(cv2.resize(crop, None, fx=3, fy=3))
-            if readable_text(text):
+            if readable_text(text) or crop.shape[1] >= crop.shape[0] * 2:
                 if references is None:
                     references = brand_references(assets["prior"])
-                if not same_brand(text, references):
+                if not same_brand(text, references) and not confirmed_template(
+                    source, point["box"], assets, known_banks
+                ):
                     text_review.append(
                         dict(
                             frame=point["frame"],
@@ -351,6 +414,31 @@ def prepare_graphics(work, detections, assets, fast, check=lambda: None):
             ],
             check,
         )
+        from .workflow import bounded_mask, interpolated_box, abrupt_area
+
+        for start, end in seed["scenes"]:
+            previous_area = None
+            for index in range(start, end):
+                check()
+                file = tracker / "masks" / files[index].name
+                component = cv2.imread(str(file), 0)
+                image = cv2.imread(str(files[index]))
+                if (
+                    component is None
+                    or component.shape != (h, w)
+                    or not set(np.unique(component)) <= {0, 255}
+                ):
+                    raise PipelineError("MASK_INVALID", "图形分割输出无效")
+                component = bounded_mask(
+                    component, interpolated_box(hints, index), image
+                )
+                area = np.count_nonzero(component) / component.size
+                if area > 0.2 or abrupt_area(previous_area, area):
+                    raise PipelineError(
+                        "MASK_UNCERTAIN", "图形分割超过面积或漂移门槛", review=True
+                    )
+                previous_area = area
+                cv2.imwrite(str(file), component)
         point = max(hints, key=lambda p: p["confidence"])
         accepted_intervals.extend(seed["scenes"])
         mask = cv2.imread(str(tracker / "masks" / f"{point['frame']:06d}.png"), 0)
@@ -410,6 +498,9 @@ def prepare_graphics(work, detections, assets, fast, check=lambda: None):
             )
         cv2.imwrite(str(graphic / "masks" / f"{index:06d}.png"), mask)
     scenes = accepted_intervals
+    (graphic / "covered-observations.json").write_text(
+        json.dumps(covered_points, ensure_ascii=False, indent=2)
+    )
     (graphic / "text-review.json").write_text(
         json.dumps(text_review, ensure_ascii=False, indent=2)
     )

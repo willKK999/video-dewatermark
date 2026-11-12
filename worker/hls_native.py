@@ -113,6 +113,16 @@ def assets_from(root):
         assets["projection"] = root / "projection.json"
     if (root / "low-band.npz").is_file():
         assets["low_band_template"] = root / "low-band.npz"
+    for name in (
+        "color_seed_image",
+        "color_seed_mask",
+        "variant_seed_image",
+        "variant_seed_mask",
+    ):
+        prefix, _, kind = name.partition("_seed_")
+        file = root / f"{prefix}-seed-{kind}.png"
+        if file.is_file():
+            assets[name] = file
     return assets
 
 

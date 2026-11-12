@@ -1007,8 +1007,9 @@ def test_verified_profile_reuses_only_global_assets_and_rejects_changed_content(
 
 @pytest.mark.parametrize("fast", [False, True])
 @pytest.mark.parametrize("textlike", [False, True])
+@pytest.mark.parametrize("leak", [False, True])
 def test_graphic_matching_respects_lifetimes_and_reinitializes_new_shot(
-    tmp_path, monkeypatch, fast, textlike
+    tmp_path, monkeypatch, fast, textlike, leak
 ):
     from worker import native_assets, short_brand, brand_templates, branding
 
@@ -1047,7 +1048,10 @@ def test_graphic_matching_respects_lifetimes_and_reinitializes_new_shot(
             initializations.append(seed["scenes"])
             for start, end in seed["scenes"]:
                 for i in range(start, end):
-                    cv2.imwrite(str(root / "masks" / f"{i:06d}.png"), support)
+                    cv2.imwrite(
+                        str(root / "masks" / f"{i:06d}.png"),
+                        np.full(shape, 255, np.uint8) if leak else support,
+                    )
 
     seen = []
     monkeypatch.setenv("DETECT_PYTHON", "检测")
@@ -1083,6 +1087,48 @@ def test_graphic_matching_respects_lifetimes_and_reinitializes_new_shot(
     assert bool(cv2.imread(str(work / "graphic/masks/000000.png"), 0).any()) == (
         not fast and not textlike
     )
+    assert not cv2.imread(str(work / "graphic/masks/000002.png"), 0)[70, 110]
     assert len(json.loads((work / "graphic/text-review.json").read_text())) == (
         2 if textlike else 0
     )
+
+
+def test_primary_association_keeps_nested_new_icon_and_distant_copy():
+    from worker.native_assets import primary_covers
+
+    points = [dict(box=[10, 10, 110, 60])]
+    assert primary_covers([12, 11, 108, 59], points)
+    assert not primary_covers([30, 20, 45, 35], points)
+    assert not primary_covers([150, 10, 250, 60], points)
+
+
+def test_profile_graphics_survive_checkpoint_and_require_each_digest(tmp_path):
+    from worker.native_assets import prepare_assets
+    from worker.roi_inpaint import digest
+
+    names = (
+        "prior",
+        "alpha",
+        "template",
+        "palette",
+        "projection",
+        "color_seed_image",
+        "color_seed_mask",
+        "variant_seed_image",
+        "variant_seed_mask",
+    )
+    profile = dict(method="v7", source_sha256="冻结片源", sha256={})
+    for name in names:
+        path = tmp_path / (name + ".png" if "seed" in name else name + ".npz")
+        path.write_bytes(name.encode())
+        profile[name] = str(path)
+        profile["sha256"][name] = digest(path)
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps(profile))
+    root = tmp_path / "assets"
+    result = prepare_assets(None, root, "冻结片源", profile=manifest)
+    assert hls_native.assets_from(root) == result
+    profile["sha256"].pop("color_seed_mask")
+    manifest.write_text(json.dumps(profile))
+    with pytest.raises(PipelineError, match="内容摘要"):
+        prepare_assets(None, root, "冻结片源", profile=manifest)
