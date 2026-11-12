@@ -891,9 +891,10 @@ def test_raw_residual_keeps_subtitles_and_uses_existing_hls_threshold(
     report = native_assets.residual_candidates(
         audit, tmp_path, dict(prior=tmp_path / "prior.npz")
     )
-    assert len(report["残留候选"]) == 2
+    assert len(report["残留候选"]) == 1
+    assert report["原始候选总数"] == 3 and report["需要复核"]
     assert (
-        len(report["文字复核依据"]) == 1
+        len(report["文字复核依据"]) == 2
         and "字幕" in report["文字复核依据"][0]["basis"]
     )
     assert json.loads((audit / "raw-residual-candidates.json").read_text()) == raw
@@ -1005,10 +1006,11 @@ def test_verified_profile_reuses_only_global_assets_and_rejects_changed_content(
 
 
 @pytest.mark.parametrize("fast", [False, True])
+@pytest.mark.parametrize("textlike", [False, True])
 def test_graphic_matching_respects_lifetimes_and_reinitializes_new_shot(
-    tmp_path, monkeypatch, fast
+    tmp_path, monkeypatch, fast, textlike
 ):
-    from worker import native_assets, short_brand, brand_templates
+    from worker import native_assets, short_brand, brand_templates, branding
 
     work = tmp_path / "work"
     for name in ["frames", "tracking/masks"]:
@@ -1051,6 +1053,12 @@ def test_graphic_matching_respects_lifetimes_and_reinitializes_new_shot(
     monkeypatch.setenv("DETECT_PYTHON", "检测")
     monkeypatch.setenv("TRACK_PYTHON", "分割")
     monkeypatch.setenv("YOLO_WEIGHTS", "模型")
+    monkeypatch.setattr(
+        branding, "recognize", lambda *a, **kw: "ordinary subtitle" if textlike else ""
+    )
+    monkeypatch.setattr(
+        native_assets, "brand_references", lambda *a: ["examplebrand.com"]
+    )
     monkeypatch.setattr(native_assets, "run", run)
     monkeypatch.setattr(short_brand, "discover", lambda *a, **kw: None)
     monkeypatch.setattr(brand_templates, "variants", lambda *a: [])
@@ -1067,7 +1075,14 @@ def test_graphic_matching_respects_lifetimes_and_reinitializes_new_shot(
         dict(palette=palette, prior=tmp_path / "prior"),
         fast,
     )
-    assert initializations == [[[1, 4]], [[5, 8]]]
-    assert sorted(seen) == ([1, 2, 3, 5, 6, 7] if fast else sorted(list(range(8)) * 2))
+    assert initializations == ([] if textlike else [[[1, 4]], [[5, 8]]])
+    assert sorted(seen) == (
+        [] if textlike else ([1, 2, 3, 5, 6, 7] if fast else sorted(list(range(8)) * 2))
+    )
     assert json.loads((work / "graphic/raw-candidates.json").read_text()) == rows
-    assert bool(cv2.imread(str(work / "graphic/masks/000000.png"), 0).any()) != fast
+    assert bool(cv2.imread(str(work / "graphic/masks/000000.png"), 0).any()) == (
+        not fast and not textlike
+    )
+    assert len(json.loads((work / "graphic/text-review.json").read_text())) == (
+        2 if textlike else 0
+    )

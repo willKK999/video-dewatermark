@@ -393,16 +393,20 @@ def audit_chunk(source, result, work, plan, assets, check=lambda: None, enforce=
                 str(work / "graphic/masks" / f"{model_index:06d}.png"), 0
             )
             if graphic_mask is not None and graphic_mask.any():
-                from .branding import palette_support
                 from .multitrack import component_scores
 
                 palette = np.load(assets["palette"])
                 source_small = model_source(model_index)
-                foreground = (
-                    graphic_mask & palette_support(source_small, palette)
-                    if len(palette)
-                    else graphic_mask
-                )
+                from .brand_foreground import foreground as source_foreground
+
+                try:
+                    foreground, _ = source_foreground(
+                        source_small, graphic_mask, palette
+                    )
+                except PipelineError as error:
+                    if error.code != "MASK_UNCERTAIN":
+                        raise
+                    foreground = np.zeros_like(graphic_mask)
                 scores = component_scores(highpass(source_small), feature, foreground)
                 bad = [p for p in scores if is_residual_score(p)]
                 if bad or not scores:
@@ -522,13 +526,21 @@ def audit_chunk(source, result, work, plan, assets, check=lambda: None, enforce=
     summary["完整图形低频复检"] = low
     low_bad = low and low["残留区域数"] > 0
     summary["硬门槛通过"] = not (
-        residual_error or raw["残留候选"] or evidence or low_bad
+        residual_error
+        or raw["残留候选"]
+        or raw.get("需要复核", False)
+        or evidence
+        or low_bad
     )
     (audit / "native-quality.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2)
     )
     if enforce and residual_error:
         raise residual_error
+    if enforce and raw.get("需要复核"):
+        raise PipelineError(
+            "RESIDUAL_UNCERTAIN", "原始图标类文字候选须做字幕复核", review=True
+        )
     if enforce and raw["残留候选"]:
         raise PipelineError(
             "RESIDUAL_UNCERTAIN", "全画面模型复检存在原始残留候选", review=True

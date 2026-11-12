@@ -6,7 +6,7 @@ import shutil
 from pathlib import Path
 import cv2
 import numpy as np
-from .branding import learn_palette, palette_support
+from .branding import learn_palette
 from .matte import fit_overlay
 from .multitrack import load_prior
 from .process import PipelineError, run
@@ -165,6 +165,18 @@ def prepare_assets(
     )
 
 
+def brand_references(prior):
+    from .branding import recognize
+
+    median, _, regions, _, _ = load_prior(prior)
+    references = []
+    for region in regions:
+        x, y, a, b = region["box"]
+        patch = np.clip(median[y:b, x:a] * 12 + 128, 0, 255).astype(np.uint8)
+        references.append(recognize(cv2.resize(patch, None, fx=3, fy=3), 11))
+    return references
+
+
 def prepare_graphics(work, detections, assets, fast, check=lambda: None):
     """完整保留候选；短时文字须经自动品牌文本确认，其他字幕不会加入掩膜。"""
     from .short_brand import discover, fraction_inside
@@ -286,9 +298,30 @@ def prepare_graphics(work, detections, assets, fast, check=lambda: None):
     h, w = cv2.imread(str(files[0])).shape[:2]
     for file in files:
         cv2.imwrite(str(graphic / "masks" / file.name), np.zeros((h, w), np.uint8))
-    records = []
+    records, text_review, accepted_intervals = [], [], []
+    references = None
     for identity, seed in enumerate(seeds):
         check()
+        from .branding import recognize, readable_text, same_brand
+
+        point = max(seed["hints"], key=lambda p: p["confidence"])
+        source = cv2.imread(str(files[point["frame"]]))
+        x, y, a, b = map(round, point["box"])
+        crop = source[max(0, y) : min(h, b), max(0, x) : min(w, a)]
+        if crop.size and not seed.get("automatic_short_brand"):
+            text = recognize(cv2.resize(crop, None, fx=3, fy=3))
+            if readable_text(text):
+                if references is None:
+                    references = brand_references(assets["prior"])
+                if not same_brand(text, references):
+                    text_review.append(
+                        dict(
+                            frame=point["frame"],
+                            box=point["box"],
+                            原因="图标类别包含未匹配品牌的文字，暂不修复，保留原始候选待字幕复核",
+                        )
+                    )
+                    continue
         tracker = graphic / f"track-{identity}"
         tracker.mkdir(exist_ok=True)
         (tracker / "frames").symlink_to(
@@ -319,15 +352,16 @@ def prepare_graphics(work, detections, assets, fast, check=lambda: None):
             check,
         )
         point = max(hints, key=lambda p: p["confidence"])
+        accepted_intervals.extend(seed["scenes"])
         mask = cv2.imread(str(tracker / "masks" / f"{point['frame']:06d}.png"), 0)
         if mask is None or not mask.any():
             raise PipelineError(
                 "TRACKING_DRIFT", "完整品牌分割没有可靠前景", review=True
             )
         image = cv2.imread(str(files[point["frame"]]))
-        foreground = palette_support(image, palette) & mask if len(palette) else mask
-        if not foreground.any():
-            raise PipelineError("MASK_UNCERTAIN", "完整品牌的颜色前景不足", review=True)
+        from .brand_foreground import foreground as source_foreground
+
+        foreground, foreground_basis = source_foreground(image, mask, palette)
         seed_image = graphic / "seeds" / f"{identity}-image.png"
         seed_mask = graphic / "seeds" / f"{identity}-mask.png"
         cv2.imwrite(str(seed_image), image)
@@ -360,7 +394,14 @@ def prepare_graphics(work, detections, assets, fast, check=lambda: None):
         matches = list(
             bounded_map(render_match, enumerate(files), depth=workers, workers=workers)
         )
-        records.append(dict(id=identity, seed_frame=point["frame"], matches=matches))
+        records.append(
+            dict(
+                id=identity,
+                seed_frame=point["frame"],
+                matches=matches,
+                foreground_basis=foreground_basis,
+            )
+        )
     for index, file in enumerate(files):
         mask = cv2.imread(str(graphic / "masks" / file.name), 0)
         if np.count_nonzero(mask) > mask.size * 0.2:
@@ -368,7 +409,10 @@ def prepare_graphics(work, detections, assets, fast, check=lambda: None):
                 "MASK_UNCERTAIN", "品牌联合支持超过原有面积门槛", review=True
             )
         cv2.imwrite(str(graphic / "masks" / f"{index:06d}.png"), mask)
-    scenes = [s["scenes"][0] for s in seeds]
+    scenes = accepted_intervals
+    (graphic / "text-review.json").write_text(
+        json.dumps(text_review, ensure_ascii=False, indent=2)
+    )
     supplied = assets.get("graphic")
     if supplied:
         for index, file in enumerate(files):
@@ -434,12 +478,7 @@ def residual_candidates(audit, work, assets, check=lambda: None):
     rows = json.loads(target.read_text())
     if len(rows) != len(files) or [r["frame"] for r in rows] != list(range(len(files))):
         raise PipelineError("OUTPUT_INVALID", "编码后全画面复检候选帧数不符")
-    median, _, regions, _, _ = load_prior(assets["prior"])
-    references = []
-    for region in regions:
-        x, y, a, b = region["box"]
-        patch = np.clip(median[y:b, x:a] * 12 + 128, 0, 255).astype(np.uint8)
-        references.append(recognize(cv2.resize(patch, None, fx=3, fy=3), 11))
+    references = brand_references(assets["prior"])
     confirmed, review = [], []
     cache = {}
     import hashlib
@@ -448,44 +487,49 @@ def residual_candidates(audit, work, assets, check=lambda: None):
         check()
         image = None
         for candidate in row["boxes"]:
-            if candidate["class_id"] in (0, 1):
+            if image is None:
+                image = cv2.imread(str(files[row["frame"]]))
+            x, y, a, b = map(round, candidate["box"])
+            patch = image[
+                max(0, y) : min(image.shape[0], b),
+                max(0, x) : min(image.shape[1], a),
+            ]
+            if not patch.size:
+                raise PipelineError("OUTPUT_INVALID", "文字候选超出编码画面")
+            key = hashlib.sha256(patch.tobytes()).hexdigest()
+            if key not in cache:
+                if len(cache) >= 256:
+                    cache.pop(next(iter(cache)))
+                cache[key] = recognize(cv2.resize(patch, None, fx=3, fy=3))
+            from .branding import readable_text
+
+            if candidate["class_id"] in (0, 1) and not readable_text(cache[key]):
                 confirmed.append(
                     dict(
                         candidate,
                         frame=row["frame"],
-                        basis="专用模型图标候选，须与原始证据复核",
+                        basis="专用模型非文字图标候选，须与原始证据复核",
                     )
                 )
+                continue
+            is_brand = same_brand(cache[key], references)
+            if is_brand:
+                confirmed.append(
+                    dict(candidate, frame=row["frame"], basis="自动品牌文本一致")
+                )
             else:
-                if image is None:
-                    image = cv2.imread(str(files[row["frame"]]))
-                x, y, a, b = map(round, candidate["box"])
-                patch = image[
-                    max(0, y) : min(image.shape[0], b),
-                    max(0, x) : min(image.shape[1], a),
-                ]
-                if not patch.size:
-                    raise PipelineError("OUTPUT_INVALID", "文字候选超出编码画面")
-                key = hashlib.sha256(patch.tobytes()).hexdigest()
-                if key not in cache:
-                    if len(cache) >= 256:
-                        cache.pop(next(iter(cache)))
-                    cache[key] = recognize(cv2.resize(patch, None, fx=3, fy=3))
-                is_brand = same_brand(cache[key], references)
-                if is_brand:
-                    confirmed.append(
-                        dict(candidate, frame=row["frame"], basis="自动品牌文本一致")
+                review.append(
+                    dict(
+                        candidate,
+                        frame=row["frame"],
+                        basis="文字不匹配已知品牌，不能把字幕直接计作水印",
+                        original_logo_class=candidate["class_id"] in (0, 1),
                     )
-                else:
-                    review.append(
-                        dict(
-                            candidate,
-                            frame=row["frame"],
-                            basis="文字不匹配已知品牌，不能把字幕直接计作水印",
-                        )
-                    )
+                )
     result = dict(
         原始候选文件=target.name,
+        原始候选总数=sum(len(row["boxes"]) for row in rows),
+        需要复核=any(p.get("original_logo_class") for p in review),
         全帧数=len(files),
         检测置信度=threshold,
         残留候选=confirmed,

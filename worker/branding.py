@@ -9,6 +9,11 @@ def text_signature(value):
     return re.sub("[^a-z0-9]", "", value.lower())
 
 
+def readable_text(value):
+    """图标类别也可能误报文字，不能据类别编号直接删去字幕。"""
+    return bool(re.search(r"[A-Za-z]{3,}|[\u3400-\u9fff]{2,}", value))
+
+
 def same_brand(value, references):
     queries = [
         text_signature(v) for v in re.findall(r"[A-Za-z0-9][A-Za-z0-9.\-]{7,}", value)
