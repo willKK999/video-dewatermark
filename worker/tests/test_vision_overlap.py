@@ -275,3 +275,56 @@ def test_conditioned_overlap_uses_real_clean_frames_and_keeps_disagreement_gate(
 
         metrics = json.loads((tmp_path / "performance.json").read_text())
         assert metrics["overlap_samples"] == 8 and metrics["overlap_max_mae"] == 0
+
+
+def test_numpy_scalar_counts_keep_inpaint_metrics_serializable_without_changing_pixels(
+    tmp_path, monkeypatch
+):
+    """数组库新版返回数值标量时，原自动窗口分支仍须正常写出指标。"""
+    import json
+    import sys
+    from pathlib import Path
+    from worker import vision
+
+    for name in ("frames", "masks"):
+        (tmp_path / name).mkdir()
+    image = np.full((20, 30, 3), 100, np.uint8)
+    mask = np.zeros((20, 30), np.uint8)
+    mask[4:12, 5:15] = 255
+    files = []
+    for i in range(2):
+        p = tmp_path / "frames" / f"{i:06d}.png"
+        cv2.imwrite(str(p), image)
+        cv2.imwrite(str(tmp_path / "masks" / p.name), mask)
+        files.append(p)
+    count = np.count_nonzero
+    monkeypatch.setattr(
+        vision.np, "count_nonzero", lambda *a, **kw: np.int64(count(*a, **kw))
+    )
+    monkeypatch.setenv("INPAINT_PYTHON", sys.executable)
+    monkeypatch.setenv("PROPAINTER_ROOT", str(tmp_path))
+    monkeypatch.setenv("PROPAINTER_ROI", "false")
+    monkeypatch.setattr(
+        vision,
+        "CleanReferences",
+        lambda *a: SimpleNamespace(
+            restore=lambda image, mask, repair: repair, stats={}, timings={}
+        ),
+    )
+
+    def model(args, check, cwd):
+        frames = Path(args[args.index("--video") + 1])
+        dest = Path(args[args.index("--output") + 1]) / "frames/frames"
+        dest.mkdir(parents=True)
+        for file in frames.glob("*.png"):
+            cv2.imwrite(str(dest / file.name), cv2.imread(str(file)))
+
+    monkeypatch.setattr(vision, "run", model)
+    vision.inpaint(tmp_path, files, [(0, 2)], "propainter", False)
+    metrics = json.loads((tmp_path / "performance.json").read_text())
+    assert metrics["low_memory"] is True
+    assert metrics["mask_fraction"] == pytest.approx(80 / 600)
+    assert all(
+        np.array_equal(cv2.imread(str(tmp_path / "composite" / f.name)), image)
+        for f in files
+    )

@@ -264,7 +264,6 @@ def masks(root, files, detections, engine, check=lambda: None, speedup=None):
                 str(Path(__file__).with_name("sam_stage.py")),
                 "--root",
                 root,
-
             ],
             check,
         )
@@ -525,9 +524,11 @@ def inpaint(
             0, len(processed_indices) - 1, min(8, len(processed_indices)), dtype=int
         )
     ]
-    mask_fraction = max(np.count_nonzero(mask) / mask.size for mask in sampled_masks)
+    mask_fraction = float(
+        max(np.count_nonzero(mask) / mask.size for mask in sampled_masks)
+    )
     # 多目标联合掩膜增加稀疏注意力的活动区域，自动缩短窗口而不降分辨率。
-    low_memory = low_memory or mask_fraction > 0.05
+    low_memory = bool(low_memory or mask_fraction > 0.05)
     from .hls_settings import HLSSettings
 
     settings = HLSSettings.from_env()
