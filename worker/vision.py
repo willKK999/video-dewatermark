@@ -113,7 +113,14 @@ def detect(files, scenes, options, root, check=lambda: None, dense=False):
     if options.get("multitrack_prior"):
         from .multitrack import make_tracks
 
-        return make_tracks(files, scenes, options["multitrack_prior"], root, check)
+        return make_tracks(
+            files,
+            scenes,
+            options["multitrack_prior"],
+            root,
+            check,
+            workers=options.get("detection_workers", 1),
+        )
     hints = {
         int(p["frame"]): dict(frame=int(p["frame"]), box=p["box"], confidence=1.0)
         for p in options.get("prompts", [])
@@ -287,6 +294,25 @@ def masks(root, files, detections, engine, check=lambda: None, speedup=None):
     return validate_masks(root, files, detections, check)
 
 
+def nearest_hints(hints, start, end):
+    """保持原提示顺序的距离平局规则，避免每帧扫描整个镜头的全部目标。"""
+    from bisect import bisect_left
+
+    first = {}
+    for rank, point in enumerate(hints):
+        first.setdefault(point["frame"], (rank, point))
+    frames = sorted(first)
+    if not frames:
+        raise PipelineError("DETECTION_UNCERTAIN", "镜头没有可靠提示", review=True)
+    result = {}
+    for index in range(start, end):
+        offset = bisect_left(frames, index)
+        choices = frames[max(0, offset - 1) : min(len(frames), offset + 1)]
+        frame = min(choices, key=lambda frame: (abs(frame - index), first[frame][0]))
+        result[index] = first[frame][1]
+    return result
+
+
 def validate_masks(root, files, detections, check=lambda: None):
     """对已完成的 SAM 输出执行同一套完整覆盖及面积校验，供失败阶段续跑。"""
     dest = root / "masks"
@@ -299,17 +325,23 @@ def validate_masks(root, files, detections, check=lambda: None):
         prior = load_prior(detections["prior"])
     manifest = []
     old_area = None
+    scene_tables = []
+    for start, end in detections["scenes"]:
+        points = [p for p in detections["hints"] if start <= p["frame"] < end]
+        scene_tables.append((points, nearest_hints(points, start, end)))
+    first_hints = {}
+    for point in detections["hints"]:
+        first_hints.setdefault(point["frame"], point)
     for i, f in enumerate(files):
         check()
         mask = read(dest / f.name, True)
         image = read(f)
         if mask.shape != image.shape[:2] or not set(np.unique(mask)) <= {0, 255}:
             raise PipelineError("MASK_INVALID", "mask geometry or values differ")
-        scene_hints = [
-            p
-            for p in detections["hints"]
-            if any(s <= i < e and s <= p["frame"] < e for s, e in detections["scenes"])
-        ]
+        scene_id = next(
+            k for k, (start, end) in enumerate(detections["scenes"]) if start <= i < end
+        )
+        scene_hints, nearest_by_frame = scene_tables[scene_id]
         if detections.get("multitrack"):
             from .multitrack import prior_masks_loaded, merge_masks
 
@@ -348,7 +380,7 @@ def validate_masks(root, files, detections, check=lambda: None):
             if len(xx)
             else None
         )
-        key_hint = next((p for p in detections["hints"] if p["frame"] == i), None)
+        key_hint = first_hints.get(i)
         if key_hint and bbox and not detections.get("multitrack"):
             a, b = bbox, key_hint["box"]
             intersection = max(0, min(a[2], b[2]) - max(a[0], b[0])) * max(
@@ -365,11 +397,7 @@ def validate_masks(root, files, detections, check=lambda: None):
                     "mask differs from reliable detection",
                     review=True,
                 )
-        scene = next((s, e) for s, e in detections["scenes"] if s <= i < e)
-        nearest = min(
-            (p for p in detections["hints"] if scene[0] <= p["frame"] < scene[1]),
-            key=lambda p: abs(p["frame"] - i),
-        )
+        nearest = nearest_by_frame[i]
         manifest.append(
             dict(
                 frame_index=i,

@@ -84,19 +84,11 @@ def process_chunk(
 
     work.mkdir(parents=True, exist_ok=True)
     cache = StageCache(work / "stages")
-    code = [
-        digest(Path(__file__).with_name(n))
-        for n in (
-            "native_chunk.py",
-            "native_assets.py",
-            "vision.py",
-            "sam_stage.py",
-            "sam_schedule.py",
-            "roi.py",
-            "roi_inpaint.py",
-            "torch_composite.py",
-            "matte.py",
-            "texture_refs.py",
+    code = [digest(p) for p in sorted(Path(__file__).parent.glob("*.py"))]
+    code += [
+        digest(p)
+        for p in sorted(
+            Path(__file__).parent.parent.joinpath("scripts").glob("hls_*.py")
         )
     ]
     settings = {
@@ -163,7 +155,11 @@ def process_chunk(
         lambda: vision.detect(
             files,
             vision.shots(files, check),
-            dict(hls=True, multitrack_prior=str(assets["prior"])),
+            dict(
+                hls=True,
+                multitrack_prior=str(assets["prior"]),
+                detection_workers=4 if config["fast"] else 1,
+            ),
             work,
             check,
         ),
@@ -304,13 +300,15 @@ def process_chunk(
     return summary
 
 
-def audit_chunk(source, result, work, plan, assets, check=lambda: None):
+def audit_chunk(source, result, work, plan, assets, check=lambda: None, enforce=True):
     """在最终编码后的核心帧上重做残留、品牌部件和全部相邻帧清晰度核验。"""
     from functools import lru_cache
     from scripts.hls_native_verify import remap_references
     from scripts.hls_brand_verify import clipped_scores
     from .brand_templates import variants
     from .multitrack import highpass
+    from .hls_settings import is_residual_score
+    from scripts.hls_detail_verify import occluder_mask
     from .matte import temporal_detail, stable_detail_mask
 
     native = json.loads((work / "rendered/native-report.json").read_text())
@@ -368,12 +366,7 @@ def audit_chunk(source, result, work, plan, assets, check=lambda: None):
                     scores = clipped_scores(
                         feature, variant["template"], variant["mask"], point["box"]
                     )
-                    bad = [
-                        p
-                        for p in scores
-                        if abs(p["correlation"]) >= 0.55
-                        and abs(p["relative_amplitude"]) >= 0.15
-                    ]
+                    bad = [p for p in scores if is_residual_score(p)]
                     if bad:
                         evidence.append(
                             dict(
@@ -398,12 +391,7 @@ def audit_chunk(source, result, work, plan, assets, check=lambda: None):
                     else graphic_mask
                 )
                 scores = component_scores(highpass(source_small), feature, foreground)
-                bad = [
-                    p
-                    for p in scores
-                    if abs(p["correlation"]) >= 0.55
-                    and abs(p["relative_amplitude"]) >= 0.15
-                ]
+                bad = [p for p in scores if is_residual_score(p)]
                 if bad or not scores:
                     evidence.append(
                         dict(
@@ -414,8 +402,9 @@ def audit_chunk(source, result, work, plan, assets, check=lambda: None):
                             support_insufficient=not scores,
                         )
                     )
-            faint, other = {}, np.zeros(original.shape[:2], np.uint8)
-            occupied = np.zeros_like(other)
+            faint = {}
+            other = occluder_mask([work / "graphic"], model_index, original.shape[:2])
+            occupied = other.copy()
             for part in supports.at(model_index, model_source(model_index)):
                 mask = cv2.resize(
                     part["mask"],
@@ -481,10 +470,15 @@ def audit_chunk(source, result, work, plan, assets, check=lambda: None):
     (audit / "native-quality.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2)
     )
+    residual_error = None
     try:
         vision.residual_quality(
             audit, sorted((audit / "composite").glob("*.png")), refs, check
         )
+    except PipelineError as error:
+        if error.code != "RESIDUAL_UNCERTAIN":
+            raise
+        residual_error = error
     finally:
         if (audit / "quality.json").exists():
             summary["原始残留检查"] = json.loads((audit / "quality.json").read_text())
@@ -498,11 +492,39 @@ def audit_chunk(source, result, work, plan, assets, check=lambda: None):
     (audit / "native-quality.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2)
     )
-    if raw["残留候选"]:
+    low = None
+    if assets.get("low_band_template"):
+        from .hls_graphic_repair import verify_low
+        from .multitrack import load_prior
+
+        # 成品核验独立运行，沿用主流程的低频填色复检，不能只检查高频笔画。
+        low = verify_low(
+            result,
+            np.load(assets["low_band_template"])["template"],
+            load_prior(assets["prior"])[2],
+            start_frame=plan["start"],
+            frame_count=len(mapping),
+            check=check,
+        )
+    summary["完整图形低频复检"] = low
+    low_bad = low and low["残留区域数"] > 0
+    summary["硬门槛通过"] = not (
+        residual_error or raw["残留候选"] or evidence or low_bad
+    )
+    (audit / "native-quality.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2)
+    )
+    if enforce and residual_error:
+        raise residual_error
+    if enforce and raw["残留候选"]:
         raise PipelineError(
             "RESIDUAL_UNCERTAIN", "全画面模型复检存在原始残留候选", review=True
         )
-    if evidence:
+    if enforce and low_bad:
+        raise PipelineError(
+            "RESIDUAL_UNCERTAIN", "完整图形低频复检存在残留候选", review=True
+        )
+    if enforce and evidence:
         raise PipelineError(
             "RESIDUAL_UNCERTAIN", "完整品牌部件复检存在残留候选", review=True
         )

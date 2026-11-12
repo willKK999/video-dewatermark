@@ -5,6 +5,7 @@ import cv2
 import numpy as np
 from worker.fine_masks import Supports
 from worker.matte import temporal_detail, stable_detail_mask
+from scripts.hls_detail_verify import occluder_mask
 
 
 def relative_clarity(args, output):
@@ -41,8 +42,10 @@ def relative_clarity(args, output):
             x, baseline, candidate = frames
             h, w = x.shape[:2]
             faint = {}
-            other = np.zeros((h, w), np.uint8)
-            occupied = np.zeros_like(other)
+            other = occluder_mask(
+                [args.graphic] if args.graphic else [], mapping[indices[2]], (h, w)
+            )
+            occupied = other.copy()
             for part in supports.at(mapping[indices[2]], cv2.resize(x, (mw, mh))):
                 mask = cv2.resize(part["mask"], (w, h), interpolation=cv2.INTER_NEAREST)
                 occupied |= mask

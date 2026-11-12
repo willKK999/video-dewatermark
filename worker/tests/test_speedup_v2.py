@@ -512,3 +512,39 @@ def test_checkpoint_hash_never_reads_a_key_or_runtime_configuration(tmp_path):
     for name in ("key.bin", "runtime.env"):
         with pytest.raises(ValueError, match="禁止读取"):
             digest(tmp_path / name)
+
+
+def test_parallel_prefetch_preserves_order_and_bound():
+    from threading import Lock
+    from time import sleep
+
+    lock = Lock()
+    active = peak = 0
+
+    def prepare(n):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        sleep(0.004 * (4 - n % 4))
+        with lock:
+            active -= 1
+        return n
+
+    assert list(bounded_map(prepare, range(12), depth=4, workers=4)) == list(range(12))
+    assert 1 < peak <= 4
+    with pytest.raises(ValueError, match="线程数"):
+        list(bounded_map(prepare, [], depth=2, workers=3))
+
+
+def test_indexed_nearest_hint_keeps_unsorted_ties_and_first_duplicate():
+    from worker.vision import nearest_hints
+
+    hints = [
+        dict(frame=8, confidence=0.8),
+        dict(frame=2, confidence=0.2),
+        dict(frame=8, confidence=0.9),
+    ]
+    indexed = nearest_hints(hints, 0, 11)
+    for i in range(11):
+        assert indexed[i] is min(hints, key=lambda p: abs(p["frame"] - i))

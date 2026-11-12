@@ -82,7 +82,8 @@ def test_prior_roundtrip_and_invalid_geometry(tmp_path):
     assert loaded[4]["sample_count"] == 25
 
 
-def test_multiple_moving_copies_have_independent_tracks(tmp_path, monkeypatch):
+@pytest.mark.parametrize("workers", [1, 4])
+def test_multiple_moving_copies_have_independent_tracks(tmp_path, monkeypatch, workers):
     from worker import multitrack
 
     image = np.zeros((80, 120, 3), np.uint8)
@@ -97,7 +98,12 @@ def test_multiple_moving_copies_have_independent_tracks(tmp_path, monkeypatch):
     regions = [dict(id=1, box=[0, 0, 10, 10], confidence=0.8, mask=signal)]
     prior = tmp_path / "prior.npz"
     multitrack.save_prior(
-        prior, median, signal, regions, [dict(region=1, flip=False, scale=1.0)], {}
+        prior,
+        median,
+        signal,
+        regions,
+        [dict(region=1, flip=False, scale=1.0), dict(region=1, flip=True, scale=1.0)],
+        {},
     )
     monkeypatch.setattr(
         multitrack,
@@ -107,11 +113,14 @@ def test_multiple_moving_copies_have_independent_tracks(tmp_path, monkeypatch):
             dict(box=[80, 45, 90, 55], confidence=0.85),
         ],
     )
-    result = multitrack.make_tracks(files, [[0, 4]], prior, tmp_path)
-    assert len(result["tracks"]) == 3
+    reads = []
+    monkeypatch.setattr(multitrack, "highpass", lambda image: reads.append(1) or median)
+    result = multitrack.make_tracks(files, [[0, 4]], prior, tmp_path, workers=workers)
+    assert len(reads) == 4
+    assert len(result["tracks"]) == 5
     assert all(len(t["hints"]) == 4 for t in result["tracks"])
     parts = multitrack.prior_masks(result, 2, (80, 120))
-    assert set(parts) == {1, 2, 3}
+    assert set(parts) == {1, 2, 3, 4, 5}
     assert merge_masks(parts.values(), (80, 120))[48, 85] == 255
 
 

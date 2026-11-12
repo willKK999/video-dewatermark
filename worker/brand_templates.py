@@ -28,6 +28,7 @@ def variants(image, mask, scales):
 
 def match(image, bank, threshold=0.5, limit=8, allow_partial=False):
     feature = highpass(image)
+    source_feature = feature
     pad_x = max(v["template"].shape[1] for v in bank) if allow_partial else 0
     pad_y = max(v["template"].shape[0] for v in bank) if allow_partial else 0
     if allow_partial:
@@ -76,7 +77,7 @@ def match(image, bank, threshold=0.5, limit=8, allow_partial=False):
             h, w = t.shape
             box = [x - pad_x, y - pad_y, x + w - pad_x, y + h - pad_y]
             # 用双精度直接复核峰值；掩膜相关在近常量画面上可能出现有限但大于1的伪峰。
-            reliable = verified_score(image, v, box)
+            reliable = verified_score(image, v, box, source_feature)
             if reliable >= threshold:
                 found.append(dict(variant=identity, confidence=reliable, box=box))
                 accepted += 1
@@ -120,7 +121,7 @@ def mask_for(shape, bank, matches):
     return result
 
 
-def verified_score(image, variant, box):
+def verified_score(image, variant, box, feature=None):
     x, y, a, b = box
     left, top, right, bottom = (
         max(0, x),
@@ -139,7 +140,9 @@ def verified_score(image, variant, box):
     if np.count_nonzero(active) < 64:
         return -1.0
     t = template[top - y : bottom - y, left - x : right - x][active].astype(np.float64)
-    z = highpass(image)[top:bottom, left:right][active].astype(np.float64)
+    if feature is None:
+        feature = highpass(image)
+    z = feature[top:bottom, left:right][active].astype(np.float64)
     if np.sqrt(np.mean(z * z)) < 0.01:
         return -1.0
     return float(np.dot(t, z) / max(1e-12, np.linalg.norm(t) * np.linalg.norm(z)))

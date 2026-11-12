@@ -245,8 +245,9 @@ def test_odd_native_boundaries_decode_with_local_sampling_phase(tmp_path):
 
 
 @pytest.mark.parametrize("residual", [0, 1])
+@pytest.mark.parametrize("enforce", [False, True])
 def test_encoded_audit_keeps_raw_evidence_and_does_not_gate_clarity(
-    tmp_path, monkeypatch, residual
+    tmp_path, monkeypatch, residual, enforce
 ):
     from worker.tests.test_speedup_bench import make_video
 
@@ -315,7 +316,7 @@ def test_encoded_audit_keeps_raw_evidence_and_does_not_gate_clarity(
     )
     monkeypatch.setattr(native_chunk.vision, "residual_quality", quality)
     plan = dict(left=0, right=12, start=0, end=12)
-    if residual:
+    if residual and enforce:
         with pytest.raises(PipelineError, match="阻止交付"):
             native_chunk.audit_chunk(
                 source,
@@ -326,9 +327,15 @@ def test_encoded_audit_keeps_raw_evidence_and_does_not_gate_clarity(
             )
     else:
         saved = native_chunk.audit_chunk(
-            source, source, work, plan, dict(prior=tmp_path / "prior.npz", alpha=alpha)
+            source,
+            source,
+            work,
+            plan,
+            dict(prior=tmp_path / "prior.npz", alpha=alpha),
+            enforce=enforce,
         )
         assert saved["通过"] is None and len(saved["低于零点七的样本"]) == 11
+        assert saved["硬门槛通过"] == (residual == 0)
     saved = json.loads((work / "audit/native-quality.json").read_text())
     assert saved["原始残留检查"]["residual_count"] == residual
 
@@ -957,3 +964,28 @@ def test_native_export_rejects_report_path_escape(tmp_path):
     with pytest.raises(PipelineError, match="路径无效"):
         export_native_artifacts(store, "bucket", "p", tmp_path)
     assert not (tmp_path.parent / "outside.mp4").exists()
+
+
+def test_verified_profile_reuses_only_global_assets_and_rejects_changed_content(
+    tmp_path,
+):
+    from worker.native_assets import prepare_assets
+    from worker.roi_inpaint import digest
+
+    profile = dict(method="v7", source_sha256="冻结原片", sha256={})
+    for name in ("prior", "alpha", "template", "palette", "projection"):
+        path = tmp_path / (name + ".npz")
+        path.write_bytes(name.encode())
+        profile[name] = str(path)
+        profile["sha256"][name] = digest(path)
+    manifest = tmp_path / "assets.json"
+    manifest.write_text(json.dumps(profile))
+    assets = prepare_assets(None, tmp_path / "copied", "冻结原片", profile=manifest)
+    assert set(assets) == {"prior", "alpha", "template", "palette", "projection"}
+    assert all(p.parent == tmp_path / "copied" for p in assets.values())
+    assert hls_native.assets_from(tmp_path / "copied") == assets
+    with pytest.raises(PipelineError, match="不一致"):
+        prepare_assets(None, tmp_path / "bad", "不同原片", profile=manifest)
+    Path(profile["alpha"]).write_bytes(b"changed")
+    with pytest.raises(PipelineError, match="摘要"):
+        prepare_assets(None, tmp_path / "copied", "冻结原片", profile=manifest)

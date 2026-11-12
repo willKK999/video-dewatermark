@@ -4,11 +4,13 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
 
-def bounded_map(function, iterable, depth=2):
+def bounded_map(function, iterable, depth=2, workers=1):
+    if not 1 <= workers <= depth:
+        raise ValueError("准备线程数须为一至队列深度")
     if not 1 <= depth <= 8:
         raise ValueError("预取队列深度必须为一至八")
     iterator = iter(iterable)
-    with ThreadPoolExecutor(max_workers=1) as executor:
+    with ThreadPoolExecutor(max_workers=workers) as executor:
         queue = deque()
         for _ in range(depth):
             try:

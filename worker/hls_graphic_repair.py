@@ -21,13 +21,21 @@ def residual_support(prior, signal, region):
     )
 
 
-def verify_low(result, template, regions):
+def verify_low(
+    result, template, regions, start_frame=0, frame_count=None, check=lambda: None
+):
     cap = cv2.VideoCapture(str(result))
     fps = cap.get(5)
-    count = round(cap.get(7))
+    total = round(cap.get(7))
+    count = total - start_frame if frame_count is None else frame_count
+    if start_frame < 0 or count < 1 or start_frame + count > total:
+        cap.release()
+        raise PipelineError("OUTPUT_INVALID", "低频复检核心帧范围无效")
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
     samples = []
     try:
         for n in range(count):
+            check()
             ok, image = cap.read()
             if not ok:
                 raise PipelineError("OUTPUT_INVALID", "低频复检帧不足")
@@ -377,7 +385,11 @@ def patch(work, assets_path, low_template_path, complete_ink=False):
         修复后视频摘要=vision.sha256(patched),
         音频内容一致=True,
         掩膜外像素策略="复用v7成品；中间RGB无损编码，最终HLS统一编码",
-        高频策略=("真实笔画内使用补画结果" if complete_ink else "保留v7成品高频，只加减当前基底的标准差3低频差分"),
+        高频策略=(
+            "真实笔画内使用补画结果"
+            if complete_ink
+            else "保留v7成品高频，只加减当前基底的标准差3低频差分"
+        ),
     )
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2))
     patched.replace(final)

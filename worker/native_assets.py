@@ -13,7 +13,9 @@ from .process import PipelineError, run
 from .speedup_cache import StageCache, fingerprint
 
 
-def prepare_assets(source, root, source_hash, check=lambda: None, prior=None):
+def prepare_assets(
+    source, root, source_hash, check=lambda: None, prior=None, profile=None
+):
     """全片只准备一次原生模板和透明度类别，不进行透明反解。"""
     from .media import probe
     from .multitrack import prepare
@@ -22,6 +24,49 @@ def prepare_assets(source, root, source_hash, check=lambda: None, prior=None):
     root.mkdir(parents=True, exist_ok=True)
     cache = StageCache(root / "stages")
     from .roi_inpaint import digest
+
+    from .hls_settings import reusable_profile
+
+    explicit_profile = profile is not None
+    profile = profile or os.getenv("HLS_V7_ASSETS")
+    if profile and reusable_profile(profile, source_hash, 60):
+        from .hls_v7 import load_assets
+
+        supplied = load_assets(Path(profile), source_hash)
+        names = ("prior", "alpha", "template", "palette", "projection")
+        if supplied.get("low_band_template"):
+            if digest(supplied["low_band_template"]) != supplied.get("low_band_sha256"):
+                raise PipelineError("OUTPUT_INVALID", "低频素材摘要不一致")
+            supplied["sha256"]["low_band_template"] = supplied["low_band_sha256"]
+            names += ("low_band_template",)
+        # 所有复用项必须有内容校验，不能只验证清单中碰巧列出的文件。
+        if any(name not in supplied.get("sha256", {}) for name in names):
+            raise PipelineError("OUTPUT_INVALID", "自动素材清单缺少必要内容摘要")
+        filenames = dict(
+            prior="multitrack-prior.npz",
+            alpha="alpha.npz",
+            template="template.npz",
+            palette="palette.npy",
+            projection="projection.json",
+            low_band_template="low-band.npz",
+        )
+        targets = {name: root / filenames[name] for name in names}
+        if len(set(targets.values())) != len(names):
+            raise PipelineError("OUTPUT_INVALID", "自动素材文件名冲突")
+        identity = fingerprint(
+            [Path(profile), *[Path(supplied[n]) for n in names]], [source_hash]
+        )
+
+        def copy_profile():
+            for name in names:
+                shutil.copyfile(supplied[name], targets[name])
+
+        cache.run(
+            "import_profile", identity, copy_profile, lambda: list(targets.values())
+        )
+        return targets
+    if explicit_profile:
+        raise PipelineError("OUTPUT_INVALID", "指定的自动素材清单与冻结源片不一致")
 
     code = [
         digest(Path(__file__).with_name(n))
@@ -93,18 +138,30 @@ def prepare_assets(source, root, source_hash, check=lambda: None, prior=None):
             palette = np.empty((0, 3), np.float32)
         np.save(root / "palette.npy", palette)
         build(samples, root / "template.npz", 3)
+        from .low_frequency import band
+
+        np.savez_compressed(
+            root / "low-band.npz",
+            template=np.median(np.stack([band(image) for image in images]), axis=0),
+        )
 
     cache.run(
         "calibrate",
         fingerprint([], [key, cache.tokens["samples"]]),
         calibrate,
-        lambda: [root / "alpha.npz", root / "template.npz", root / "palette.npy"],
+        lambda: [
+            root / "alpha.npz",
+            root / "template.npz",
+            root / "palette.npy",
+            root / "low-band.npz",
+        ],
     )
     return dict(
         prior=target,
         alpha=root / "alpha.npz",
         template=root / "template.npz",
         palette=root / "palette.npy",
+        low_band_template=root / "low-band.npz",
     )
 
 
@@ -276,8 +333,10 @@ def prepare_graphics(work, detections, assets, fast, check=lambda: None):
         cv2.imwrite(str(seed_image), image)
         cv2.imwrite(str(seed_mask), foreground)
         bank = variants(image, foreground, [0.95, 1, 1.05])
-        matches = []
-        for index, file in enumerate(files):
+        from .speedup import bounded_map
+
+        def render_match(item):
+            index, file = item
             check()
             current = cv2.imread(str(file))
             points = match(current, bank, 0.5, 2, allow_partial=True)
@@ -291,7 +350,12 @@ def prepare_graphics(work, detections, assets, fast, check=lambda: None):
                 shape, np.ones((5, 5), np.uint8)
             )
             cv2.imwrite(str(target), union)
-            matches.append(points)
+            return points
+
+        workers = 4 if fast else 1
+        matches = list(
+            bounded_map(render_match, enumerate(files), depth=workers, workers=workers)
+        )
         records.append(dict(id=identity, seed_frame=point["frame"], matches=matches))
     for index, file in enumerate(files):
         mask = cv2.imread(str(graphic / "masks" / file.name), 0)

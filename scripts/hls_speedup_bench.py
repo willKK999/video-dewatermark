@@ -59,6 +59,7 @@ def compare(candidate, baseline, output, duration, crops=()):
         raise ValueError("七版与候选成品的分辨率不一致，禁止缩放掩盖差异")
     rate = float(Fraction(b["avg_frame_rate"]))
     values = {}
+    (output / "regions.json").write_text(json.dumps([None, *crops]))
     for index, crop in enumerate([None, *crops]):
         directory = output / str(index)
         directory.mkdir(exist_ok=True)
@@ -177,6 +178,62 @@ def comparisons(source, candidate, baseline, output, duration, times):
     )
 
 
+def worst_comparisons(source, baseline, candidate, metrics_root, output, limit=6):
+    """按逐帧区域相似度选取最差证据，选图坐标不参与修复。"""
+    output.mkdir(parents=True, exist_ok=True)
+    info = media.probe(baseline)
+    stream = next(s for s in info["streams"] if s["codec_type"] == "video")
+    fps = float(Fraction(stream["avg_frame_rate"]))
+    manifest = metrics_root / "regions.json"
+    regions = json.loads(manifest.read_text())
+    candidates = []
+    for index, region in enumerate(regions):
+        log = metrics_root / str(index) / "ssim.log"
+        for frame, score in re.findall(r"n:(\d+).*?All:([\d.eE+-]+)", log.read_text()):
+            candidates.append((float(score), int(frame) - 1, region))
+    selected = []
+    seen = set()
+    # 相邻帧往往是同一问题，按区域及半秒时间桶去重。
+    for score, frame, crop in sorted(candidates, key=lambda row: (row[0], row[1])):
+        key = (tuple(crop) if crop else None, int(frame / fps * 2))
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append((score, frame, crop))
+        if len(selected) >= limit:
+            break
+    captures = [cv2.VideoCapture(str(p)) for p in (source, baseline, candidate)]
+    records = []
+    try:
+        for n, (score, frame, crop) in enumerate(selected):
+            images = []
+            for cap in captures:
+                cap.set(cv2.CAP_PROP_POS_MSEC, frame / fps * 1000)
+                ok, image = cap.read()
+                if not ok:
+                    raise ValueError("最差样本截图解码失败")
+                if crop:
+                    x, y, w, h = crop
+                    image = image[y : y + h, x : x + w]
+                images.append(image)
+            path = output / f"worst-{n + 1:02d}.png"
+            if not cv2.imwrite(str(path), np.hstack(images)):
+                raise ValueError("最差样本截图写入失败")
+            records.append(
+                dict(秒数=frame / fps, 区域=crop, SSIM=score, 图片=str(path))
+            )
+    finally:
+        for cap in captures:
+            cap.release()
+    report = dict(
+        图片顺序="原片、七版、提速成品",
+        选取方法="逐帧SSIM升序，按区域及半秒时间桶去重",
+        样本=records,
+    )
+    (output / "worst.json").write_text(json.dumps(report, ensure_ascii=False, indent=2))
+    return report
+
+
 def automatic_crops(args):
     if not args.prior or not args.detected:
         return []
@@ -244,7 +301,11 @@ def prepare_run(args, phases):
     if config["fast"]:
         config["backend"] = args.backend
     assets = prepare_assets(
-        args.source, args.output / "native-assets", source_hash, prior=args.prior
+        args.source,
+        args.output / "native-assets",
+        source_hash,
+        prior=args.prior,
+        profile=getattr(args, "asset_manifest", None),
     )
     asset_times = args.output / "native-assets/stages/timings.json"
     if asset_times.exists():
@@ -341,9 +402,14 @@ def assess(args, phases):
         系统="视频去水印系统",
         基线分步耗时秒=BASELINE_SECONDS,
         基线总耗时秒=sum(BASELINE_SECONDS.values()),
+        整集首块基线秒=3219,
         分步计时=phases.timings,
         通过=None,
         目检="未进行",
+        公共素材复用=bool(getattr(args, "asset_manifest", None)),
+        冷启动范围="已有公共素材的分块修复"
+        if getattr(args, "asset_manifest", None)
+        else "含公共素材准备的分块修复",
         闪现闪烁="待结合原片镜头切换逐帧检查",
         接缝检查="单块内部窗口见补画指标；整集分片时间轴与接缝待整集基准",
         安全对象前缀=None,
@@ -423,9 +489,23 @@ def assess(args, phases):
             shared["work"],
             shared["plan"],
             shared["assets"],
+            enforce=False,
         )
         verification_times["残留品牌清晰度与闪烁指标"] = time.monotonic() - measured
+        report["自动残留硬门槛通过"] = quality["硬门槛通过"]
+        if not quality["硬门槛通过"]:
+            report["通过"] = False
         report["清晰度"] = clarity_summary(quality["清晰度统计"])
+        report["完整图形低频复检"] = quality.get("完整图形低频复检")
+        if shared["assets"].get("low_band_template"):
+            from worker.hls_graphic_repair import verify_low
+            from worker.multitrack import load_prior
+
+            report["七版完整图形低频复检"] = verify_low(
+                args.baseline,
+                np.load(shared["assets"]["low_band_template"])["template"],
+                load_prior(shared["assets"]["prior"])[2],
+            )
         report["原始残留检查"] = quality["原始残留检查"]
         report["原始品牌残留候选"] = quality["品牌残留候选"]
         report["全画面模型复检"] = quality.get("全画面模型复检")
@@ -495,6 +575,13 @@ def assess(args, phases):
             args.duration,
             args.times,
         )
+        report["最差样本"] = worst_comparisons(
+            args.source,
+            args.baseline,
+            args.candidate,
+            args.output / "metrics",
+            args.output / "comparisons/worst",
+        )
     else:
         report["对比产物"] = "未生成，使用并排输出参数生成"
     report["独立核验耗时秒"] = time.monotonic() - verification_started
@@ -522,6 +609,11 @@ def parser():
         type=Path,
         default=Path("/workspace/dewatermark-data/hls-huangguo/source.mp4"),
         help="已解密的原片",
+    )
+    p.add_argument(
+        "--asset-manifest",
+        type=Path,
+        help="已接受的自动素材清单，须与源片及逐文件摘要一致；不复用分块处理结果",
     )
     p.add_argument("--baseline", type=Path, default=BASELINE, help="已接受的七版成品")
     p.add_argument(
@@ -654,12 +746,19 @@ def main():
         report = assess(args, phases)
     except Exception as error:
         # 不输出异常正文，避免第三方日志包含环境、签名地址或输入内容。
+        import traceback
+
         report = getattr(args, "_partial_report", {})
         report.update(
             系统="视频去水印系统",
             通过=False,
             目检="未进行",
             失败类型=type(error).__name__,
+            失败代码=getattr(error, "code", None),
+            失败位置=[
+                dict(文件=Path(frame.filename).name, 函数=frame.name, 行号=frame.lineno)
+                for frame in traceback.extract_tb(error.__traceback__)
+            ],
             失败阶段="处理或核验",
             分步计时=phases.timings,
             未完成检查="不得宣称提速或质量达标",
@@ -680,9 +779,19 @@ def main():
             report["可用于冷启动提速结论"] = (
                 args.run and not report["复用检查点"] and report.get("失败类型") is None
             )
+            seconds = report["本次处理耗时秒"]
+            report["相对分项基线倍数"] = (
+                sum(BASELINE_SECONDS.values()) / seconds if seconds else None
+            )
+            report["相对整集首块倍数"] = 3219 / seconds if seconds else None
             report["三倍提速目标达成"] = (
                 report["本次处理耗时秒"] < sum(BASELINE_SECONDS.values()) / 3
                 if report["可用于冷启动提速结论"]
+                else None
+            )
+            report["速度与质量目标同时达成"] = (
+                False
+                if report.get("通过") is False or report["三倍提速目标达成"] is False
                 else None
             )
             (args.output / "report.json").write_text(

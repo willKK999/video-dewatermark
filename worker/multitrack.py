@@ -229,7 +229,7 @@ def discover_variants(files, median, regions, check=lambda: None):
     return chosen
 
 
-def make_tracks(files, scenes, prior_path, root, check=lambda: None, fps=30):
+def make_tracks(files, scenes, prior_path, root, check=lambda: None, fps=30, workers=1):
     import shutil
 
     median, signal, regions, variants, metrics = load_prior(prior_path)
@@ -256,22 +256,42 @@ def make_tracks(files, scenes, prior_path, root, check=lambda: None, fps=30):
                 ],
             )
         )
+    from .speedup import bounded_map
+
     available = bank(median, regions)
-    for variant_index, spec in enumerate(variants):
-        variant = next(v for v in available if all(v[k] == spec[k] for k in spec))
-        instances = []
-        for i, path in enumerate(files):
-            check()
-            image = highpass(
-                cv2.resize(cv2.imread(str(path)), (median.shape[1], median.shape[0]))
-            )
-            candidates = [
+    chosen = [
+        next(v for v in available if all(v[k] == spec[k] for k in spec))
+        for spec in variants
+    ]
+    all_instances = [[] for _ in variants]
+
+    def candidates_for(path):
+        check()
+        feature = highpass(
+            cv2.resize(cv2.imread(str(path)), (median.shape[1], median.shape[0]))
+        )
+        return [
+            [
                 p
                 for p in template_candidates(
-                    image, variant["template"], variant["support"], 0.45, 12
+                    feature, variant["template"], variant["support"], 0.45, 12
                 )
                 if outside_fixed(p["box"], regions)
             ]
+            for variant in chosen
+        ]
+
+    # 每帧只解码和提取一次高频，有界并行匹配；轨迹仍按原帧序串行更新。
+    for i, rows in enumerate(
+        bounded_map(
+            candidates_for,
+            files if variants else [],
+            depth=max(1, workers),
+            workers=workers,
+        )
+    ):
+        for variant_index, (spec, candidates) in enumerate(zip(variants, rows)):
+            instances = all_instances[variant_index]
             assigned = set()
             for p in sorted(candidates, key=lambda p: p["confidence"], reverse=True):
                 center = np.array(
@@ -308,6 +328,7 @@ def make_tracks(files, scenes, prior_path, root, check=lambda: None, fps=30):
                         track_id=t["id"],
                     )
                 )
+    for variant_index, instances in enumerate(all_instances):
         for t in instances:
             if len(t["hints"]) >= max(1, round(fps * 0.1)):
                 t.pop("center")

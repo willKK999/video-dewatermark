@@ -90,3 +90,29 @@ def test_temporal_brand_template_excludes_background_without_hiding_remnant():
     assert any(
         q["correlation"] >= 0.55 and q["relative_amplitude"] >= 0.15 for q in residual
     )
+
+
+def test_peak_rechecks_share_exact_source_feature_without_repeated_filtering(
+    monkeypatch,
+):
+    from worker import brand_templates as brand
+
+    seed = np.full((80, 160, 3), 60, np.uint8)
+    mask = np.zeros(seed.shape[:2], np.uint8)
+    cv2.putText(mask, "BRAND", (2, 55), 0, 0.8, 255, 2)
+    seed[mask > 0] = 220
+    bank = brand.variants(seed, mask, [1])
+    image = np.tile(seed, (2, 3, 1))
+    original_filter = brand.highpass
+    calls = []
+    monkeypatch.setattr(
+        brand, "highpass", lambda im: calls.append(1) or original_filter(im)
+    )
+    points = brand.match(image, bank, 0.8, allow_partial=True)
+    assert len(points) > 1 and len(calls) == 1
+    feature = original_filter(image)
+    for point in points:
+        variant = bank[point["variant"]]
+        assert brand.verified_score(
+            image, variant, point["box"], feature
+        ) == brand.verified_score(image, variant, point["box"])

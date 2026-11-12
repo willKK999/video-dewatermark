@@ -345,3 +345,26 @@ def test_encoded_clarity_below_point_seven_is_recorded_without_failure(
     assert report["通过"] is None and report["清晰度仅记录"]
     assert report["最小保留比"] == 0.62
     assert len(report["低于零点七的样本"]) == len(report["全部样本"]) == 11
+
+
+def test_worst_crops_are_selected_by_metrics_and_keep_three_sources(tmp_path):
+    video = tmp_path / "source.mp4"
+    make_video(video, seconds=1)
+    metrics = tmp_path / "metrics"
+    (metrics / "0").mkdir(parents=True)
+    (metrics / "1").mkdir()
+    (metrics / "regions.json").write_text(json.dumps([None, [0, 0, 64, 48]]))
+    for i in range(2):
+        (metrics / str(i) / "ssim.log").write_text(
+            "n:1 All:0.99\nn:2 All:0.85\nn:31 All:0.90\n"
+        )
+    report = bench.worst_comparisons(
+        video, video, video, metrics, tmp_path / "worst", limit=3
+    )
+    assert len(report["样本"]) == 3
+    assert report["样本"][0]["SSIM"] == 0.85
+    import cv2
+
+    for sample in report["样本"]:
+        image = cv2.imread(sample["图片"])
+        assert image.shape[1] == (sample["区域"][2] if sample["区域"] else 128) * 3

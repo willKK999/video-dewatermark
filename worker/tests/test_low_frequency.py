@@ -113,14 +113,15 @@ def test_rgb_lossless_intermediate_keeps_all_existing_pixels(tmp_path):
 
 def test_text_without_circular_icon_has_reliable_residual_support():
     from worker.hls_graphic_repair import residual_support
+
     image = np.full((100, 240), 128, np.uint8)
-    cv2.putText(image, 'Sample', (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 1, 220, 2)
+    cv2.putText(image, "Sample", (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 1, 220, 2)
     feature = image.astype(np.float32) - 128
     signal = (feature > 0).astype(np.uint8) * 255
     region = dict(id=1, box=[10, 20, 210, 80], mask=signal.copy())
     support = residual_support(feature, signal, region)
     assert np.all(support[signal > 0] > 0)
-    assert not support[90, 230] and np.count_nonzero(support) < support.size * .2
+    assert not support[90, 230] and np.count_nonzero(support) < support.size * 0.2
 
 
 def test_low_band_retry_uses_current_baseline_without_reapplying_old_delta():
@@ -133,4 +134,25 @@ def test_low_band_retry_uses_current_baseline_without_reapplying_old_delta():
     again = repair_low_band(once, clean, clean, mask)
     assert np.array_equal(again, once)
     doubled = repair_low_band(once, source, clean, mask)
-    assert np.abs(doubled.astype(float) - clean).mean() > np.abs(again.astype(float) - clean).mean()
+    assert (
+        np.abs(doubled.astype(float) - clean).mean()
+        > np.abs(again.astype(float) - clean).mean()
+    )
+
+
+def test_low_verification_samples_only_requested_core(tmp_path, monkeypatch):
+    from worker import hls_graphic_repair as repair
+    from worker.tests.test_speedup_bench import make_video
+    from worker.process import PipelineError
+    import pytest
+
+    video = tmp_path / "source.mp4"
+    make_video(video, seconds=1)
+    calls = []
+    monkeypatch.setattr(repair, "fixed_scores", lambda t, c, r: calls.append(c) or [])
+    result = repair.verify_low(
+        video, np.zeros((96, 128)), [], start_frame=12, frame_count=24
+    )
+    assert result["样本数"] == 1 and len(calls) == 1
+    with pytest.raises(PipelineError, match="范围"):
+        repair.verify_low(video, np.zeros((96, 128)), [], start_frame=59, frame_count=2)

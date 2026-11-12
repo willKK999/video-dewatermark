@@ -88,6 +88,9 @@ def identity(source_hash, options, config, execution_fingerprint):
                 mode=config["mode"],
                 backend=config["backend"],
                 settings=settings,
+                asset_profile=digest(Path(os.environ["HLS_V7_ASSETS"]))
+                if os.getenv("HLS_V7_ASSETS")
+                else None,
                 execution=execution_fingerprint,
                 code=code,
             ),
@@ -97,7 +100,7 @@ def identity(source_hash, options, config, execution_fingerprint):
 
 
 def assets_from(root):
-    return {
+    assets = {
         name: root / file
         for name, file in dict(
             prior="multitrack-prior.npz",
@@ -106,6 +109,11 @@ def assets_from(root):
             palette="palette.npy",
         ).items()
     }
+    if (root / "projection.json").is_file():
+        assets["projection"] = root / "projection.json"
+    if (root / "low-band.npz").is_file():
+        assets["low_band_template"] = root / "low-band.npz"
+    return assets
 
 
 def cache_chunk(work, store, name, key, check):
