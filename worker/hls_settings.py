@@ -26,6 +26,11 @@ class HLSSettings:
     panel_neighbor_dark_fill: float = 0.2
     visibility_correlation: float = 0.02
     visibility_amplitude: float = 0.05
+    opaque_white_saturation: float = 20
+    opaque_white_min_value: float = 235
+    opaque_palette_margin: float = 12
+    opaque_ink_radius: int = 4
+    opaque_brand_padding: float = .1
 
     @classmethod
     def from_env(cls):
@@ -67,6 +72,8 @@ class HLSSettings:
             raise ValueError("相邻面板几何配置无效")
         if not (0 < settings.visibility_correlation <= 1 and settings.visibility_amplitude > 0):
             raise ValueError("源片字形可见性配置无效")
+        if not (0 < settings.opaque_white_saturation <= 255 and 0 < settings.opaque_white_min_value <= 255 and 0 <= settings.opaque_palette_margin <= 255 and 1 <= settings.opaque_ink_radius <= 12 and 0 <= settings.opaque_brand_padding <= .25):
+            raise ValueError("不透明品牌笔画配置无效")
         return settings
 
 

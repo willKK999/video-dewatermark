@@ -195,6 +195,34 @@ def palette_support(image, palette, distance=22):
     return mask
 
 
+def opaque_brand_ink(image, box, palette):
+    """在自动品牌框内覆盖所有独立前景笔画，不依赖SAM是否把小字分为同一对象。"""
+    from .hls_settings import HLSSettings
+
+    settings = HLSSettings.from_env()
+    colors = cv2.cvtColor(palette.astype(np.uint8)[None], cv2.COLOR_LAB2BGR)[0]
+    centers = cv2.cvtColor(colors[None], cv2.COLOR_BGR2HSV)[0].astype(np.float32)
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV).astype(np.float32)
+    selected = np.zeros(image.shape[:2], np.uint8)
+    for h, s, v in centers:
+        if s > 90:
+            hue = np.minimum(np.abs(hsv[:, :, 0] - h), 180 - np.abs(hsv[:, :, 0] - h))
+            active = (hue < 7) & (hsv[:, :, 1] > s * .45) & (hsv[:, :, 2] > v * .6)
+        elif v > 215:
+            active = (hsv[:, :, 1] < settings.opaque_white_saturation) & (hsv[:, :, 2] > max(settings.opaque_white_min_value, v - settings.opaque_palette_margin))
+        else:
+            continue
+        selected[active] = 255
+    x, y, a, b = map(round, box)
+    pad=round((b-y)*settings.opaque_brand_padding)
+    x,y,a,b=x-pad,y-pad,a+pad,b+pad
+    x, y, a, b = max(0,x), max(0,y), min(image.shape[1],a), min(image.shape[0],b)
+    bounded = np.zeros_like(selected)
+    bounded[y:b,x:a] = selected[y:b,x:a]
+    radius = settings.opaque_ink_radius
+    return cv2.dilate(bounded,cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(2*radius+1,2*radius+1)))
+
+
 def play_icons(image):
     """通用圆形播放标识：必须同时具有圆轮廓、内置三角形和合理面积比。"""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
