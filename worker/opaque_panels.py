@@ -108,7 +108,7 @@ def panel_support(image, box, expand=True):
     )[0]:
         cx, cy, cw, ch = cv2.boundingRect(contour)
         ca = cv2.contourArea(contour)
-        if ca < area * 0.015 or ca / (cw * ch) < 0.4 or ch > (box[3] - box[1]) * 0.7:
+        if ca < area * 0.015 or ca / (cw * ch) < 0.4:
             continue
         component = np.zeros(local.shape, np.uint8)
         cv2.drawContours(component, [cv2.convexHull(contour)], -1, 255, -1)
@@ -219,10 +219,20 @@ def patch(work, assets_path):
     native = work / "native"
     final = native / "chunk1.mp4"
     root = work / "opaque-panels"
-    method = "完整面板邻接图形与时域包络-5"
+    method = "完整面板连通色带与当前成品上下文-6"
     if root.exists() and any(root.iterdir()):
         marker = root / "method.json"
-        if not marker.exists() or json.loads(marker.read_text()).get("方法") != method:
+        input_marker = root / "current-frames.json"
+        current = vision.sha256(final)
+        saved = json.loads((root / "report.json").read_text()) if (root / "report.json").exists() else {}
+        child = json.loads((work / "complete-graphics/report.json").read_text()) if (work / "complete-graphics/report.json").exists() else {}
+        bound = (
+            not input_marker.exists()
+            or json.loads(input_marker.read_text()).get("输入摘要") == current
+            or saved.get("输出摘要") == current
+            or (child.get("基底视频摘要") == saved.get("输出摘要") and child.get("修复后视频摘要") == current)
+        )
+        if not marker.exists() or json.loads(marker.read_text()).get("方法") != method or not bound:
             root.rename(work / f"opaque-panels-before-v3-{time.time_ns()}")
     root.mkdir(exist_ok=True)
     (root / "method.json").write_text(json.dumps(dict(方法=method), ensure_ascii=False))
@@ -244,6 +254,11 @@ def patch(work, assets_path):
     d = json.loads(Path(info["detected"]).read_text())
     meta = json.loads((native / "native-report.json").read_text())
     mapping = meta["帧映射"]
+    from .hls_model_frames import capture
+    current_frames = root / "current-frames"
+    if not (root / "current-frames.json").exists():
+        missing = capture(final, mapping, current_frames, sorted((Path(info["coarse"]) / "composite").glob("*.png")))
+        (root / "current-frames.json").write_text(json.dumps(dict(输入摘要=vision.sha256(final), 补齐未映射帧=missing), ensure_ascii=False))
     detected_path = root / "observations.json"
     if not detected_path.exists():
         detected_path.write_text(
@@ -385,7 +400,7 @@ def patch(work, assets_path):
         for file in files:
             cv2.imwrite(
                 str(crop / "frames" / file.name),
-                cv2.imread(str(coarse / "composite" / file.name))[ry:rb, rx:ra],
+                cv2.imread(str(current_frames / file.name))[ry:rb, rx:ra],
             )
             cv2.imwrite(
                 str(crop / "masks" / file.name),
@@ -444,7 +459,7 @@ def patch(work, assets_path):
 
     @lru_cache(maxsize=8)
     def repaired(i):
-        base = cv2.imread(str(coarse / "composite" / files[i].name))
+        base = cv2.imread(str(current_frames / files[i].name))
         base[ry:rb, rx:ra] = cv2.imread(str(crop / "composite" / files[i].name))
         return cv2.resize(
             base, (width, height), interpolation=cv2.INTER_CUBIC

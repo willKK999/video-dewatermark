@@ -154,3 +154,16 @@ def test_nearby_skin_or_plain_coloured_object_cannot_grow_brand_box():
     cv2.rectangle(image, (20, 20), (100, 95), (0, 220, 250), -1)
     box = [105, 20, 370, 95]
     assert adjacent_panel_box(image, box) == box
+
+
+def test_footer_connected_to_tall_icon_is_completed_as_one_colour_component():
+    im=np.full((180,400,3),(140,170,190),np.uint8)
+    cv2.rectangle(im,(20,20),(370,75),(10,10,10),-1)
+    cv2.rectangle(im,(20,20),(370,75),(240,240,240),2)
+    cv2.circle(im,(57,57),30,(0,220,250),-1)
+    cv2.rectangle(im,(20,76),(370,114),(0,220,250),-1)
+    cv2.rectangle(im,(20,40),(30,100),(0,220,250),-1)
+    cv2.putText(im,'Brand',(125,65),0,1,(0,220,250),2)
+    mask=panel_support(im,[18,15,375,122])
+    assert mask[108,300] and mask[57,57]
+    assert not mask[150,300]
