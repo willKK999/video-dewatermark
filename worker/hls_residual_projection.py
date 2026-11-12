@@ -8,12 +8,14 @@ from .matte import ink_support
 from .process import PipelineError
 from .vision import sha256
 from scripts.hls_chunk_check import mux_core_audio, audio_hash
-from .hls_settings import is_residual_score
+from .hls_settings import is_residual_score, HLSSettings
 
 
 def fit_correction(template, consensus, mask):
     """沿用v7的字形及一阶导数基、64像素窗和32像素步长；仅拟合时域共识。"""
     g = template.astype(np.float32)
+    # 补画、缩放和编码会改变同一字形各频带的幅度，不能只拟合原始锐利笔画。
+    smooth = cv2.GaussianBlur(g, (0, 0), HLSSettings.from_env().detail_sigma)
     dx = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3) / 8
     dy = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3) / 8
     h, w = g.shape
@@ -25,15 +27,16 @@ def fit_correction(template, consensus, mask):
             active = mask[y:b, x:a] > 0
             if active.sum() < 20:
                 continue
-            design = np.stack([v[y:b, x:a] for v in [g, dx, dy]], axis=2)
+            design = np.stack([v[y:b, x:a] for v in [g, smooth, dx, dy]], axis=2)
             X = design[active].astype(np.float64)
             if np.sum(X * X) < 1e-4:
                 continue
-            normal = X.T @ X
-            normal += np.eye(3) * max(np.trace(normal) * 0.0001, 1e-6)
+            scale = np.maximum(np.linalg.norm(X, axis=0), 1e-6)
+            normalized = X / scale
+            normal = normalized.T @ normalized + np.eye(X.shape[1]) * .0001
             coeff = np.linalg.solve(
-                normal, X.T @ consensus[y:b, x:a][active].astype(np.float64)
-            )
+                normal, normalized.T @ consensus[y:b, x:a][active].astype(np.float64)
+            ) / scale[:, None]
             weight = (
                 np.maximum(0.05, np.hanning(b - y))[:, None]
                 * np.maximum(0.05, np.hanning(a - x))[None, :]
@@ -56,6 +59,30 @@ def apply_correction(image, correction, mask):
     )
     result[mask == 0] = image[mask == 0]
     return result
+
+
+def projection_support(prior, signal, region, shape):
+    mask = cv2.resize(ink_support(prior, signal, region["mask"], 3), (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST)
+    # 带通字形含负侧瓣，按相同滤波器的三倍标准差覆盖侧瓣，仍只拟合字形方向。
+    radius = max(1, int(np.ceil(3 * HLSSettings.from_env().detail_sigma)))
+    return cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1)))
+
+
+def visible_support(source, prior, regions, supports):
+    """源片没有该固定字形时不施加校正，避免中途消失后反向造出水印。"""
+    settings = HLSSettings.from_env()
+    feature = highpass(cv2.resize(source, (prior.shape[1], prior.shape[0])))
+    allowed = np.zeros(next(iter(supports.values())).shape, np.uint8)
+    for region in regions:
+        if region["id"] not in supports:
+            continue
+        active = region["mask"] > 0
+        a, b = prior[active], feature[active]
+        correlation = float(a @ b / max(float(np.linalg.norm(a) * np.linalg.norm(b)), 1e-6))
+        amplitude = float(a @ b / max(float(a @ a), 1e-6))
+        if correlation >= settings.visibility_correlation and amplitude >= settings.visibility_amplitude:
+            allowed |= supports[region["id"]]
+    return allowed
 
 
 def scan(video, prior, regions):
@@ -105,32 +132,27 @@ def patch(work, assets_path):
     video = native / "chunk1.mp4"
     digest = sha256(video)
     root = work / "residual-projection"
+    method = "v7编码后多频带时域字形投影校正-2"
+    if (root / "report.json").exists() and json.loads((root / "report.json").read_text()).get("方法") != method:
+        root.rename(work / (root.name + "-previous-" + str(time.time_ns())))
     root.mkdir(exist_ok=True)
     report_path = root / "report.json"
     if (
         report_path.exists()
         and json.loads(report_path.read_text()).get("输出摘要") == digest
     ):
+        saved = json.loads(report_path.read_text())
+        if any(p["residual"] for p in saved.get("修复后", []) if p["region"] in saved.get("修复区域", [])):
+            raise PipelineError("RESIDUAL_UNCERTAIN", "已缓存的字形校正未通过，需诊断后更新方法", review=True)
         return
     prior, signal, regions, _, _ = load_prior(Path(assets["prior"]))
     before, images = scan(video, prior, regions)
     wanted = {p["region"] for p in before if p["residual"]}
-    # 专用面板已有独立补修；字形投影不能代替清除不透明整块图形。
-    opaque = work / "opaque-panels/masks"
-    union = np.zeros(prior.shape, np.uint8)
-    if opaque.exists():
-        for p in sorted(opaque.glob("*.png"))[::30]:
-            union |= cv2.imread(str(p), 0)
-    wanted = {
-        r["id"]
-        for r in regions
-        if r["id"] in wanted
-        and np.count_nonzero(union & (r["mask"])) < np.count_nonzero(r["mask"]) * 0.25
-    }
+    # 不透明图层逐帧排除，不能因其他目标一度经过这里就跳过整块固定水印。
     if not wanted:
         report_path.write_text(
             json.dumps(
-                dict(无需校正=True, 修复前=before, 输出摘要=digest),
+                dict(方法=method, 无需校正=True, 修复前=before, 输出摘要=digest),
                 ensure_ascii=False,
                 indent=2,
             )
@@ -146,22 +168,14 @@ def patch(work, assets_path):
     fields = np.zeros((h, w, 3), np.float32)
     mask = np.zeros((h, w), np.uint8)
     statistics = []
+    region_supports = {}
     for region in regions:
         if region["id"] not in wanted:
             continue
-        support = cv2.resize(
-            ink_support(prior, signal, region["mask"], 3),
-            (w, h),
-            interpolation=cv2.INTER_NEAREST,
-        )
-        x, y, a, b = [
-            (
-                round(v * w / prior.shape[1])
-                if i % 2 == 0
-                else round(v * h / prior.shape[0])
-            )
-            for i, v in enumerate(region["box"])
-        ]
+        support = projection_support(prior, signal, region, (h, w))
+        region_supports[region["id"]] = support
+        yy, xx = np.where(support > 0)
+        x, y, a, b = int(xx.min()), int(yy.min()), int(xx.max()+1), int(yy.max()+1)
         values = np.stack([im[y:b, x:a] for im in images])
         common = np.median(values, axis=0)
         field = fit_correction(template[y:b, x:a], common, support[y:b, x:a])
@@ -175,6 +189,8 @@ def patch(work, assets_path):
             )
         )
     del images
+    if np.count_nonzero(mask) / mask.size > HLSSettings.from_env().mask_fraction_limit:
+        raise PipelineError("MASK_UNCERTAIN", "字形校正单遍超过面积保护", review=True)
     np.savez_compressed(root / "correction.npz", correction=fields, mask=mask)
     old = root / f"before-{digest[:12]}.mp4"
     shutil.copyfile(video, old)
@@ -219,9 +235,14 @@ def patch(work, assets_path):
 
     @lru_cache(maxsize=8)
     def permitted(index):
-        allowed = mask.copy()
+        source = cv2.imread(str(work / "frames" / f"{index:06d}.png"))
+        if source is None:
+            raise PipelineError("OUTPUT_INVALID", "字形校正缺少源片可见性参考帧")
+        allowed = visible_support(source, prior, regions, region_supports)
         for directory in [
             Path(info["graphics"]) / "masks",
+            Path(info["color"]) / "masks",
+            Path(info["variant"]) / "masks",
             work / "opaque-panels/masks",
         ]:
             path = directory / f"{index:06d}.png"
@@ -256,7 +277,7 @@ def patch(work, assets_path):
     after, samples = scan(output, prior, regions)
     del samples
     report = dict(
-        方法="v7编码后时域字形投影校正",
+        方法=method,
         修复区域=sorted(wanted),
         修复前=before,
         修复后=after,

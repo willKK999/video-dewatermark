@@ -24,6 +24,8 @@ class HLSSettings:
     panel_neighbor_max_height: float = 1.4
     panel_neighbor_bright_rim: float = 0.25
     panel_neighbor_dark_fill: float = 0.2
+    visibility_correlation: float = 0.02
+    visibility_amplitude: float = 0.05
 
     @classmethod
     def from_env(cls):
@@ -63,6 +65,8 @@ class HLSSettings:
             and 0 < settings.panel_neighbor_dark_fill <= 1
         ):
             raise ValueError("相邻面板几何配置无效")
+        if not (0 < settings.visibility_correlation <= 1 and settings.visibility_amplitude > 0):
+            raise ValueError("源片字形可见性配置无效")
         return settings
 
 
