@@ -382,6 +382,7 @@ def prepare_graphics(work, detections, assets, fast, check=lambda: None):
         cv2.imwrite(str(graphic / "masks" / file.name), np.zeros((h, w), np.uint8))
     records, text_review, accepted_intervals = [], [], []
     lifecycle_transitions = []
+    prompt_review = []
     references = None
     known_banks = []
     for identity, seed in enumerate(seeds):
@@ -427,7 +428,25 @@ def prepare_graphics(work, detections, assets, fast, check=lambda: None):
                     load_mask_prompt(graphic, p["mask_prompt"], (h, w)).astype(np.uint8)
                     * 255
                 )
-            return graphic_prompt(cv2.imread(str(files[p["frame"]])), p["box"], palette)
+            try:
+                return graphic_prompt(
+                    cv2.imread(str(files[p["frame"]])), p["box"], palette
+                )
+            except PipelineError as error:
+                if error.code != "MASK_UNCERTAIN":
+                    raise
+                prompt_review.append(
+                    dict(
+                        track=identity,
+                        frame=p["frame"],
+                        box=p["box"],
+                        依据="颜色像素不足，不注入伪前景；保留原观测及完整生命周期，由可靠提示传播覆盖",
+                    )
+                )
+                (graphic / "prompt-review.json").write_text(
+                    json.dumps(prompt_review, ensure_ascii=False, indent=2)
+                )
+                return None
 
         for p, prompt in adaptive_mask_hints(
             observations, *seed["scenes"][0], load_prompt, fast=fast
@@ -450,6 +469,10 @@ def prepare_graphics(work, detections, assets, fast, check=lambda: None):
                 int(yy.max() + 1),
             ]
             hints.append(p)
+        if not hints:
+            raise PipelineError(
+                "MASK_UNCERTAIN", "整条图形轨迹没有可靠像素提示", review=True
+            )
         (tracker / "detections.json").write_text(
             json.dumps(dict(scenes=seed["scenes"], hints=hints))
         )

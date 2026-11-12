@@ -90,8 +90,13 @@ def adaptive_mask_hints(hints, start, end, load_mask, fast=True):
     ordered = sorted(hints, key=lambda p: p["frame"])
     required = {p["frame"] for p in adaptive_hints(ordered, start, end)}
     previous = None
+    last_valid = None
+    last_emitted = None
     for point in ordered:
         mask = load_mask(point)
+        if mask is None:
+            continue
+        last_valid = point, mask
         active = mask > 0
         changed = previous is None
         if previous is not None:
@@ -100,6 +105,9 @@ def adaptive_mask_hints(hints, start, end, load_mask, fast=True):
         if not fast or point["frame"] in required or changed:
             yield point, mask
             previous = active
+            last_emitted = point["frame"]
+    if last_valid is not None and last_valid[0]["frame"] != last_emitted:
+        yield last_valid
 
 
 def segmentation_shape(height, width, max_edge):

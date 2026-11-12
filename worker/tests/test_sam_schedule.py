@@ -67,3 +67,20 @@ def test_mask_deformation_adds_prompt_when_box_does_not_move():
             hints, 0, 6, lambda p: masks[p["frame"]], fast=False
         )
     ] == list(range(6))
+
+
+def test_weak_pixel_observations_remain_covered_by_reliable_prompts():
+    import numpy as np
+    from worker.sam_schedule import adaptive_mask_hints
+
+    hints = [dict(frame=i, box=[0, 0, 20, 20]) for i in range(5)]
+    mask = np.zeros((20, 20), np.uint8)
+    mask[3:12, 3:12] = 255
+    selected = list(
+        adaptive_mask_hints(
+            hints, 0, 5, lambda p: mask if p["frame"] in (1, 3) else None
+        )
+    )
+    assert [p["frame"] for p, _ in selected] == [1, 3]
+    assert [p["frame"] for p in hints] == list(range(5))
+    assert list(adaptive_mask_hints(hints, 0, 5, lambda p: None)) == []
