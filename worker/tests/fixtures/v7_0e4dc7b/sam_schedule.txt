@@ -1,0 +1,47 @@
+"""主分支0e4dc7b原始函数快照，仅作等价性测试参考。"""
+
+def groups_for_scene(detections, start, end):
+    hints = [p for p in detections["hints"] if start <= p["frame"] < end]
+    if not detections.get("multitrack"):
+        return [(start, end, hints)]
+    by_id = {}
+    for hint in hints:
+        by_id.setdefault(hint["track_id"], []).append(hint)
+    groups = {}
+    for observations in by_id.values():
+        first = min(p["frame"] for p in observations)
+        last = max(p["frame"] for p in observations) + 1
+        groups.setdefault((first, last), []).extend(observations)
+    return [
+        (a, b, sorted(points, key=lambda p: (p["frame"], p["track_id"])))
+        for (a, b), points in sorted(groups.items())
+    ]
+
+def sampled_hints(hints, start, end, stride=30):
+    first = {}
+    for point in hints:
+        first.setdefault(point.get("track_id", 1), point["frame"])
+    return [
+        p
+        for p in hints
+        if (p["frame"] - start) % stride == 0
+        or p["frame"] == end - 1
+        or p["frame"] == first[p.get("track_id", 1)]
+    ]
+
+def load_mask_prompt(root, relative, shape):
+    from pathlib import Path
+    import cv2, numpy as np
+
+    path = Path(relative)
+    if (
+        path.is_absolute()
+        or ".." in path.parts
+        or path.parts[0] != "prompts"
+        or path.suffix != ".png"
+    ):
+        raise ValueError("自动掩膜提示路径无效")
+    mask = cv2.imread(str(Path(root) / path), 0)
+    if mask is None or mask.shape != shape or not set(np.unique(mask)) <= {0, 255}:
+        raise ValueError("自动掩膜提示尺寸或取值无效")
+    return mask > 0

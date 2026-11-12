@@ -49,6 +49,7 @@ def verify(
     output,
     sample_stride=1,
     occluder_roots=(),
+    source_frame_offset=0,
 ):
     started = time.monotonic()
     indices = json.loads(mapping.read_text())["帧映射"]
@@ -57,6 +58,8 @@ def verify(
     selected = sample_pairs(indices, detections, sample_stride)
     mh, mw = supports.median.shape
     a = cv2.VideoCapture(str(source))
+    if source_frame_offset:
+        a.set(cv2.CAP_PROP_POS_FRAMES, source_frame_offset)
     b = cv2.VideoCapture(str(result))
     fps = b.get(5)
     w, h = int(b.get(3)), int(b.get(4))

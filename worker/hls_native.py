@@ -147,19 +147,22 @@ def cache_chunk(work, store, name, key, check):
         check,
         timeout=7200,
     )
+    paths = [
+        movie,
+        work / "chunk.json",
+        work / "detections.json",
+        work / "masks",
+        work / "graphic",
+        work / "rendered/native-report.json",
+        work / "performance.json",
+        work / "projection.json",
+    ]
+    if (work / "v7-assets.json").is_file():
+        paths = canonical_checkpoint_files(work, movie, check)
     store.save(
         name,
         work,
-        [
-            movie,
-            work / "chunk.json",
-            work / "detections.json",
-            work / "masks",
-            work / "graphic",
-            work / "rendered/native-report.json",
-            work / "performance.json",
-            work / "projection.json",
-        ],
+        paths,
         key,
     )
     movie.unlink()
@@ -168,7 +171,11 @@ def cache_chunk(work, store, name, key, check):
 def restore_chunk(work, store, name, key, source, plan, assets, check):
     if not store.restore(name, work, key):
         return False
-    decode_chunk(source, work, plan, check)
+    canonical = (work / "v7-assets.json").is_file()
+    if canonical:
+        restore_canonical_inputs(work, assets, check)
+    else:
+        decode_chunk(source, work, plan, check)
     (work / "rendered/frames").mkdir(exist_ok=True)
     run(
         [
@@ -193,6 +200,11 @@ def restore_chunk(work, store, name, key, source, plan, assets, check):
     detections = json.loads((work / "detections.json").read_text())
     detections["prior"] = str(assets["prior"])
     (work / "detections.json").write_text(json.dumps(detections))
+    if canonical:
+        for path in work.rglob("layers.json"):
+            data = json.loads(path.read_text())
+            data["detected_sha256"] = digest(work / "detections.json")
+            path.write_text(json.dumps(data))
     (work / "native.mkv").unlink()
     return True
 
@@ -577,3 +589,143 @@ def finish_report(root, output, delivery, info, metrics, native, check):
         对比产物=captures,
     )
     (root / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2))
+
+
+def canonical_checkpoint_files(work, movie, check):
+    """保存七版真正使用的模型输入与图形证据，恢复时不重新采样或改变相位。"""
+    from .native_checkpoint import allowed
+
+    model = work / "model-input.mkv"
+    run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-y",
+            "-framerate",
+            "30",
+            "-i",
+            work / "frames/%06d.png",
+            "-c:v",
+            "ffv1",
+            "-level",
+            "3",
+            "-pix_fmt",
+            "bgr0",
+            model,
+        ],
+        check,
+        timeout=7200,
+    )
+    source = work / "source-input.mkv"
+    run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-y",
+            "-i",
+            work / "source.mp4",
+            "-map",
+            "0",
+            "-c",
+            "copy",
+            source,
+        ],
+        check,
+        timeout=7200,
+    )
+    paths = [movie, model, source]
+    metadata = (
+        "chunk.json",
+        "detections.json",
+        "prepared.json",
+        "v7-assets.json",
+        "decision-provenance.json",
+        "performance.json",
+        "native/native-report.json",
+        "rendered/native-report.json",
+    )
+    paths += [work / name for name in metadata if (work / name).is_file()]
+    for folder in (
+        "color",
+        "variant",
+        "graphics",
+        "masks",
+        "fine",
+        "coarse",
+        "opaque-panels",
+        "brand-ink-repair",
+        "complete-graphics",
+    ):
+        root = work / folder
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*"):
+            if (
+                path.is_file()
+                and not path.is_symlink()
+                and allowed(path.relative_to(work).as_posix())
+            ):
+                if (
+                    path.suffix == ".json"
+                    or "masks" in path.parts
+                    or path.name in ("seed-image.png", "seed-mask.png")
+                ):
+                    paths.append(path)
+    return paths
+
+
+def restore_canonical_inputs(work, assets, check):
+    """只作路径适配与无损解码；不调用检测、分割、模板匹配或掩膜判定。"""
+    info_path = work / "prepared.json"
+    old = json.loads(info_path.read_text())
+    old_root = str(Path(old["detected"]).parent)
+
+    def rebase(value):
+        if isinstance(value, dict):
+            return {key: rebase(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [rebase(item) for item in value]
+        if isinstance(value, str) and (
+            value == old_root or value.startswith(old_root + "/")
+        ):
+            return str(work) + value[len(old_root) :]
+        return value
+
+    for file in work.rglob("*.json"):
+        if file.is_symlink():
+            continue
+        file.write_text(
+            json.dumps(rebase(json.loads(file.read_text())), ensure_ascii=False)
+        )
+    frames = work / "frames"
+    frames.mkdir(exist_ok=True)
+    run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-i",
+            work / "model-input.mkv",
+            "-start_number",
+            "0",
+            frames / "%06d.png",
+        ],
+        check,
+        timeout=7200,
+    )
+    coarse = work / "coarse"
+    coarse.mkdir(exist_ok=True)
+    (coarse / "frames").symlink_to(frames.resolve(), target_is_directory=True)
+    if not (work / "graphic").exists():
+        (work / "graphic").symlink_to(
+            (work / "graphics").resolve(), target_is_directory=True
+        )
+    info = rebase(old)
+    info["source"] = str(work / "source-input.mkv")
+    info_path.write_text(json.dumps(info))
+    manifest = work / "v7-assets.json"
+    data = json.loads(manifest.read_text())
+    data.update({name: str(path) for name, path in assets.items()})
+    manifest.write_text(json.dumps(data))

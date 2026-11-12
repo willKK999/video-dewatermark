@@ -415,6 +415,7 @@ def patch(work, assets_path):
             d["scenes"],
             "propainter",
             True,
+            roi=False,
             condition_overlap=True,
         )
         (root / "gpu-complete.json").write_text("{}")

@@ -228,6 +228,7 @@ def patch(work, assets_path, low_template_path, complete_ink=False):
             detected["scenes"],
             "propainter",
             True,
+            roi=False,
             condition_overlap=complete_ink,
         )
         (root / "gpu-complete.json").write_text(

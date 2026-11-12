@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from worker.roi import plan_rois, paste_roi
 from worker.speedup import bounded_map, encoder_args
-from worker.sam_schedule import adaptive_hints, groups_for_scene, segmentation_shape
+from worker.sam_schedule import sampled_hints, groups_for_scene
 
 
 def test_roi_covers_every_moving_pixel_and_keeps_distant_marks_separate():
@@ -80,20 +80,17 @@ def test_encoding_policy_copies_audio_elsewhere_and_does_not_cap_bitrate():
         encoder_args("unknown")
 
 
-def test_adaptive_keys_keep_motion_lifetime_and_shot_boundaries():
+def test_v7_keys_keep_original_stride_and_lifetimes():
     hints = [dict(frame=i, track_id=1, box=[10, 10, 30, 30]) for i in range(100)]
     hints[23]["box"] = [80, 80, 100, 100]
     hints += [dict(frame=i, track_id=2, box=[10, 10, 30, 30]) for i in range(41, 65)]
-    groups = groups_for_scene(dict(multitrack=True, hints=hints), 0, 70)
-    for a, b, points in groups:
-        sampled = adaptive_hints(points, a, b, stride=30)
-        assert sampled[0]["frame"] == a
-        assert sampled[-1]["frame"] == b - 1
+    for a, b, points in groups_for_scene(dict(multitrack=True, hints=hints), 0, 70):
+        actual = sampled_hints(points, a, b)
+        assert actual == [
+            p for p in points if (p["frame"] - a) % 30 == 0 or p["frame"] in (a, b - 1)
+        ]
         if a == 0:
-            assert {23, 24} <= {p["frame"] for p in sampled}
-    assert segmentation_shape(1080, 1920, 1024) == (576, 1024)
-    with pytest.raises(ValueError):
-        adaptive_hints(hints, 0, 100, stride=0)
+            assert 23 not in [p["frame"] for p in actual]
 
 
 @pytest.mark.parametrize("sigma", [1.2, 3.0])
@@ -220,7 +217,7 @@ def test_roi_runner_caches_model_work_and_invalidates_changed_masks(
 
 
 @pytest.mark.parametrize("gpu_state", [False, True])
-def test_sam_runner_scales_prompts_reinitializes_and_prepares_jpeg_once(
+def test_sam_runner_ignores_experimental_options_and_preserves_v7_calls(
     tmp_path, monkeypatch, gpu_state
 ):
     import importlib.util
@@ -249,27 +246,27 @@ def test_sam_runner_scales_prompts_reinitializes_and_prepares_jpeg_once(
         image_size = 1024
 
         def init_state(self, video_path, **kwargs):
-            assert kwargs["offload_state_to_cpu"] is (not gpu_state)
+            assert kwargs["offload_state_to_cpu"] is True
             paths = sorted(Path(video_path).glob("*.jpg"))
-            assert cv2.imread(str(paths[0])).shape[:2] == (72, 128)
+            assert cv2.imread(str(paths[0])).shape[:2] == (144, 256)
             state = dict(count=len(paths), objects=set())
             states.append(state)
             return state
 
         def add_new_mask(self, state, frame_idx, obj_id, mask):
-            assert mask.shape == (72, 128)
+            assert mask.shape == (144, 256)
             masks.append(mask)
             state["objects"].add(obj_id)
 
         def add_new_points_or_box(self, state, frame_idx, obj_id, box):
-            assert 0 <= box[0] < box[2] <= 128 and 0 <= box[1] < box[3] <= 72
+            assert 0 <= box[0] < box[2] <= 256 and 0 <= box[1] < box[3] <= 144
             state["objects"].add(obj_id)
 
         def propagate_in_video(self, state, start_frame_idx, reverse):
             directions.append(reverse)
             for i in range(state["count"]):
                 ids = sorted(state["objects"])
-                yield i, ids, torch.ones((len(ids), 1, 72, 128))
+                yield i, ids, torch.ones((len(ids), 1, 144, 256))
 
         def reset_state(self, state):
             pass
@@ -310,8 +307,8 @@ def test_sam_runner_scales_prompts_reinitializes_and_prepares_jpeg_once(
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     module.main()
-    assert len(states) == 3 and len(writes) == 4
-    assert len(masks) == 1 and directions == [False, False, False]
+    assert len(states) == 3 and len(writes) == 5
+    assert len(masks) == 1 and directions == [False, True] * 3
     assert {p.name for p in (tmp_path / "object-masks/2").glob("*.png")} == {
         "000001.png"
     }
@@ -319,8 +316,9 @@ def test_sam_runner_scales_prompts_reinitializes_and_prepares_jpeg_once(
         assert cv2.imread(str(path), 0).shape == (144, 256)
 
 
+@pytest.mark.parametrize("canonical", [False, True])
 def test_native_fused_renderer_executes_both_v7_passes_and_retains_sixty_source_frames(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, canonical
 ):
     torch = pytest.importorskip("torch")
 
@@ -411,7 +409,9 @@ def test_native_fused_renderer_executes_both_v7_passes_and_retains_sixty_source_
         projection_calibration=coefficients,
         output_fps=60,
         backend="torch-cpu",
-        fused_detail=True,
+        fused_detail=not canonical,
+        final_recompose=canonical,
+        detail_sigma=3 if canonical else 1.2,
         video_crf=10,
     )
     report = json.loads((output / "native-report.json").read_text())
@@ -421,7 +421,12 @@ def test_native_fused_renderer_executes_both_v7_passes_and_retains_sixty_source_
         base = cv2.imread(str(coarse / "composite" / f"{report['帧映射'][n]:06d}.png"))
         expected = originals[n].copy()
         first = projected_texture_composite(
-            originals[n], base, mask, [glyph], calibration={}, detail_sigma=1.2
+            originals[n],
+            base,
+            mask,
+            [glyph],
+            calibration={},
+            detail_sigma=3 if canonical else 1.2,
         )
         expected[mask > 0] = first[mask > 0]
         second = projected_texture_composite(

@@ -539,3 +539,65 @@ def test_three_column_comparison_is_720p_and_under_size_limit(tmp_path):
     assert frame[360, 1000, 0] > 200
     assert report["视频字节数"] < 50_000_000
     assert report["视频列顺序"] == "原片、七版、提速成品"
+
+
+def test_canonical_native_core_uses_stream_copy_without_changing_pixels_or_audio(
+    tmp_path, monkeypatch
+):
+    import cv2
+    from worker import native_assets, native_chunk, hls_native
+    from scripts.hls_chunk_check import audio_hash
+
+    source = tmp_path / "source.mp4"
+    make_video(source, seconds=0.4, audio=True)
+    args = bench.parser().parse_args(
+        [
+            "--run",
+            "--cold-start",
+            "--source",
+            str(source),
+            "--output",
+            str(tmp_path / "out"),
+            "--duration",
+            "0.2",
+            "--context",
+            "0.2",
+        ]
+    )
+    monkeypatch.setenv("DETECTOR", "yolo")
+    monkeypatch.setenv("MODEL_MANIFEST", "fixed-model")
+    monkeypatch.setattr(bench.vision, "verify_models", lambda p: "fixed")
+    monkeypatch.setattr(hls_native, "validate_source", lambda info: None)
+    inputs = {}
+    for name in ("prior", "alpha", "template", "palette"):
+        p = tmp_path / (name + ".npz")
+        p.write_bytes(name.encode())
+        inputs[name] = p
+    monkeypatch.setattr(native_assets, "prepare_assets", lambda *a, **kw: inputs)
+
+    def shared(source, work, plan, assets, config, source_hash):
+        assert not config["materialize_frames"]
+        (work / "rendered").mkdir(parents=True)
+        report = dict(
+            帧映射=list(range(24)), 原片帧索引=list(range(24)), 帧数=24, 清晰度统计=[]
+        )
+        (work / "rendered/native-report.json").write_text(json.dumps(report))
+        return dict(native=report, stages={}, native_video=str(source))
+
+    monkeypatch.setattr(native_chunk, "process_chunk", shared)
+    phases = StageCache(args.output / "stages")
+    bench.prepare_run(args, phases)
+    info = probe(args.candidate, count=True)
+    video = next(s for s in info["streams"] if s["codec_type"] == "video")
+    assert int(video["nb_read_frames"]) == 12
+    assert audio_hash(source, 0.2) == audio_hash(args.candidate)
+    a, b = cv2.VideoCapture(str(source)), cv2.VideoCapture(str(args.candidate))
+    try:
+        for i in range(12):
+            ok, x = a.read()
+            good, y = b.read()
+            assert ok and good and np.array_equal(x, y)
+        assert not b.read()[0]
+    finally:
+        a.release()
+        b.release()

@@ -15,7 +15,7 @@ def process(work,root,info,mapping,files,scenes,active,settings):
     validated=VerifiedLayers(root/'layers.json',Path(info['detected']))
     missing=capture(video,mapping,root/'frames',files)
     ranges=intervals(active,scenes,len(files),settings.model_fps)
-    vision.inpaint(root,sorted((root/'frames').glob('*.png')),ranges,'propainter',True,condition_overlap=True)
+    vision.inpaint(root,sorted((root/'frames').glob('*.png')),ranges,'propainter',True,roi=False,condition_overlap=True)
     output=blend(video,Path(info['source']),mapping,root/'masks',root/'composite',root/'patched.mp4',validated)
     if audio_hash(video)!=audio_hash(output):raise PipelineError('OUTPUT_INVALID','局部补修改变了音频')
     return output,ranges,missing

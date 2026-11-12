@@ -336,13 +336,25 @@ def prepare_run(args, phases):
     )
     if config["fast"]:
         config["backend"] = args.backend
-    assets = prepare_assets(
-        args.source,
-        args.output / "native-assets",
-        source_hash,
-        prior=args.prior,
-        profile=getattr(args, "asset_manifest", None),
-    )
+    config["materialize_frames"] = False
+    if getattr(args, "v7_inputs", None):
+        from worker.v7_equivalent import fixed_inputs
+
+        measured = time.monotonic()
+        assets = fixed_inputs(
+            args.v7_inputs, source_hash, args.output / "native-assets"
+        )
+        phases.timings["fixed_inputs"] = dict(
+            seconds=time.monotonic() - measured, reused=False
+        )
+    else:
+        assets = prepare_assets(
+            args.source,
+            args.output / "native-assets",
+            source_hash,
+            prior=args.prior,
+            profile=getattr(args, "asset_manifest", None),
+        )
     asset_times = args.output / "native-assets/stages/timings.json"
     if asset_times.exists():
         phases.timings.update(
@@ -381,6 +393,31 @@ def prepare_run(args, phases):
 
     def encode():
         silent = rendered / "video.mp4"
+        if summary.get("native_video"):
+            run(
+                [
+                    "ffmpeg",
+                    "-v",
+                    "error",
+                    "-y",
+                    "-i",
+                    summary["native_video"],
+                    "-map",
+                    "0:v:0",
+                    "-an",
+                    *(
+                        ["-c:v", "copy"]
+                        if config["encoder"] == "libx264"
+                        else encoder_args(config["encoder"], 10)
+                    ),
+                    "-frames:v",
+                    str(plan["end"]),
+                    silent,
+                ],
+                timeout=7200,
+            )
+            mux_core_audio(silent, args.source, rendered / "chunk1.mp4", args.duration)
+            return
         run(
             [
                 "ffmpeg",
@@ -431,6 +468,44 @@ def prepare_run(args, phases):
     return work
 
 
+def mask_equivalence(args):
+    """参考额外成本单列，参考计算不参与修复，也不读取旧检查点。"""
+    from scripts.hls_mask_equivalence import compare as compare_masks
+
+    reference = args.output / "v7-graphic-reference"
+    work = args.output / "work"
+    failure = None
+    try:
+        run(
+            [
+                os.environ["TRACK_PYTHON"],
+                Path(__file__).with_name("hls_v7_mask_reference.py"),
+                "--reference-code",
+                args.v7_reference_code,
+                "--work",
+                reference,
+                "--frames",
+                work / "frames",
+                "--detected",
+                work / "detections.json",
+                "--assets",
+                work / "v7-assets.json",
+            ],
+            timeout=7200,
+        )
+    except Exception as error:
+        failure = dict(
+            错误类型=type(error).__name__, 错误码=getattr(error, "code", None)
+        )
+    report = compare_masks(work, reference, args.output / "mask-equivalence.json")
+    if failure:
+        report.update(通过=False, 参考计算失败=failure)
+        (args.output / "mask-equivalence.json").write_text(
+            json.dumps(report, ensure_ascii=False, indent=2)
+        )
+    return report
+
+
 def assess(args, phases):
     from scripts.hls_chunk_check import audio_hash
 
@@ -443,7 +518,10 @@ def assess(args, phases):
         通过=None,
         目检="未进行",
         公共素材复用=bool(getattr(args, "asset_manifest", None)),
-        冷启动范围="已有公共素材的分块修复"
+        固定七版算法输入=bool(getattr(args, "v7_inputs", None)),
+        冷启动范围="固定七版算法输入下的全部运行阶段重算"
+        if getattr(args, "v7_inputs", None)
+        else "已有公共素材的分块修复"
         if getattr(args, "asset_manifest", None)
         else "含公共素材准备的分块修复",
         闪现闪烁="待结合原片镜头切换逐帧检查",
@@ -454,6 +532,16 @@ def assess(args, phases):
     verification_started = time.monotonic()
     verification_times = {}
     report["核验分步耗时秒"] = verification_times
+    if getattr(args, "v7_reference_code", None) and getattr(args, "_native_run", None):
+        measured = time.monotonic()
+        report["图形逐帧等价性"] = mask_equivalence(args)
+        verification_times["七版图形独立参考与逐帧交并比"] = time.monotonic() - measured
+        if not report["图形逐帧等价性"]["通过"]:
+            report["通过"] = False
+    else:
+        report["图形逐帧等价性"] = dict(
+            通过=None, 说明="未提供独立主分支源码，未执行逐帧检查"
+        )
     candidate_info = media.probe(args.candidate, count=True)
     v = next(s for s in candidate_info["streams"] if s["codec_type"] == "video")
     fps = float(Fraction(v["avg_frame_rate"]))
@@ -546,6 +634,7 @@ def assess(args, phases):
         report["原始品牌残留候选"] = quality["品牌残留候选"]
         report["全画面模型复检"] = quality.get("全画面模型复检")
         report["闪烁指标"] = quality["闪烁指标"]
+        args._candidate_temporal = quality.get("时域核验")
         report["品牌图形独立检查"] = "已执行编码后完整部件复检，仍需目检"
         measured = time.monotonic()
         report["相对七版清晰度"] = relative_clarity(args, audit)
@@ -607,7 +696,9 @@ def assess(args, phases):
 
         measured = time.monotonic()
         report["时域异常对照"] = {
-            name: temporal_candidates(
+            name: getattr(args, "_candidate_temporal", None)
+            if name == "候选" and getattr(args, "_candidate_temporal", None)
+            else temporal_candidates(
                 args.source,
                 path,
                 args.detected,
@@ -665,6 +756,16 @@ def parser():
         help="只评估已有成品；提供检测映射时仍调用检测模型复检，需设备空闲",
     )
     p.add_argument(
+        "--v7-inputs",
+        type=Path,
+        help="七版冻结算法输入清单；只读九项固定输入，不导入运行检查点",
+    )
+    p.add_argument(
+        "--v7-reference-code",
+        type=Path,
+        help="主分支冻结源码目录；本次重新计算图形参考并逐帧核对交并比",
+    )
+    p.add_argument(
         "--source",
         type=Path,
         default=Path("/workspace/dewatermark-data/hls-huangguo/source.mp4"),
@@ -719,22 +820,22 @@ def parser():
     p.add_argument(
         "--sam-state-on-gpu",
         action="store_true",
-        help="将分割状态保留在显卡；单模型串行使用，须核对显存与掩膜一致性",
+        help="历史命令兼容参数；本轮七版等价路径不改变原分割状态设置",
     )
     p.add_argument(
         "--sam-prepare-max-edge",
         type=int,
         default=1024,
-        help="分割准备图像长边；内部模型尺寸不变",
+        help="历史命令兼容参数；本轮按七版原尺寸准备，不采用此参数",
     )
     p.add_argument(
         "--sam-hint-stride",
         type=int,
         default=30,
-        help="关键提示最大间隔，显著运动自动补提示",
+        help="历史命令兼容参数；本轮固定采用七版原提示采样",
     )
     p.add_argument(
-        "--roi-margin", type=int, default=96, help="局部补画区域外扩像素，模型尺度不变"
+        "--roi-margin", type=int, default=96, help="历史命令兼容参数；本轮不启用新增局部裁剪补画"
     )
     p.add_argument(
         "--crop",
@@ -778,6 +879,9 @@ def validate_output(args):
         ):
             raise ValueError("完整冷启动禁止复用旧先验、素材、检测及环境素材清单")
     protected = [args.source, args.baseline]
+    protected += [
+        getattr(args, name, None) for name in ("v7_inputs", "v7_reference_code")
+    ]
     if args.run:
         protected += [
             args.prior,
@@ -839,9 +943,9 @@ def main():
     try:
         if args.run:
             os.environ.update(
-                PROPAINTER_ROI="true",
+                PROPAINTER_ROI="false",
                 PROPAINTER_ROI_MARGIN=str(args.roi_margin),
-                SAM_SPEEDUP="true",
+                SAM_SPEEDUP="false",
                 SAM_STATE_ON_GPU="true" if args.sam_state_on_gpu else "false",
                 SAM_PREPARE_MAX_EDGE=str(args.sam_prepare_max_edge),
                 SAM_HINT_STRIDE=str(args.sam_hint_stride),
@@ -876,7 +980,12 @@ def main():
             report["分步计时"] = phases.timings
             report["本次总耗时秒"] = time.monotonic() - started
             report["分步耗时累计秒"] = sum(
-                v["seconds"] for v in phases.timings.values()
+                v["seconds"]
+                for name, v in phases.timings.items()
+                if name not in ("v7_prepare", "v7_gpu")
+            )
+            report["计时加总口径"] = (
+                "准备及显卡外层总计不重复加总；原生阶段含七版原补修及首次复检；独立参考与最终指标另列"
             )
             report["本次处理耗时秒"] = getattr(args, "_process_wall_seconds", None)
             report["输入与配置指纹"] = getattr(args, "_input_fingerprint", None)

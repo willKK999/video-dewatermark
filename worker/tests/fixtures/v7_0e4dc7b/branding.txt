@@ -1,0 +1,136 @@
+"""主分支0e4dc7b原始函数快照，仅作等价性测试参考。"""
+
+def grow_brand_components(signal, anchors):
+    joined = cv2.morphologyEx(signal, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(joined)
+    components = []
+    for identity, (x, y, w, h, area) in enumerate(stats[1:], 1):
+        scale = max((b[2] - b[0] for b in anchors), default=0)
+        envelope_ok = any(
+            x + w >= b[0] - 0.65 * scale
+            and x <= b[2] + 0.65 * scale
+            and y >= b[1] - 0.65 * scale
+            and y + h <= b[3] + 0.65 * scale
+            for b in anchors
+        )
+        strip_ok = h <= max(w * 6, max((b[3] - b[1] for b in anchors), default=0) * 2)
+        if (
+            area >= 30
+            and min(w, h) >= 3
+            and h <= scale * 0.6
+            and w <= scale * 2
+            and envelope_ok
+            and strip_ok
+        ):
+            components.append(
+                dict(
+                    id=identity,
+                    box=[int(x), int(y), int(x + w), int(y + h)],
+                    area=int(area),
+                )
+            )
+    selected = set()
+    for component in components:
+        a = component["box"]
+        if any(
+            max(0, min(a[2], b[2]) - max(a[0], b[0]))
+            * max(0, min(a[3], b[3]) - max(a[1], b[1]))
+            >= component["area"] * 0.2
+            for b in anchors
+        ):
+            selected.add(component["id"])
+    for _ in range(5):
+        added = set()
+        for c in components:
+            if c["id"] in selected:
+                continue
+            a = c["box"]
+            aw, ah = a[2] - a[0], a[3] - a[1]
+            for d in components:
+                if d["id"] not in selected:
+                    continue
+                b = d["box"]
+                bw, bh = b[2] - b[0], b[3] - b[1]
+                gapx = max(0, max(a[0], b[0]) - min(a[2], b[2]))
+                gapy = max(0, max(a[1], b[1]) - min(a[3], b[3]))
+                if max(ah, bh) > 4 * min(ah, bh):
+                    continue
+                horizontal = (
+                    gapx <= 1.5 * min(ah, bh)
+                    and abs((a[1] + a[3]) - (b[1] + b[3])) / 2 <= max(ah, bh) * 0.65
+                )
+                vertical = (
+                    gapy <= 1.5 * min(ah, bh)
+                    and abs((a[0] + a[2]) - (b[0] + b[2])) / 2 <= max(aw, bw) * 0.65
+                )
+                if horizontal or vertical:
+                    added.add(c["id"])
+                    break
+        if not added:
+            break
+        selected |= added
+    return np.where(np.isin(labels, list(selected)), 255, 0).astype(np.uint8)
+
+def palette_support(image, palette, distance=22):
+    colors = cv2.cvtColor(palette.astype(np.uint8)[None], cv2.COLOR_LAB2BGR)[0]
+    centers = cv2.cvtColor(colors[None], cv2.COLOR_BGR2HSV)[0].astype(np.float32)
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV).astype(np.float32)
+    mask = np.zeros(image.shape[:2], np.uint8)
+    for h, s, v in centers:
+        if s > 90:
+            hue = np.minimum(np.abs(hsv[:, :, 0] - h), 180 - np.abs(hsv[:, :, 0] - h))
+            selected = (hue < 7) & (hsv[:, :, 1] > s * 0.45) & (hsv[:, :, 2] > v * 0.6)
+        elif v > 215:
+            selected = (hsv[:, :, 1] < 45) & (hsv[:, :, 2] > v * 0.85)
+        else:
+            continue
+        mask[selected] = 255
+    colorful = ((hsv[:, :, 1] > 160) & (hsv[:, :, 2] > 90)).astype(np.uint8)
+    n, groups, properties, _ = cv2.connectedComponentsWithStats(colorful)
+    near = cv2.dilate(mask, np.ones((9, 9), np.uint8)) > 0
+    capacity = max(30, np.count_nonzero(mask) * 0.4)
+    for identity in range(1, n):
+        component = groups == identity
+        if (
+            np.count_nonzero(component & near) >= 3
+            and np.count_nonzero(component & (mask == 0)) <= capacity
+        ):
+            mask[component] = 255
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
+    for identity, (x, y, w, h, area) in enumerate(stats[1:], 1):
+        if (
+            area < 12
+            or x == 0
+            or y == 0
+            or x + w == mask.shape[1]
+            or y + h == mask.shape[0]
+        ):
+            mask[labels == identity] = 0
+    return mask
+
+def opaque_brand_ink(image, box, palette):
+    """在自动品牌框内覆盖所有独立前景笔画，不依赖SAM是否把小字分为同一对象。"""
+    from .hls_settings import HLSSettings
+
+    settings = HLSSettings.from_env()
+    colors = cv2.cvtColor(palette.astype(np.uint8)[None], cv2.COLOR_LAB2BGR)[0]
+    centers = cv2.cvtColor(colors[None], cv2.COLOR_BGR2HSV)[0].astype(np.float32)
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV).astype(np.float32)
+    selected = np.zeros(image.shape[:2], np.uint8)
+    for h, s, v in centers:
+        if s > 90:
+            hue = np.minimum(np.abs(hsv[:, :, 0] - h), 180 - np.abs(hsv[:, :, 0] - h))
+            active = (hue < 7) & (hsv[:, :, 1] > s * .45) & (hsv[:, :, 2] > v * .6)
+        elif v > 215:
+            active = (hsv[:, :, 1] < settings.opaque_white_saturation) & (hsv[:, :, 2] > max(settings.opaque_white_min_value, v - settings.opaque_palette_margin))
+        else:
+            continue
+        selected[active] = 255
+    x, y, a, b = map(round, box)
+    pad=round((b-y)*settings.opaque_brand_padding)
+    x,y,a,b=x-pad,y-pad,a+pad,b+pad
+    x, y, a, b = max(0,x), max(0,y), min(image.shape[1],a), min(image.shape[0],b)
+    bounded = np.zeros_like(selected)
+    bounded[y:b,x:a] = selected[y:b,x:a]
+    radius = settings.opaque_ink_radius
+    return cv2.dilate(bounded,cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(2*radius+1,2*radius+1)))

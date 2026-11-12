@@ -119,7 +119,9 @@ def relative_clarity(args, output):
     return report
 
 
-def temporal_candidates(source, result, detected, mapping, duration, output):
+def temporal_candidates(
+    source, result, detected, mapping, duration, output, source_frame_offset=0
+):
     """沿用整集收尾的区域时域异常规则；候选需逐项复核，不等同真实闪烁。"""
     detected = json.loads(detected.read_text())
     indices = json.loads(mapping.read_text())["帧映射"]
@@ -133,14 +135,16 @@ def temporal_candidates(source, result, detected, mapping, duration, output):
         a.release()
         b.release()
         raise ValueError("时域核验需要六十帧源片及三十或六十帧成品")
-    cursor = -1
+    if source_frame_offset:
+        a.set(cv2.CAP_PROP_POS_FRAMES, source_frame_offset)
+    cursor = source_frame_offset - 1
     previous = None
     samples, candidates = [], []
     try:
         for n in range(round(duration * fps)):
             source_index = int(n * source_fps / fps)
             original = None
-            while cursor < source_index:
+            while cursor < source_index + source_frame_offset:
                 ok, original = a.read()
                 if not ok:
                     raise ValueError("时域核验源片帧数不足")

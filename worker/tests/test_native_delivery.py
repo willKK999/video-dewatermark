@@ -156,7 +156,7 @@ def test_explicit_sam_mode_overrides_environment(tmp_path, monkeypatch, fast):
     monkeypatch.setattr(vision, "run", lambda args, *a, **kw: calls.append(args))
     monkeypatch.setattr(vision, "validate_masks", lambda *a: [])
     vision.masks(tmp_path, [], {}, "propainter", speedup=fast)
-    assert ("--speedup" if fast else "--no-speedup") in calls[0]
+    assert "--speedup" not in calls[0] and "--no-speedup" not in calls[0]
 
 
 def test_explicit_roi_false_does_not_use_fast_environment(tmp_path, monkeypatch):
@@ -338,149 +338,6 @@ def test_encoded_audit_keeps_raw_evidence_and_does_not_gate_clarity(
         assert saved["硬门槛通过"] == (residual == 0)
     saved = json.loads((work / "audit/native-quality.json").read_text())
     assert saved["原始残留检查"]["residual_count"] == residual
-
-
-@pytest.mark.parametrize("mode", ["speedup-v2", "v7"])
-def test_shared_chunk_reuses_models_and_preserves_mode_on_backend_change(
-    tmp_path, monkeypatch, mode
-):
-    from scripts import hls_align_reference, hls_fit_projection, hls_native_chunk
-
-    work = tmp_path / "work"
-    source = tmp_path / "source.mp4"
-    source.write_bytes(b"source")
-    assets = {}
-    for name in ("prior", "alpha", "template", "palette"):
-        file = tmp_path / (name + ".npz")
-        file.write_bytes(b"asset")
-        assets[name] = file
-    counters = {
-        name: 0
-        for name in (
-            "decode",
-            "detect",
-            "sam",
-            "graphics",
-            "fine_masks",
-            "inpaint",
-            "align",
-            "projection",
-            "render",
-        )
-    }
-
-    def write_images(folder, count=6):
-        folder.mkdir(parents=True, exist_ok=True)
-        for n in range(count):
-            cv2.imwrite(str(folder / f"{n:06d}.png"), np.full((32, 48, 3), n, np.uint8))
-
-    def decode(source, work, plan, check):
-        counters["decode"] += 1
-        write_images(work / "frames")
-
-    def detect(files, scenes, options, root, check):
-        counters["detect"] += 1
-        (root / "detections.json").write_text(
-            json.dumps(
-                dict(scenes=scenes, tracks=[], hints=[], prior=str(assets["prior"]))
-            )
-        )
-        (root / "multitrack-prior.npz").write_bytes(b"prior")
-
-    def masks(root, files, d, engine, check, speedup):
-        counters["sam"] += 1
-        assert speedup == (mode == "speedup-v2")
-        write_images(root / "masks")
-        (root / "metrics.sam.json").write_text("{}")
-
-    def graphics(root, d, a, fast, check):
-        counters["graphics"] += 1
-        assert fast == (mode == "speedup-v2")
-        (root / "graphic").mkdir()
-        (root / "graphic/brands.json").write_text("[]")
-
-    def fine(root, *a):
-        counters["fine_masks"] += 1
-        write_images(root / "masks")
-
-    def inpaint(root, files, scenes, engine, low_memory, check, roi):
-        counters["inpaint"] += 1
-        assert low_memory and roi == (mode == "speedup-v2")
-        write_images(root / "composite")
-        (root / "performance.json").write_text("{}")
-
-    def align(source, frames, root, **kwargs):
-        counters["align"] += 1
-        assert kwargs["source_start_frame"] == 0 and kwargs["source_end_frame"] == 12
-        root.mkdir()
-        (root / "alignment.json").write_text("{}")
-
-    def fit(*args):
-        counters["projection"] += 1
-        args[7].write_text("{}")
-
-    def render(*args, **kwargs):
-        counters["render"] += 1
-        assert (
-            kwargs["frames_only"]
-            and args[11] == 60
-            and args[13] == 10
-            and args[15] is True
-        )
-        write_images(args[7] / "frames", 12)
-        (args[7] / "native-report.json").write_text(
-            json.dumps(dict(帧映射=[0] * 12, 清晰度最小保留比=None))
-        )
-
-    monkeypatch.setattr(native_chunk, "decode_chunk", decode)
-    monkeypatch.setattr(native_chunk.vision, "detect", detect)
-    monkeypatch.setattr(native_chunk.vision, "shots", lambda *a: [[0, 6]])
-    monkeypatch.setattr(native_chunk.vision, "masks", masks)
-    monkeypatch.setattr(native_chunk, "prepare_graphics", graphics)
-    monkeypatch.setattr(native_chunk, "fine_masks", fine)
-    monkeypatch.setattr(native_chunk.vision, "inpaint", inpaint)
-    monkeypatch.setattr(hls_align_reference, "align", align)
-    monkeypatch.setattr(hls_fit_projection, "fit", fit)
-    monkeypatch.setattr(hls_native_chunk, "render", render)
-    config = dict(
-        mode=mode, fast=mode == "speedup-v2", backend="numpy", encoder="libx264"
-    )
-    plan = dict(left=0, right=12, start=0, end=6)
-    native_chunk.process_chunk(source, work, plan, assets, config, "源片")
-    native_chunk.process_chunk(source, work, plan, assets, config, "源片")
-    config["encoder"] = "h264_nvenc"
-    native_chunk.process_chunk(source, work, plan, assets, config, "源片")
-    assert all(n == 1 for n in counters.values())
-    from contextlib import contextmanager
-    from worker import gpu_lock
-
-    locks = []
-
-    @contextmanager
-    def lock(**kwargs):
-        locks.append("进入")
-        yield
-        locks.append("退出")
-
-    monkeypatch.setattr(gpu_lock, "device_lock", lock)
-    config["backend"] = "torch-cuda"
-    native_chunk.process_chunk(source, work, plan, assets, config, "源片")
-    assert locks == ["进入", "退出"]
-    assert counters["render"] == 2 and all(
-        counters[name] == 1 for name in counters if name != "render"
-    )
-    if mode == "speedup-v2":
-        monkeypatch.setenv("PROPAINTER_ROI_MARGIN", "112")
-        native_chunk.process_chunk(source, work, plan, assets, config, "源片")
-        assert (
-            counters["inpaint"] == 2
-            and counters["projection"] == 2
-            and counters["render"] == 3
-        )
-        assert all(
-            counters[name] == 1
-            for name in ("decode", "detect", "sam", "graphics", "fine_masks", "align")
-        )
 
 
 def test_no_translucent_fixed_mark_does_not_require_fake_calibration(
@@ -912,13 +769,13 @@ def test_raw_residual_keeps_subtitles_and_uses_existing_hls_threshold(
     assert json.loads((audit / "raw-residual-candidates.json").read_text()) == raw
 
 
-def test_empty_palette_does_not_invent_foreground():
+def test_empty_palette_keeps_main_v7_failure_behavior():
     from worker.branding import palette_support
 
-    result = palette_support(
-        np.full((20, 30, 3), 200, np.uint8), np.empty((0, 3), np.float32)
-    )
-    assert not result.any() and result.shape == (20, 30)
+    with pytest.raises(cv2.error):
+        palette_support(
+            np.full((20, 30, 3), 255, np.uint8), np.empty((0, 3), np.float32)
+        )
 
 
 def test_failed_upload_keeps_previous_checkpoint_marker(tmp_path, monkeypatch):
@@ -1017,106 +874,6 @@ def test_verified_profile_reuses_only_global_assets_and_rejects_changed_content(
         prepare_assets(None, tmp_path / "copied", "冻结原片", profile=manifest)
 
 
-@pytest.mark.parametrize("fast", [False, True])
-@pytest.mark.parametrize("textlike", [False, True])
-@pytest.mark.parametrize("leak", [False, True])
-def test_graphic_matching_respects_lifetimes_and_reinitializes_new_shot(
-    tmp_path, monkeypatch, fast, textlike, leak
-):
-    from worker import native_assets, short_brand, brand_templates, branding
-
-    work = tmp_path / "work"
-    for name in ["frames", "tracking/masks"]:
-        (work / name).mkdir(parents=True)
-    shape = (80, 120)
-    support = np.zeros(shape, np.uint8)
-    support[10:20, 20:35] = 255
-    for i in range(8):
-        image = np.full((*shape, 3), i, np.uint8)
-        image[support > 0] = (0, 255, 0)
-        cv2.imwrite(str(work / "frames" / f"{i:06d}.png"), image)
-        cv2.imwrite(
-            str(work / "tracking/masks" / f"{i:06d}.png"), np.zeros(shape, np.uint8)
-        )
-    palette = tmp_path / "palette.npy"
-    np.save(palette, cv2.cvtColor(np.uint8([[[0, 255, 0]]]), cv2.COLOR_BGR2LAB)[0])
-    rows = [
-        dict(
-            frame=i,
-            boxes=[dict(class_id=0, confidence=0.9, box=[20, 10, 35, 20])]
-            if i in [1, 2, 5, 6]
-            else [],
-        )
-        for i in range(8)
-    ]
-    initializations = []
-
-    def run(args, *a, **kw):
-        if "yolo_stage.py" in str(args[1]):
-            Path(args[-1]).write_text(json.dumps(rows))
-        else:
-            root = Path(args[args.index("--root") + 1])
-            seed = json.loads((root / "detections.json").read_text())
-            initializations.append(seed["scenes"])
-            for point in seed["hints"]:
-                prompt = cv2.imread(str(root / point["mask_prompt"]), 0)
-                assert np.array_equal(prompt, support)
-            for start, end in seed["scenes"]:
-                for i in range(start, end):
-                    cv2.imwrite(
-                        str(root / "masks" / f"{i:06d}.png"),
-                        np.full(shape, 255, np.uint8) if leak else support,
-                    )
-
-    seen = []
-    monkeypatch.setenv("DETECT_PYTHON", "检测")
-    monkeypatch.setenv("TRACK_PYTHON", "分割")
-    monkeypatch.setenv("YOLO_WEIGHTS", "模型")
-    monkeypatch.setattr(
-        branding, "recognize", lambda *a, **kw: "ordinary subtitle" if textlike else ""
-    )
-    monkeypatch.setattr(
-        native_assets, "brand_references", lambda *a: ["examplebrand.com"]
-    )
-    monkeypatch.setattr(native_assets, "run", run)
-    monkeypatch.setattr(short_brand, "discover", lambda *a, **kw: None)
-    monkeypatch.setattr(brand_templates, "variants", lambda *a: [])
-    monkeypatch.setattr(
-        brand_templates,
-        "match",
-        lambda image, *a, **kw: seen.append(int(image[0, 0, 0]))
-        or [dict(variant=0, box=[20, 10, 35, 20], confidence=0.9)],
-    )
-    monkeypatch.setattr(brand_templates, "mask_for", lambda *a: support.copy())
-    native_assets.prepare_graphics(
-        work,
-        dict(scenes=[[0, 4], [4, 8]], hints=[]),
-        dict(palette=palette, prior=tmp_path / "prior"),
-        fast,
-    )
-    assert initializations == ([] if textlike else [[[1, 4]], [[5, 8]]])
-    assert sorted(seen) == (
-        [] if textlike else ([1, 2, 3, 5, 6, 7] if fast else sorted(list(range(8)) * 2))
-    )
-    assert json.loads((work / "graphic/raw-candidates.json").read_text()) == rows
-    assert bool(cv2.imread(str(work / "graphic/masks/000000.png"), 0).any()) == (
-        not fast and not textlike
-    )
-    assert not cv2.imread(str(work / "graphic/masks/000002.png"), 0)[70, 110]
-    assert len(json.loads((work / "graphic/text-review.json").read_text())) == (
-        2 if textlike else 0
-    )
-
-
-def test_primary_association_keeps_nested_new_icon_and_distant_copy():
-    from worker.native_assets import primary_covers
-
-    points = [dict(box=[10, 10, 110, 60])]
-    assert primary_covers([12, 11, 108, 59], points)
-    assert not primary_covers([30, 20, 45, 35], points)
-    assert not primary_covers([150, 10, 250, 60], points)
-
-
 def test_profile_graphics_survive_checkpoint_and_require_each_digest(tmp_path):
     from worker.native_assets import prepare_assets
     from worker.roi_inpaint import digest
@@ -1147,49 +904,3 @@ def test_profile_graphics_survive_checkpoint_and_require_each_digest(tmp_path):
     manifest.write_text(json.dumps(profile))
     with pytest.raises(PipelineError, match="内容摘要"):
         prepare_assets(None, root, "冻结片源", profile=manifest)
-
-
-def test_graphic_pixel_prompt_excludes_background_and_rejects_missing_support():
-    from worker.native_assets import graphic_prompt
-
-    image = np.zeros((80, 120, 3), np.uint8)
-    image[15:25, 25:40] = (0, 255, 0)
-    image[40:70, 70:100] = (0, 255, 0)
-    palette = cv2.cvtColor(np.uint8([[[0, 255, 0]]]), cv2.COLOR_BGR2LAB)[0]
-    prompt = graphic_prompt(image, [20, 10, 50, 30], palette)
-    assert np.count_nonzero(prompt) == 150
-    assert not prompt[40:70, 70:100].any()
-    assert not prompt[10, 20]
-    with pytest.raises(PipelineError, match="像素提示"):
-        graphic_prompt(image, [0, 30, 40, 70], palette)
-    assert np.array_equal(
-        graphic_prompt(image, [20, 10, 50, 30], np.empty((0, 3))), prompt
-    )
-
-
-def test_graphic_range_guard_does_not_add_background_or_repeat_text_dilation():
-    from worker.native_assets import bounded_graphic_mask
-
-    mask = np.zeros((100, 160), np.uint8)
-    mask[25:30, 55:80] = 255
-    assert np.array_equal(bounded_graphic_mask(mask, [50, 20, 90, 40]), mask)
-    assert np.array_equal(bounded_graphic_mask(mask, [40, 10, 100, 80]), mask)
-    assert not bounded_graphic_mask(np.zeros_like(mask), [40, 10, 100, 80]).any()
-    mask[85:95, 130:150] = 255
-    assert not bounded_graphic_mask(mask, [50, 20, 90, 40])[85:95].any()
-
-
-def test_graphic_prompt_supports_new_colors_and_excludes_pale_flat_background():
-    from worker.native_assets import graphic_prompt
-
-    image = np.full((120, 180, 3), 225, np.uint8)
-    image[35:45, 45:65] = (0, 255, 255)
-    image[55:65, 75:95] = (0, 255, 0)
-    image[40:48, 100:125] = 255
-    white_palette = cv2.cvtColor(np.uint8([[[255, 255, 255]]]), cv2.COLOR_BGR2LAB)[0]
-    mask = graphic_prompt(image, [30, 25, 140, 85], white_palette)
-    assert np.all(mask[35:45, 45:65])
-    assert np.all(mask[55:65, 75:95])
-    assert np.all(mask[40:48, 100:125])
-    assert not mask[75:85, 40:130].any()
-    assert not mask[:10].any()

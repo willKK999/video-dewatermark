@@ -87,7 +87,7 @@ def graphic_masks(files, assets, root, check):
     write_json(root / "graphics/detections.json", dict(scenes=intervals))
 
 
-def prepare_block(full, work, plan, assets, check):
+def prepare_block(full, work, plan, assets, check, timings=None):
     started = time.monotonic()
     work.mkdir(parents=True, exist_ok=True)
     descriptor = work / "prepared.json"
@@ -132,7 +132,7 @@ def prepare_block(full, work, plan, assets, check):
     )
     for name in ["frames", "reference"]:
         (work / name).mkdir(exist_ok=True)
-    count = plan["right"] - plan["left"]
+    count = round(plan["right"] - plan["left"])
     run(
         [
             "ffmpeg",
@@ -170,17 +170,25 @@ def prepare_block(full, work, plan, assets, check):
     files = sorted((work / "frames").glob("*.png"))
     if len(files) != count:
         raise PipelineError("OUTPUT_INVALID", "处理块规范化帧数不一致")
+    if timings is not None:
+        timings["decode"] = time.monotonic() - started
     from . import vision
     from .multitrack import make_tracks
 
+    measured = time.monotonic()
     detected = make_tracks(
         files, vision.shots(files, check), Path(assets["prior"]), work, check
     )
+    if timings is not None:
+        timings["detect"] = time.monotonic() - measured
     write_json(
         work / "reference/alignment.json",
         {"帧对应": [{"source_frame": i * 2} for i in range(count)]},
     )
+    measured = time.monotonic()
     graphic_masks(files, assets, work, check)
+    if timings is not None:
+        timings["graphics_template"] = time.monotonic() - measured
     info = dict(
         reused_v7=False,
         coarse=str(work / "fine"),
@@ -197,15 +205,15 @@ def prepare_block(full, work, plan, assets, check):
     return info
 
 
-def gpu_block(work, assets, info, engine, stage, check):
+def gpu_block(work, assets, info, engine, stage, check, timings=None):
     from .gpu_lock import device_lock
 
     work.mkdir(parents=True, exist_ok=True)
     with device_lock(work / "gpu-stage.lock", check):
-        return _gpu_block(work, assets, info, engine, stage, check)
+        return _gpu_block(work, assets, info, engine, stage, check, timings)
 
 
-def _gpu_block(work, assets, info, engine, stage, check):
+def _gpu_block(work, assets, info, engine, stage, check, timings=None):
     marker = work / "gpu.json"
     if marker.exists():
         return json.loads(marker.read_text())
@@ -220,6 +228,7 @@ def _gpu_block(work, assets, info, engine, stage, check):
     d = json.loads(Path(info["detected"]).read_text())
     started = time.monotonic()
     stage("detect")
+    measured = time.monotonic()
     if not (work / "all-yolo.json").exists():
         run(
             [
@@ -234,18 +243,27 @@ def _gpu_block(work, assets, info, engine, stage, check):
             check,
             timeout=1800,
         )
+    if timings is not None:
+        timings["detect_candidates"] = time.monotonic() - measured
     stage("mask")
+    measured = time.monotonic()
     if not (work / "sam-complete.json").exists():
         # SAM 对每个镜头及目标生命周期独立初始化，已有多轨迹不会阻止新增目标。
         if (work / "masks").exists():
             shutil.rmtree(work / "masks")
         vision.masks(work, files, d, engine, check)
         write_json(work / "sam-complete.json", dict(完成=True))
+    if timings is not None:
+        timings["sam"] = time.monotonic() - measured
     from .colour_tracks import complete as complete_colour
     from .hls_layers import track_bins, write_manifest
     from .hls_repair import intervals
 
+    measured = time.monotonic()
     colour_tracking = complete_colour(work, assets, d, check)
+    if timings is not None:
+        timings["graphics_sam"] = time.monotonic() - measured
+    measured = time.monotonic()
     fine = work / "fine"
     if (
         fine.exists()
@@ -303,6 +321,9 @@ def _gpu_block(work, assets, info, engine, stage, check):
                         mask |= part["mask"]
                 cv2.imwrite(str(item / "masks" / file.name), mask)
     stage("inpaint")
+    if timings is not None:
+        timings["fine_masks"] = time.monotonic() - measured
+    measured = time.monotonic()
     performance_paths = []
 
     def apply_layer(target, source_frames, mask_dir, short_context=False):
@@ -336,6 +357,7 @@ def _gpu_block(work, assets, info, engine, stage, check):
                     engine,
                     True,
                     check,
+                    roi=False,
                 )
             else:
                 (target / "composite").mkdir()
@@ -372,6 +394,8 @@ def _gpu_block(work, assets, info, engine, stage, check):
         union_max = max(union_max, float(np.count_nonzero(mask) / mask.size))
         cv2.imwrite(str(merged / "masks" / file.name), mask)
     write_manifest(merged, Path(info["detected"]), layer_dirs, files)
+    if timings is not None:
+        timings["inpaint"] = time.monotonic() - measured
     info["coarse"] = str(merged)
     write_json(work / "prepared.json", info)
     stats = dict(
@@ -392,14 +416,14 @@ def _gpu_block(work, assets, info, engine, stage, check):
     return stats
 
 
-def native_block(work, assets_path):
+def native_block(work, assets_path, backend="numpy"):
     from .gpu_lock import device_lock
 
     with device_lock(work / "native-stage.lock"):
-        return _native_block(work, assets_path)
+        return _native_block(work, assets_path, backend)
 
 
-def _native_block(work, assets_path):
+def _native_block(work, assets_path, backend="numpy"):
     """独立进程运行，避免多块光流缓存叠加常驻；参数与 v7 相同。"""
     cv2.setNumThreads(2)
     from scripts.hls_native_chunk import render
@@ -426,7 +450,8 @@ def _native_block(work, assets_path):
             60,
             settings.detail_sigma,
             settings.video_crf,
-            True,
+            final_recompose=True,
+            backend=backend,
             layer_manifest=(
                 (Path(info["coarse"]) / "layers.json")
                 if (Path(info["coarse"]) / "layers.json").exists()
@@ -478,7 +503,7 @@ def _native_block(work, assets_path):
     return report
 
 
-def verify_block(work, assets, info):
+def verify_block(work, assets, info, source_frame_offset=0, result_path=None):
     from scripts.hls_native_verify import remap_references
     from scripts.hls_brand_verify import verify as brand_verify
     from scripts.hls_detail_verify import verify as detail_verify
@@ -488,7 +513,7 @@ def verify_block(work, assets, info):
     native = work / "native"
     report_path = native / "native-report.json"
     metadata = json.loads(report_path.read_text())
-    result = native / "chunk1.mp4"
+    result = Path(result_path) if result_path is not None else native / "chunk1.mp4"
     audit = work / "audit"
     audit.mkdir(exist_ok=True)
     encoded = audit / "composite"
@@ -544,6 +569,7 @@ def verify_block(work, assets, info):
             Path(info["graphics"]),
             audit / "clarity.json",
             occluder_roots=[Path(info["color"]), Path(info["variant"]), work / "opaque-panels"],
+            source_frame_offset=source_frame_offset,
         )
     quality = json.loads((audit / "quality.json").read_text())
     brand = json.loads((audit / "brand.json").read_text())

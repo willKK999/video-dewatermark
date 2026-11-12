@@ -264,13 +264,7 @@ def masks(root, files, detections, engine, check=lambda: None, speedup=None):
                 str(Path(__file__).with_name("sam_stage.py")),
                 "--root",
                 root,
-                *(
-                    ["--speedup"]
-                    if speedup is True
-                    else ["--no-speedup"]
-                    if speedup is False
-                    else []
-                ),
+
             ],
             check,
         )

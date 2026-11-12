@@ -3,7 +3,7 @@
 import argparse, json, time, subprocess, math
 from pathlib import Path
 from fractions import Fraction
-from functools import lru_cache
+from functools import lru_cache, wraps
 import cv2, numpy as np
 from worker.fine_masks import Supports
 from worker.matte import (
@@ -23,6 +23,22 @@ def source_frame_for_output(frame, source_fps, output_fps):
     return math.floor(frame * source_fps / output_fps)
 
 
+def serialized_cuda_render(operation):
+    """只在合成期间持有显卡锁，后续七版补修仍可正常调用模型。"""
+
+    @wraps(operation)
+    def execute(*args, **kwargs):
+        if kwargs.get("backend", "numpy") == "torch-cuda":
+            from worker.gpu_lock import device_lock
+
+            with device_lock(check=kwargs.get("check")):
+                return operation(*args, **kwargs)
+        return operation(*args, **kwargs)
+
+    return execute
+
+
+@serialized_cuda_render
 def render(
     source,
     coarse,
@@ -38,14 +54,15 @@ def render(
     output_fps=None,
     detail_sigma=1.2,
     video_crf=16,
+    final_recompose=False,
+    layer_manifest=None,
+    *,
     backend="numpy",
     fused_detail=False,
     encoder_name="libx264",
     frames_only=False,
     source_start_frame=0,
     check=lambda: None,
-    final_recompose=False,
-    layer_manifest=None,
 ):
     if not 0 < duration <= 30 or source_start_frame < 0:
         raise ValueError("原生块必须为三十秒以内且起始帧非负")
@@ -188,6 +205,7 @@ def render(
             check()
             source_indices.append(source_index)
             frame_started = time.monotonic()
+            frame_detail_seconds = 0.0
             small = cv2.resize(original, (mw, mh))
             nominal = (
                 int(np.argmin(np.abs(source_positions - source_index)))
@@ -276,8 +294,9 @@ def render(
                 trusted = reference_valid & (occupied > 0)
                 result[trusted] = base[trusted]
             if final_recompose and templates and np.any(faint_union):
+                detail_started = time.monotonic()
                 # v7 的第二遍联合纹理合成；在同一原生帧上完成，免去中间有损编码。
-                painted = projected_texture_composite(
+                painted = projector(
                     original,
                     result,
                     faint_union,
@@ -286,13 +305,17 @@ def render(
                     detail_sigma=detail_sigma,
                 )
                 result[faint_union > 0] = painted[faint_union > 0]
+                frame_detail_seconds = time.monotonic() - detail_started
+                timings["detail"] += frame_detail_seconds
             area = float(np.count_nonzero(occupied) / occupied.size)
             max_area = max(max_area, area)
             if layer_proof:
                 layer_proof.validate(index, occupied)
             elif area > 0.2:
                 raise ValueError("联合掩膜超过20%且缺少逐层保护与来源证明")
-            timings["composite"] += time.monotonic() - frame_started
+            timings["composite"] += (
+                time.monotonic() - frame_started - frame_detail_seconds
+            )
             if (
                 fused_detail
                 and not final_recompose
@@ -385,6 +408,7 @@ def render(
         分步耗时秒=timings,
         合成后端=backend,
         内存连续细节融合=fused_detail,
+        七版原细节重合成=final_recompose,
         编码器=None if frames_only else encoder_name,
         清晰度仅记录=True,
         低于零点七的样本=[
@@ -448,6 +472,11 @@ def main():
     p.add_argument("--detail-sigma", type=float, default=1.2)
     p.add_argument("--crf", type=int, default=16)
     p.add_argument(
+        "--final-recompose",
+        action="store_true",
+        help="执行主分支七版原始第二遍细节合成",
+    )
+    p.add_argument(
         "--backend",
         choices=["numpy", "torch-cpu", "torch-cuda"],
         default="numpy",
@@ -482,9 +511,10 @@ def main():
         a.output_fps,
         a.detail_sigma,
         a.crf,
-        a.backend,
-        a.fused_detail,
-        a.encoder,
+        final_recompose=a.final_recompose,
+        backend=a.backend,
+        fused_detail=a.fused_detail,
+        encoder_name=a.encoder,
     )
 
 

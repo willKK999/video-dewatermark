@@ -1,0 +1,42 @@
+"""主分支0e4dc7b原始函数快照，仅作等价性测试参考。"""
+
+def graphic_masks(files, assets, root, check):
+    """位置由完整图案多尺度匹配产生；没有影片名称、坐标或人工框。"""
+    from .brand_templates import variants, match, mask_for
+
+    color = cv2.imread(assets["color_seed_image"])
+    color_mask = cv2.imread(assets["color_seed_mask"], 0)
+    color_bank = variants(
+        color, color_mask, [0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.75, 1.0]
+    )
+    white = cv2.imread(assets["variant_seed_image"])
+    white_mask = cv2.imread(assets["variant_seed_mask"], 0)
+    white_bank = variants(white, white_mask, [0.95, 1, 1.05])
+    for name in ["color", "variant", "graphics"]:
+        (root / name / "masks").mkdir(parents=True, exist_ok=True)
+    for name in ["seed-image.png", "seed-mask.png"]:
+        shutil.copyfile(
+            assets["variant_" + name.replace("-", "_").replace(".png", "")],
+            root / "variant" / name,
+        )
+    records, intervals = [], []
+    for index, file in enumerate(files):
+        check()
+        image = cv2.imread(str(file))
+        c = match(image, color_bank, 0.55, 2)
+        v = match(image, white_bank, 0.5, 2)
+        cm = mask_for(image.shape[:2], color_bank, c)
+        vm = mask_for(image.shape[:2], white_bank, v)
+        cv2.imwrite(str(root / "color/masks" / file.name), cm)
+        cv2.imwrite(str(root / "variant/masks" / file.name), vm)
+        cv2.imwrite(str(root / "graphics/masks" / file.name), cm | vm)
+        if c:
+            if intervals and intervals[-1][1] == index:
+                intervals[-1][1] += 1
+            else:
+                intervals.append([index, index + 1])
+        records.append(dict(frame=index, matches=v, color_matches=c))
+    write_json(root / "variant/tracks.json", dict(frames=records))
+    # 固定标识的显隐判定只在彩色开场图案期间启用，不因白色水印全片存在而错误关掉固定轨迹。
+    write_json(root / "color/detections.json", dict(scenes=intervals))
+    write_json(root / "graphics/detections.json", dict(scenes=intervals))
