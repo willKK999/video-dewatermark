@@ -546,7 +546,7 @@ def test_real_native_hls_delivery_retries_only_failed_block_and_preserves_audio(
     second = tmp_path / "attempt-2"
     second.mkdir()
     output, meta, _ = hls.execute_hls("index.m3u8", second, *args)
-    assert calls == [0, 24, 24] and len(asset_calls) == 1 and audits == [0, 24]
+    assert calls == [0, 24, 24] and len(asset_calls) == 2 and audits == [0, 24]
     metrics = json.loads((second / "metrics-hls.json").read_text())
     assert [c["reused"] for c in metrics["chunks"]] == [True, False]
     assert meta["fps"] == 60 and (meta["width"], meta["height"]) == (1920, 1080)
@@ -643,67 +643,21 @@ def test_all_candidate_mode_keeps_each_raw_box_and_original_threshold(
     assert all(p["conf"] == 0.35 for p in calls)
 
 
-def test_asset_preparation_has_verified_cache_and_rejects_short_consensus(
+def test_asset_preparation_delegates_to_original_recipe_without_old_inputs(
     tmp_path, monkeypatch
 ):
-    from worker import native_assets
-    from scripts import hls_template
+    from worker import native_assets, v7_rebuild
 
-    source = tmp_path / "source.mp4"
-    source.write_bytes(b"source")
-    prior = tmp_path / "prior.npz"
-    prior.write_bytes(b"prior")
     calls = []
-
-    def metadata(*args, **kwargs):
-        return {"format": {"duration": "20"}}
-
-    monkeypatch.setattr(hls_native.media, "probe", metadata)
-
-    def run_samples(args, *a, **kw):
-        calls.append("sample")
-        for n in range(20):
-            cv2.imwrite(
-                str(Path(args[-1]).parent / f"{n:06d}.jpg"),
-                np.full((30, 50, 3), n, np.uint8),
-            )
-
-    monkeypatch.setattr(native_assets, "run", run_samples)
-    mask = np.zeros((30, 50), np.uint8)
-    mask[2:6, 3:10] = 255
+    monkeypatch.delenv("HLS_V7_ASSETS", raising=False)
     monkeypatch.setattr(
-        native_assets,
-        "load_prior",
-        lambda path: (mask.astype(np.float32), mask, [dict(mask=mask)], [], {}),
+        v7_rebuild, "rebuild", lambda *a: calls.append(a) or {"本次": True}
     )
-    monkeypatch.setattr(
-        native_assets, "fit_overlay", lambda *a: (np.zeros_like(mask), None)
+    result = native_assets.prepare_assets(
+        tmp_path / "source.mp4", tmp_path / "assets", "原片摘要"
     )
-    monkeypatch.setattr(
-        native_assets, "learn_palette", lambda *a: np.zeros((1, 3), np.float32)
-    )
-    monkeypatch.setattr(
-        hls_template,
-        "build",
-        lambda files, out, sigma: (
-            calls.append("template"),
-            np.savez(out, template=mask),
-        ),
-    )
-    root = tmp_path / "assets"
-    native_assets.prepare_assets(source, root, "冻结源", prior=prior)
-    native_assets.prepare_assets(source, root, "冻结源", prior=prior)
-    assert calls == ["sample", "template"]
-    (root / "template.npz").write_bytes(b"damaged")
-    native_assets.prepare_assets(source, root, "冻结源", prior=prior)
-    assert calls == ["sample", "template", "template"]
-    monkeypatch.setattr(
-        hls_native.media, "probe", lambda *a, **kw: {"format": {"duration": "10"}}
-    )
-    with pytest.raises(PipelineError, match="十五"):
-        native_assets.prepare_assets(
-            source, tmp_path / "short-assets", "另一个源", prior=prior
-        )
+    assert result == {"本次": True} and len(calls) == 1
+    assert calls[0][:3] == (tmp_path / "source.mp4", tmp_path / "assets", "原片摘要")
 
 
 def test_raw_residual_keeps_subtitles_and_uses_existing_hls_threshold(
@@ -849,58 +803,18 @@ def test_native_export_rejects_report_path_escape(tmp_path):
     assert not (tmp_path.parent / "outside.mp4").exists()
 
 
-def test_verified_profile_reuses_only_global_assets_and_rejects_changed_content(
-    tmp_path,
+@pytest.mark.parametrize("kind", ["prior", "profile", "environment"])
+def test_frozen_material_is_never_accepted_as_processing_input(
+    tmp_path, monkeypatch, kind
 ):
     from worker.native_assets import prepare_assets
-    from worker.roi_inpaint import digest
 
-    profile = dict(method="v7", source_sha256="冻结原片", sha256={})
-    for name in ("prior", "alpha", "template", "palette", "projection"):
-        path = tmp_path / (name + ".npz")
-        path.write_bytes(name.encode())
-        profile[name] = str(path)
-        profile["sha256"][name] = digest(path)
-    manifest = tmp_path / "assets.json"
-    manifest.write_text(json.dumps(profile))
-    assets = prepare_assets(None, tmp_path / "copied", "冻结原片", profile=manifest)
-    assert set(assets) == {"prior", "alpha", "template", "palette", "projection"}
-    assert all(p.parent == tmp_path / "copied" for p in assets.values())
-    assert hls_native.assets_from(tmp_path / "copied") == assets
-    with pytest.raises(PipelineError, match="不一致"):
-        prepare_assets(None, tmp_path / "bad", "不同原片", profile=manifest)
-    Path(profile["alpha"]).write_bytes(b"changed")
-    with pytest.raises(PipelineError, match="摘要"):
-        prepare_assets(None, tmp_path / "copied", "冻结原片", profile=manifest)
-
-
-def test_profile_graphics_survive_checkpoint_and_require_each_digest(tmp_path):
-    from worker.native_assets import prepare_assets
-    from worker.roi_inpaint import digest
-
-    names = (
-        "prior",
-        "alpha",
-        "template",
-        "palette",
-        "projection",
-        "color_seed_image",
-        "color_seed_mask",
-        "variant_seed_image",
-        "variant_seed_mask",
-    )
-    profile = dict(method="v7", source_sha256="冻结片源", sha256={})
-    for name in names:
-        path = tmp_path / (name + ".png" if "seed" in name else name + ".npz")
-        path.write_bytes(name.encode())
-        profile[name] = str(path)
-        profile["sha256"][name] = digest(path)
-    manifest = tmp_path / "manifest.json"
-    manifest.write_text(json.dumps(profile))
-    root = tmp_path / "assets"
-    result = prepare_assets(None, root, "冻结片源", profile=manifest)
-    assert hls_native.assets_from(root) == result
-    profile["sha256"].pop("color_seed_mask")
-    manifest.write_text(json.dumps(profile))
-    with pytest.raises(PipelineError, match="内容摘要"):
-        prepare_assets(None, root, "冻结片源", profile=manifest)
+    monkeypatch.delenv("HLS_V7_ASSETS", raising=False)
+    kwargs = {}
+    if kind == "environment":
+        monkeypatch.setenv("HLS_V7_ASSETS", str(tmp_path / "must-not-read.json"))
+    else:
+        kwargs[kind] = tmp_path / "must-not-read.json"
+    with pytest.raises(PipelineError, match="禁止"):
+        prepare_assets(None, tmp_path / "assets", "原片摘要", **kwargs)
+    assert not (tmp_path / "assets").exists()

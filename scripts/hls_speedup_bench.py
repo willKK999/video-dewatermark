@@ -328,6 +328,7 @@ def prepare_run(args, phases):
     from worker.roi_inpaint import digest
 
     source_hash = digest(args.source)
+    args._source_hash = source_hash
     config = configuration(
         dict(
             hls_native_path=getattr(args, "path", "speedup-v2"),
@@ -337,24 +338,13 @@ def prepare_run(args, phases):
     if config["fast"]:
         config["backend"] = args.backend
     config["materialize_frames"] = False
-    if getattr(args, "v7_inputs", None):
-        from worker.v7_equivalent import fixed_inputs
-
-        measured = time.monotonic()
-        assets = fixed_inputs(
-            args.v7_inputs, source_hash, args.output / "native-assets"
-        )
-        phases.timings["fixed_inputs"] = dict(
-            seconds=time.monotonic() - measured, reused=False
-        )
-    else:
-        assets = prepare_assets(
-            args.source,
-            args.output / "native-assets",
-            source_hash,
-            prior=args.prior,
-            profile=getattr(args, "asset_manifest", None),
-        )
+    assets = prepare_assets(
+        args.source,
+        args.output / "native-assets",
+        source_hash,
+        prior=args.prior,
+        profile=getattr(args, "asset_manifest", None),
+    )
     asset_times = args.output / "native-assets/stages/timings.json"
     if asset_times.exists():
         phases.timings.update(
@@ -468,11 +458,13 @@ def prepare_run(args, phases):
     return work
 
 
-def mask_equivalence(args):
+def mask_equivalence(args, frozen=False):
     """参考额外成本单列，参考计算不参与修复，也不读取旧检查点。"""
     from scripts.hls_mask_equivalence import compare as compare_masks
 
-    reference = args.output / "v7-graphic-reference"
+    reference = args.output / (
+        "v7-frozen-graphic-reference" if frozen else "v7-graphic-reference"
+    )
     work = args.output / "work"
     failure = None
     try:
@@ -489,7 +481,7 @@ def mask_equivalence(args):
                 "--detected",
                 work / "detections.json",
                 "--assets",
-                work / "v7-assets.json",
+                args.comparison_assets if frozen else work / "v7-assets.json",
             ],
             timeout=7200,
         )
@@ -497,12 +489,13 @@ def mask_equivalence(args):
         failure = dict(
             错误类型=type(error).__name__, 错误码=getattr(error, "code", None)
         )
-    report = compare_masks(work, reference, args.output / "mask-equivalence.json")
+    report_path = args.output / (
+        "frozen-mask-equivalence.json" if frozen else "mask-equivalence.json"
+    )
+    report = compare_masks(work, reference, report_path)
     if failure:
         report.update(通过=False, 参考计算失败=failure)
-        (args.output / "mask-equivalence.json").write_text(
-            json.dumps(report, ensure_ascii=False, indent=2)
-        )
+        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2))
     return report
 
 
@@ -517,13 +510,9 @@ def assess(args, phases):
         分步计时=phases.timings,
         通过=None,
         目检="未进行",
-        公共素材复用=bool(getattr(args, "asset_manifest", None)),
-        固定七版算法输入=bool(getattr(args, "v7_inputs", None)),
-        冷启动范围="固定七版算法输入下的全部运行阶段重算"
-        if getattr(args, "v7_inputs", None)
-        else "已有公共素材的分块修复"
-        if getattr(args, "asset_manifest", None)
-        else "含公共素材准备的分块修复",
+        公共素材复用=False,
+        固定七版算法输入=False,
+        冷启动范围="本次从原片重建九项输入及全部分块处理阶段",
         闪现闪烁="待结合原片镜头切换逐帧检查",
         接缝检查="单块内部窗口见补画指标；整集分片时间轴与接缝待整集基准",
         安全对象前缀=None,
@@ -536,6 +525,10 @@ def assess(args, phases):
         measured = time.monotonic()
         report["图形逐帧等价性"] = mask_equivalence(args)
         verification_times["七版图形独立参考与逐帧交并比"] = time.monotonic() - measured
+        if getattr(args, "comparison_assets", None):
+            measured = time.monotonic()
+            report["冻结素材图形逐帧对照"] = mask_equivalence(args, frozen=True)
+            verification_times["冻结素材图形对照"] = time.monotonic() - measured
         if not report["图形逐帧等价性"]["通过"]:
             report["通过"] = False
     else:
@@ -748,7 +741,7 @@ def parser():
     mode.add_argument(
         "--run",
         action="store_true",
-        help="运行检测、分割、局部补画和合成；仅在设备空闲后使用",
+        help="从原片重建九项输入并运行七版等价完整流程；仅在设备空闲后使用",
     )
     mode.add_argument(
         "--candidate",
@@ -758,7 +751,12 @@ def parser():
     p.add_argument(
         "--v7-inputs",
         type=Path,
-        help="七版冻结算法输入清单；只读九项固定输入，不导入运行检查点",
+        help="已禁用：冻结输入禁止参与处理；对照请用 --comparison-assets",
+    )
+    p.add_argument(
+        "--comparison-assets",
+        type=Path,
+        help="仅供独立评价的七版冻结清单，不复制、替换或修正重建结果",
     )
     p.add_argument(
         "--v7-reference-code",
@@ -835,7 +833,10 @@ def parser():
         help="历史命令兼容参数；本轮固定采用七版原提示采样",
     )
     p.add_argument(
-        "--roi-margin", type=int, default=96, help="历史命令兼容参数；本轮不启用新增局部裁剪补画"
+        "--roi-margin",
+        type=int,
+        default=96,
+        help="历史命令兼容参数；本轮不启用新增局部裁剪补画",
     )
     p.add_argument(
         "--crop",
@@ -861,6 +862,14 @@ def parser():
 
 def validate_output(args):
     output = args.output.resolve()
+    if args.run and (
+        getattr(args, "v7_inputs", None)
+        or getattr(args, "asset_manifest", None)
+        or os.getenv("HLS_V7_ASSETS")
+    ):
+        raise ValueError(
+            "禁止复用冻结清单作为处理输入；只能使用 --comparison-assets 作独立对照"
+        )
     if getattr(args, "cold_start", False):
         if not args.run or (output.exists() and any(output.iterdir())):
             raise ValueError("完整冷启动必须使用运行模式与全新空输出目录")
@@ -880,7 +889,8 @@ def validate_output(args):
             raise ValueError("完整冷启动禁止复用旧先验、素材、检测及环境素材清单")
     protected = [args.source, args.baseline]
     protected += [
-        getattr(args, name, None) for name in ("v7_inputs", "v7_reference_code")
+        getattr(args, name, None)
+        for name in ("v7_inputs", "v7_reference_code", "comparison_assets")
     ]
     if args.run:
         protected += [
@@ -976,6 +986,29 @@ def main():
         raise SystemExit("基准未完成，阶段记录已保留，请检查独立输出目录") from None
     finally:
         if report is not None:
+            if getattr(args, "comparison_assets", None) and getattr(
+                args, "_source_hash", None
+            ):
+                from scripts.hls_v7_inputs_compare import compare as compare_inputs
+
+                measured = time.monotonic()
+                try:
+                    comparison = compare_inputs(
+                        args.output / "native-assets",
+                        args.comparison_assets,
+                        args._source_hash,
+                    )
+                    (args.output / "input-comparison.json").write_text(
+                        json.dumps(
+                            comparison, ensure_ascii=False, indent=2, allow_nan=False
+                        )
+                    )
+                    report["九项重建对照"] = comparison
+                except Exception as comparison_error:
+                    report["九项重建对照"] = dict(
+                        通过=False, 错误类型=type(comparison_error).__name__
+                    )
+                report["九项独立对照耗时秒"] = time.monotonic() - measured
             recover_timings(args.output, phases.timings)
             report["分步计时"] = phases.timings
             report["本次总耗时秒"] = time.monotonic() - started

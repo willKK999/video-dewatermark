@@ -1,0 +1,89 @@
+# 视频去水印系统：七版等价冷启动与固定输入重建
+
+本轮遵守kelin“每次都从原片重建固定输入”的决定。九项冻结素材仅作对照，禁止传入处理路径。没有真实成片和逐项证据时，不宣称达到三倍或效果验收通过。
+
+## 原生成链调查与实现
+
+只读追查了原会话记录、远端原标定脚本及冻结清单。没有执行旧脚本，没有修改原运行目录。已核对原片第0、5、30、119、200、250秒：按原命令从当前原片重建的JPEG，解码后与原 `source-samples` 对应图像逐像素相同，平均及最大绝对差异均为零。这仅证明这六个采样点，不代表全部素材等价。
+
+此前提速版的 `prepare_assets` 与原配方不同：仅全片均匀取60张，透明度先缩到720p，对所有区域学习颜色，且未生成固定投影和四项品牌种子。本轮删除该替代配方，连接原生成步骤，未降低面积、残留或分割门槛。
+
+| 输入 | 原生成逻辑及本轮调用 | 对照内容 |
+| --- | --- | --- |
+| 先验 | `worker.multitrack.prepare`：原1帧/秒及720p共识、原模型验证、原固定与移动轨迹 | 每个数组形状、误差、掩膜交并比、元数据 |
+| 透明度 | 原 `probe_matte_fit_tmp.py`：共识信号与区域相交，`fill_support(...,2)`，恢复原生尺寸；最高置信区域相关性严格大于0.35的原生秒级样本调用 `matte.fit_overlay` | 原生透明度、偏移、掩膜逐数组误差 |
+| 模板 | 原 `run_chunk6.py` 的 `hls_template.build`，全部原生秒级JPEG，标准差3 | 高频模板及标准差 |
+| 颜色 | 原 `probe_palette_brand_tmp.py`：每五张抽一张、相同最高置信区域相关性大于0.35、模板大于2的前景，原 `branding.learn_palette` | 原始数组误差及双向最近颜色中心距离，避免仅因中心顺序而误读 |
+| 彩色种子图像 | 原解码及 `short_brand.discover` 自动选择的提示帧 | 图像形状、逐元素误差及最大差异位置 |
+| 彩色种子掩膜 | 原 `short_brand.discover` 的模型、OCR与前景补全 | 掩膜交并比及差异像素 |
+| 白色种子图像 | 原 `hls_brand_variants` 的模型印证与模板匹配，读取本次原稀疏补画掩膜 | 自动选择图像的像素误差 |
+| 白色种子掩膜 | 同一原变体发现脚本的实际高频笔画和 `ink_support(...,2)` | 掩膜交并比及差异像素 |
+| 固定投影 | 原稀疏补画、图形补残、品牌补画完成后，原生帧对齐，再调用 `hls_fit_projection.fit(...,3)` | 所有不同系数的位置、数值和绝对差异 |
+
+生成顺序由 `worker.v7_rebuild.rebuild` 统一管理，失败阶段也写入 `native-assets/stages/timings.json`。没有“缺项时自动换提示”的后备判定。原稀疏联合掩膜和品牌联合掩膜保留20%保护，原补画明确关闭实验ROI。图形处理、提示采样及掩膜函数仍直接复用七版。
+
+原标定源文件摘要（仅代码，不包含配置或素材）：
+
+| 原文件 | SHA256 |
+| --- | --- |
+| `scripts/probe_matte_fit_tmp.py` | `6d1a69747277d9a658f9e2fd843fe9355c5659598a6dace997b1a4333f9378ed` |
+| `scripts/probe_palette_brand_tmp.py` | `983f72cd5127486d360828a06bef9c7d9d26d2236b04a9b47fe4f6e28f7e4333` |
+| `scripts/prepare_short_brand_tmp.py` | `53a07bb0b1a03f9273d4a42e23251e901d9710767340b2a85fc1c890dd1a1c07` |
+| `scripts/run_fine_chunk_tmp.py` | `07290141b497b7e14239bc8a9b4173f717bab404cb4266a21346e625ad855fad` |
+| `/tmp/discover_brand_variants.py` | `d1b1140873647178280fd836d7768471befdc494b4f1d99c932fa395db6c3145` |
+| `/tmp/run_chunk6.py` | `0ff7b71ae9b33a37373b02700a80140167e49f6055243c796972e03ac9bfbe83` |
+
+原清单生成脚本 `/tmp/hls_prepare_full_assets.py` 只收集已存在的九项素材，不能当作重建入口。原 `fine-chunk1/masks` 曾在图形补残后原地合并，原白色种子也依赖此状态；本轮显式重放这一步，不读取旧目录。保留原品牌种子生成时的CRF16剪辑及CRF18规范化，避免擅自去掉编码而改变提示图像。最终交付仍使用原片原生像素与60帧，不能将这些种子准备图像当作最终原片。
+
+## 冷启动运行与对照隔离
+
+先确认整集及其他显卡任务结束、GPU空闲。代码部署至全新独立目录，原 `/workspace/video-dewatermark`、模型、正式版及其他会话目录保持不变。不安装或升级原环境；模型解释器与后置纯Python依赖分开，当前和子进程都禁止写字节码。只加载配置，不输出变量。
+
+```sh
+set -a
+. /opt/dewatermark/config/runtime.env
+set +a
+cd /本次独立代码目录
+export PYTHONPATH=.
+export PYTHONDONTWRITEBYTECODE=1
+export TORCH_HOME=/本次独立代码目录/.cache/torch
+export TRITON_CACHE_DIR=/本次独立代码目录/.cache/triton
+unset HLS_V7_ASSETS
+"$INPAINT_PYTHON" -B -m scripts.hls_speedup_launch \
+  --extra-python-path /workspace/video-dewatermark/.venv/lib/python3.11/site-packages \
+  --run --cold-start \
+  --source /workspace/dewatermark-data/hls-huangguo/source.mp4 \
+  --baseline /workspace/dewatermark-data/hls-huangguo/chunk1-v7/chunk1.mp4 \
+  --comparison-assets /workspace/dewatermark-data/hls-huangguo/v7-assets.json \
+  --v7-reference-code /本次独立代码目录/七版冻结源码 \
+  --output /本次全新空目录/首块冷启动 \
+  --path speedup-v2 --duration 25 --context 2 \
+  --backend torch-cuda --encoder libx264 \
+  --make-comparisons --times 5 12 20
+```
+
+`--comparison-assets` 只能到达独立评价，不返回处理路径；九项结果可缺失并记录，但不能用冻结数据补齐。`input-comparison.json` 保存逐项报告。独立命令也可以只评价失败前已重建的项目：
+
+```sh
+.venv/bin/python -B -m scripts.hls_v7_inputs_compare \
+  --source /原片.mp4 --rebuilt /本次输出/native-assets \
+  --comparison-assets /冻结素材.json --output /独立输出/九项差异.json
+```
+
+图形核验执行两种独立参考：相同本次输入和冻结源码，检查执行方式是否等价；另用冻结素材、相同本次解码帧及冻结源码，检查重建素材造成的图形差异。两种参考都只评价，不参与处理。逐帧IoU至少0.99，低于门槛、缺帧及输入不一致全部列出，不能复制提速结果充当参考。
+
+## 耗时和验收口径
+
+原分项基线：检测34秒、SAM356秒、补画1061秒、原生合成1070秒、细节融合479秒，共3000秒。整集首块实测基线3219秒另列。九项重建中的所有解码、标定、分割、补画、补残和投影准备均计入处理墙钟；不能从分母中删除准备补画来凑倍数。独立素材对照、图形参考及成品评价的额外耗时单列，另报完整墙钟。
+
+水印残留必须为0，无修复造成的闪现/闪烁。清晰度仅记录，列出全部、最低值及低于0.7的样本；相对七版清晰度、SSIM/PSNR不得明显退化。保留原始候选及复核依据。输出1920×1080、60帧、音频复制；另生成整体1280×720三列视频，小于50,000,000字节，以及逐帧SSIM最差裁图。未完成目检不宣称验收通过。
+
+本轮冷启动可能比原首块更慢：原正式首块复用了全片公共素材，本轮必须额外重建；原投影又依赖先完成的补画。当前仍保留整帧补画及原判定，单纯加速合成不能保证三倍。先记录真实瓶颈，再评估原数学运算的批处理、模型常驻和同运行内特征去重，不以缩小分割或改变图形判定换速度。
+
+## 本轮结果
+
+本地完整检查：Python358通过、12跳过、0失败（83.79秒）；Go14个用例通过、0失败。跳过项为未启用的数据库、存储与部署集成检查。新测试覆盖九项生成顺序、禁止冻结输入、原生透明度尺寸与原颜色抽样、缺种子失败、20%保护及只读差异评价。既有原函数快照、编码像素和音频一致性回归继续通过。
+
+整集路径每次重建公共素材，保留前次目录作为证据；素材摘要参与分块缓存身份。若重建数据发生变化，旧分块必须失效。旧先验元数据含运行耗时，因此即使掩膜相同也可能触发保守失效；本轮不以删元数据或放松校验换复用。
+
+远端冷启动结果待实际运行填写；当前不得据此宣称三倍或质量通过。

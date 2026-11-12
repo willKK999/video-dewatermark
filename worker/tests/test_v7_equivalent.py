@@ -298,28 +298,8 @@ def test_canonical_checkpoint_restores_exact_model_and_native_pixels(tmp_path):
     assert proof.validate(0, cv2.imread(str(b / "fine/masks/000000.png"), 0))
 
 
-def test_fixed_inputs_validate_source_and_each_asset_without_importing_old_outputs(
-    tmp_path,
-):
-    from worker.roi_inpaint import digest
-    from worker.process import PipelineError
-
-    data = dict(method="v7", source_sha256="frozen-source", sha256={})
-    for name in v7_equivalent.REQUIRED_ASSETS:
-        path = tmp_path / (name + ".npz")
-        path.write_bytes(name.encode())
-        data[name] = str(path)
-        data["sha256"][name] = digest(path)
-    manifest = tmp_path / "fixed.json"
-    manifest.write_text(json.dumps(data))
-    result = v7_equivalent.fixed_inputs(manifest, "frozen-source", tmp_path / "copied")
-    assert set(result) == set(v7_equivalent.REQUIRED_ASSETS)
-    assert not (tmp_path / "copied/complete.json").exists()
-    with pytest.raises(PipelineError, match="源片摘要"):
-        v7_equivalent.fixed_inputs(manifest, "other-source", tmp_path / "wrong")
-    Path(data["color_seed_mask"]).write_bytes(b"changed")
-    with pytest.raises(PipelineError, match="内容摘要"):
-        v7_equivalent.fixed_inputs(manifest, "frozen-source", tmp_path / "changed")
+def test_fixed_input_copying_bypass_has_been_removed():
+    assert not hasattr(v7_equivalent, "fixed_inputs")
 
 
 def test_independent_reference_verifies_commit_and_every_code_digest(tmp_path):

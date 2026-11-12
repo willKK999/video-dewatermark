@@ -2,181 +2,22 @@
 
 import json
 import os
-import shutil
 from pathlib import Path
 import cv2
 import numpy as np
-from .branding import learn_palette
-from .matte import fit_overlay
 from .multitrack import load_prior
 from .process import PipelineError, run
-from .speedup_cache import StageCache, fingerprint
 
 
 def prepare_assets(
     source, root, source_hash, check=lambda: None, prior=None, profile=None
 ):
-    """全片只准备一次原生模板和透明度类别，不进行透明反解。"""
-    from .media import probe
-    from .multitrack import prepare
-    from scripts.hls_template import build
+    """本次从原片重建；冻结素材只能交给独立对照工具。"""
+    from .v7_rebuild import rebuild
 
-    root.mkdir(parents=True, exist_ok=True)
-    cache = StageCache(root / "stages")
-    from .roi_inpaint import digest
-
-    from .hls_settings import reusable_profile
-
-    explicit_profile = profile is not None
-    profile = profile or os.getenv("HLS_V7_ASSETS")
-    if profile and reusable_profile(profile, source_hash, 60):
-        from .hls_v7 import load_assets
-
-        supplied = load_assets(Path(profile), source_hash)
-        names = ("prior", "alpha", "template", "palette", "projection")
-        if supplied.get("low_band_template"):
-            if digest(supplied["low_band_template"]) != supplied.get("low_band_sha256"):
-                raise PipelineError("OUTPUT_INVALID", "低频素材摘要不一致")
-            supplied["sha256"]["low_band_template"] = supplied["low_band_sha256"]
-            names += ("low_band_template",)
-        graphics = (
-            "color_seed_image",
-            "color_seed_mask",
-            "variant_seed_image",
-            "variant_seed_mask",
-        )
-        if any(supplied.get(name) for name in graphics):
-            if not all(supplied.get(name) for name in graphics):
-                raise PipelineError("OUTPUT_INVALID", "完整图形模板必须成组提供")
-            names += graphics
-        # 所有复用项必须有内容校验，不能只验证清单中碰巧列出的文件。
-        if any(name not in supplied.get("sha256", {}) for name in names):
-            raise PipelineError("OUTPUT_INVALID", "自动素材清单缺少必要内容摘要")
-        filenames = dict(
-            prior="multitrack-prior.npz",
-            alpha="alpha.npz",
-            template="template.npz",
-            palette="palette.npy",
-            projection="projection.json",
-            low_band_template="low-band.npz",
-            color_seed_image="color-seed-image.png",
-            color_seed_mask="color-seed-mask.png",
-            variant_seed_image="variant-seed-image.png",
-            variant_seed_mask="variant-seed-mask.png",
-        )
-        targets = {name: root / filenames[name] for name in names}
-        if len(set(targets.values())) != len(names):
-            raise PipelineError("OUTPUT_INVALID", "自动素材文件名冲突")
-        identity = fingerprint(
-            [Path(profile), *[Path(supplied[n]) for n in names]], [source_hash]
-        )
-
-        def copy_profile():
-            for name in names:
-                shutil.copyfile(supplied[name], targets[name])
-
-        cache.run(
-            "import_profile", identity, copy_profile, lambda: list(targets.values())
-        )
-        return targets
-    if explicit_profile:
-        raise PipelineError("OUTPUT_INVALID", "指定的自动素材清单与冻结源片不一致")
-
-    code = [
-        digest(Path(__file__).with_name(n))
-        for n in ("native_assets.py", "matte.py", "multitrack.py", "branding.py")
-    ]
-    key = fingerprint(
-        [prior] if prior else [], [source_hash, os.getenv("MODEL_LOCK_HASH"), code]
-    )
-    target = root / "multitrack-prior.npz"
-
-    def make_prior():
-        if prior:
-            shutil.copyfile(prior, target)
-        else:
-            prepare(source, root, check)
-
-    cache.run("prior", key, make_prior, lambda: [target])
-    duration = float(probe(source, check)["format"]["duration"])
-    count = min(60, int(duration))
-    if count < 15:
-        raise PipelineError(
-            "TEMPORAL_UNCERTAIN", "全片原生校准不足十五个独立秒级样本", review=True
-        )
-    samples = root / "native-samples"
-
-    def sample():
-        if samples.exists():
-            shutil.rmtree(samples)
-        samples.mkdir()
-        run(
-            [
-                "ffmpeg",
-                "-v",
-                "error",
-                "-i",
-                source,
-                "-vf",
-                f"fps={count / duration}",
-                "-frames:v",
-                str(count),
-                "-q:v",
-                "2",
-                samples / "%06d.jpg",
-            ],
-            check,
-            timeout=7200,
-        )
-        if len(list(samples.glob("*.jpg"))) != count:
-            raise PipelineError("OUTPUT_INVALID", "全片原生采样帧数不足")
-
-    key = fingerprint([], [key, cache.tokens["prior"], count])
-    cache.run("samples", key, sample, lambda: [samples])
-
-    def calibrate():
-        median, signal, regions, _, _ = load_prior(target)
-        mask = np.zeros(median.shape, np.uint8)
-        for region in regions:
-            mask |= region["mask"]
-        images = [
-            cv2.resize(cv2.imread(str(p)), (median.shape[1], median.shape[0]))
-            for p in sorted(samples.glob("*.jpg"))
-        ]
-        alpha, _ = fit_overlay(images, mask)
-        np.savez_compressed(root / "alpha.npz", alpha=alpha)
-        # 颜色只用于确认完整品牌的前景支持，无法学到时不伪造颜色。
-        try:
-            palette = learn_palette(images, mask)
-        except ValueError:
-            palette = np.empty((0, 3), np.float32)
-        np.save(root / "palette.npy", palette)
-        build(samples, root / "template.npz", 3)
-        from .low_frequency import band
-
-        np.savez_compressed(
-            root / "low-band.npz",
-            template=np.median(np.stack([band(image) for image in images]), axis=0),
-        )
-
-    cache.run(
-        "calibrate",
-        fingerprint([], [key, cache.tokens["samples"]]),
-        calibrate,
-        lambda: [
-            root / "alpha.npz",
-            root / "template.npz",
-            root / "palette.npy",
-            root / "low-band.npz",
-        ],
-    )
-    return dict(
-        prior=target,
-        alpha=root / "alpha.npz",
-        template=root / "template.npz",
-        palette=root / "palette.npy",
-        low_band_template=root / "low-band.npz",
-    )
+    if prior is not None or profile is not None or os.getenv("HLS_V7_ASSETS"):
+        raise PipelineError("MODEL_INVALID", "禁止将旧先验或冻结素材清单作为处理输入")
+    return rebuild(source, root, source_hash, check)
 
 
 def brand_references(prior):

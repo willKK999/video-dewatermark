@@ -138,7 +138,7 @@ def test_help_never_initializes_a_device():
         text=True,
         check=True,
     )
-    assert "局部补画" in result.stdout and "--baseline" in result.stdout
+    assert "从原片重建九项输入" in result.stdout and "--baseline" in result.stdout
 
 
 def test_assessment_does_not_turn_missing_residual_and_visual_checks_into_pass(
@@ -494,6 +494,12 @@ def test_cold_start_rejects_all_reused_material_and_nonempty_directory(
     with pytest.raises(ValueError, match="禁止复用"):
         bench.validate_output(args)
     monkeypatch.delenv("HLS_V7_ASSETS")
+    args.v7_inputs = tmp_path / "冻结素材.json"
+    with pytest.raises(ValueError, match="禁止复用"):
+        bench.validate_output(args)
+    args.v7_inputs = None
+    args.comparison_assets = tmp_path / "仅供对照.json"
+    bench.validate_output(args)
     args.output.mkdir()
     (args.output / "report.json").write_text("{}")
     with pytest.raises(ValueError, match="全新空"):

@@ -88,9 +88,7 @@ def identity(source_hash, options, config, execution_fingerprint):
                 mode=config["mode"],
                 backend=config["backend"],
                 settings=settings,
-                asset_profile=digest(Path(os.environ["HLS_V7_ASSETS"]))
-                if os.getenv("HLS_V7_ASSETS")
-                else None,
+                asset_recipe="v7-source-rebuild-1",
                 execution=execution_fingerprint,
                 code=code,
             ),
@@ -261,15 +259,20 @@ def execute_native_hls(
         raise PipelineError("MODEL_INVALID", "整集原生交付需要固定的专用检测模型")
     config = configuration(options)
     key = identity(source_hash, options, config, execution_fingerprint)
-    store = BundleStore(s3, bucket, prefix + "/native-v2/" + key, check)
     asset_root = root / "native-assets"
+    if asset_root.exists() and any(asset_root.iterdir()):
+        asset_root = root / f"native-assets-rebuilt-{time.time_ns()}"
     asset_root.mkdir(exist_ok=True)
     stage("detect")
-    if store.restore("assets", asset_root, key):
-        assets = assets_from(asset_root)
-    else:
-        assets = prepare_assets(full, asset_root, source_hash, check)
-        store.save("assets", asset_root, list(assets.values()), key)
+    # 公共输入每次由原片重建，不从旧整集或对象存储恢复本集素材。
+    assets = prepare_assets(full, asset_root, source_hash, check)
+    key = hashlib.sha256(
+        json.dumps(
+            [key, {name: digest(path) for name, path in sorted(assets.items())}],
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()
+    store = BundleStore(s3, bucket, prefix + "/native-v2/" + key, check)
     plans = chunks(durations, 60)
     frames = root / "joined"
     frames.mkdir()
