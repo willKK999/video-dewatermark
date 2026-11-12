@@ -58,6 +58,16 @@ def compare(candidate, baseline, output, duration, crops=()):
     if (a["width"], a["height"]) != (b["width"], b["height"]):
         raise ValueError("七版与候选成品的分辨率不一致，禁止缩放掩盖差异")
     rate = float(Fraction(b["avg_frame_rate"]))
+    ratio = Fraction(a["avg_frame_rate"]) / Fraction(b["avg_frame_rate"])
+    if ratio.denominator != 1 or ratio < 1:
+        raise ValueError("候选帧率必须为七版帧率的整数倍，禁止隐式插帧比较")
+    (output / "alignment.json").write_text(
+        json.dumps(
+            dict(候选采样步长=int(ratio), 原片时间相位=0, 对照帧率=rate),
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
     values = {}
     (output / "regions.json").write_text(json.dumps([None, *crops]))
     for index, crop in enumerate([None, *crops]):
@@ -76,8 +86,10 @@ def compare(candidate, baseline, output, duration, crops=()):
             ):
                 raise ValueError("对照裁图范围超出视频")
             crop_filter = f",crop={w}:{h}:{x}:{y}"
-        normalize = f"fps={rate}:start_time=0,trim=duration={duration},setpts=PTS-STARTPTS{crop_filter}"
-        filters = f"[0:v]{normalize},split[c1][c2];[1:v]{normalize},split[v1][v2];[c1][v1]ssim=stats_file=ssim.log[s];[c2][v2]psnr=stats_file=psnr.log[p]"
+        # 七版原生渲染采用floor原片索引：60转30选0、2、4帧。
+        # fps滤镜默认可能选1、3、5帧，会把时间相位误差算成质量损失。
+        normalize = f"setpts=N/({rate}*TB),trim=duration={duration}{crop_filter}"
+        filters = f"[0:v]select=not(mod(n\\,{int(ratio)})),{normalize},split[c1][c2];[1:v]{normalize},split[v1][v2];[c1][v1]ssim=stats_file=ssim.log[s];[c2][v2]psnr=stats_file=psnr.log[p]"
         run(
             [
                 "ffmpeg",
@@ -566,6 +578,30 @@ def assess(args, phases):
             report["原始残留检查"] = None
             report["残留复核依据"] = "未完成：缺少检测与映射"
         report["品牌图形独立检查"] = "待运行品牌图形复检入口，未宣称零残留"
+    if args.detected and args.native_report:
+        from scripts.hls_speedup_quality import temporal_candidates
+
+        measured = time.monotonic()
+        report["时域异常对照"] = {
+            name: temporal_candidates(
+                args.source,
+                path,
+                args.detected,
+                args.native_report,
+                args.duration,
+                audit / f"temporal-{name}.json",
+            )
+            for name, path in (("七版", args.baseline), ("候选", args.candidate))
+        }
+        verification_times["时域异常对照"] = time.monotonic() - measured
+        count = report["时域异常对照"]["候选"]["异常候选数"]
+        report["闪现闪烁"] = (
+            "存在自动异常候选，待逐项复核"
+            if count
+            else "自动区域核验未见异常；逐帧目检尚未进行"
+        )
+        if count:
+            report["通过"] = False
     if args.make_comparisons:
         report["对比产物"] = comparisons(
             args.source,

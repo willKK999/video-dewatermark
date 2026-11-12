@@ -47,7 +47,9 @@ def test_real_metrics_align_sixty_to_thirty_frames_and_report_crops(tmp_path):
             "-i",
             str(sixty),
             "-vf",
-            "fps=30",
+            "select=not(mod(n\\,2)),setpts=N/(30*TB)",
+            "-r",
+            "30",
             "-c:v",
             "libx264",
             "-crf",
@@ -59,7 +61,8 @@ def test_real_metrics_align_sixty_to_thirty_frames_and_report_crops(tmp_path):
     )
     report = bench.compare(sixty, thirty, tmp_path / "metrics", 0.2, [(0, 0, 64, 48)])
     assert report["全画面"]["帧数"] == 6
-    assert report["全画面"]["SSIM均值"] > 0.999
+    assert report["全画面"]["SSIM均值"] == 1
+    assert report["全画面"]["均方误差日志为零"]
     assert report["0,0,64,48"]["帧数"] == 6
 
 
@@ -368,3 +371,48 @@ def test_worst_crops_are_selected_by_metrics_and_keep_three_sources(tmp_path):
     for sample in report["样本"]:
         image = cv2.imread(sample["图片"])
         assert image.shape[1] == (sample["区域"][2] if sample["区域"] else 128) * 3
+
+
+def test_temporal_check_reports_repair_flash_without_counting_source_cut(
+    tmp_path, monkeypatch
+):
+    from scripts import hls_speedup_quality as quality
+    import cv2
+
+    frames = [np.full((72, 128, 3), 60 if i < 6 else 180, np.uint8) for i in range(12)]
+    repaired = [frame.copy() for frame in frames]
+    repaired[4][:] = 255
+
+    class Capture:
+        def __init__(self, path):
+            self.frames = iter(frames if path == "源片" else repaired)
+
+        def get(self, n):
+            return 60
+
+        def read(self):
+            image = next(self.frames, None)
+            return image is not None, image
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(cv2, "VideoCapture", Capture)
+    detected = tmp_path / "detected.json"
+    detected.write_text(
+        json.dumps(
+            dict(
+                scenes=[[0, 3], [3, 6]],
+                hints=[
+                    dict(frame=i, track_id=1, box=[0, 0, 1280, 720]) for i in range(6)
+                ],
+            )
+        )
+    )
+    mapping = tmp_path / "mapping.json"
+    mapping.write_text(json.dumps({"帧映射": [i // 2 for i in range(12)]}))
+    report = quality.temporal_candidates(
+        "源片", "成品", detected, mapping, 0.2, tmp_path / "temporal.json"
+    )
+    assert {r["frame"] for r in report["异常候选"]} == {4, 5}
+    assert any(r["frame"] == 6 and r["source_scene_cut"] for r in report["全体样本"])

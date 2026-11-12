@@ -117,3 +117,88 @@ def relative_clarity(args, output):
         json.dumps(report, ensure_ascii=False, indent=2)
     )
     return report
+
+
+def temporal_candidates(source, result, detected, mapping, duration, output):
+    """沿用整集收尾的区域时域异常规则；候选需逐项复核，不等同真实闪烁。"""
+    detected = json.loads(detected.read_text())
+    indices = json.loads(mapping.read_text())["帧映射"]
+    hints = {}
+    for point in detected["hints"]:
+        hints.setdefault(point["frame"], []).append(point)
+    cuts = {start for start, end in detected["scenes"]}
+    a, b = cv2.VideoCapture(str(source)), cv2.VideoCapture(str(result))
+    source_fps, fps = a.get(5), b.get(5)
+    if source_fps != 60 or fps not in (30, 60):
+        a.release()
+        b.release()
+        raise ValueError("时域核验需要六十帧源片及三十或六十帧成品")
+    cursor = -1
+    previous = None
+    samples, candidates = [], []
+    try:
+        for n in range(round(duration * fps)):
+            source_index = int(n * source_fps / fps)
+            original = None
+            while cursor < source_index:
+                ok, original = a.read()
+                if not ok:
+                    raise ValueError("时域核验源片帧数不足")
+                cursor += 1
+            good, final = b.read()
+            if not good or source_index >= len(indices):
+                raise ValueError("时域核验成品或映射帧数不足")
+            x, y = [
+                cv2.resize(image, (1280, 720)).astype(np.float32)
+                for image in (original, final)
+            ]
+            index = indices[source_index]
+            if previous is not None:
+                old_x, old_y, old_index = previous
+                source_delta, result_delta = np.abs(x - old_x), np.abs(y - old_y)
+                repair_delta = np.abs((y - x) - (old_y - old_x))
+                source_cut = index in cuts and index != old_index
+                for point in hints.get(index, []):
+                    left, top, right, bottom = map(round, point["box"])
+                    left, top, right, bottom = (
+                        max(0, left),
+                        max(0, top),
+                        min(1280, right),
+                        min(720, bottom),
+                    )
+                    if right <= left or bottom <= top:
+                        continue
+                    region = np.s_[top:bottom, left:right]
+                    ds, dy, dr = [
+                        float(v[region].mean())
+                        for v in (source_delta, result_delta, repair_delta)
+                    ]
+                    row = dict(
+                        frame=n,
+                        time=n / fps,
+                        track_id=point["track_id"],
+                        source_mae=ds,
+                        result_mae=dy,
+                        repair_delta_mae=dr,
+                        source_scene_cut=source_cut,
+                        box=point["box"],
+                    )
+                    samples.append(row)
+                    # 与worker.hls_final_audit一致，不放宽已有无闪烁门槛。
+                    if not source_cut and dy > max(ds + 6, ds * 1.8) and dr > 12:
+                        candidates.append(row)
+            previous = x, y, index
+    finally:
+        a.release()
+        b.release()
+    report = dict(
+        全体样本=samples,
+        异常候选=candidates,
+        异常候选数=len(candidates),
+        采样帧率=fps,
+        目检="未进行",
+        说明="沿用整集区域时域规则；源片切镜不判修复闪现，未决候选不得自动清零",
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(report, ensure_ascii=False, indent=2))
+    return report
