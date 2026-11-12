@@ -13,6 +13,9 @@ p.add_argument("--output", default="/workspace/user-videos/hls")
 p.add_argument("--token-file", default="/home/box/.config/dewatermark/console-token")
 p.add_argument("--existing", action="store_true")
 p.add_argument("--retry", action="store_true")
+p.add_argument(
+    "--submit-only", action="store_true", help="只提交并保存任务编号，不等待整集结束"
+)
 a = p.parse_args()
 out = Path(a.output)
 out.mkdir(parents=True, exist_ok=True)
@@ -52,8 +55,12 @@ with sync_playwright() as pw:
                 arg=job,
             )
             print("已通过操作台重试未完成块", flush=True)
+    if a.submit_only:
+        page.screenshot(path=str(out / "console-submitted.png"), full_page=True)
+        browser.close()
+        raise SystemExit(0)
     previous = None
-    for _ in range(2400):
+    for _ in range(8640):
         try:
             data = page.evaluate(
                 "async id=>await Promise.race([api('/v1/jobs/'+id).then(r=>r.json()),new Promise((_,reject)=>setTimeout(()=>reject(Error('状态请求超时')),25000))])",

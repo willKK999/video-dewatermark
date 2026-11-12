@@ -44,6 +44,8 @@ def render(
     frames_only=False,
     source_start_frame=0,
     check=lambda: None,
+    final_recompose=False,
+    layer_manifest=None,
 ):
     if not 0 < duration <= 30 or source_start_frame < 0:
         raise ValueError("原生块必须为三十秒以内且起始帧非负")
@@ -66,6 +68,9 @@ def render(
     width, height = video["width"], video["height"]
     count = round(duration * fps)
     detections = json.loads(detected.read_text())
+    from worker.hls_layers import VerifiedLayers
+
+    layer_proof = VerifiedLayers(layer_manifest, detected) if layer_manifest else None
     alpha = np.load(calibration)["alpha"]
     supports = Supports(prior, detections, alpha, graphic)
     native = np.load(template)["template"]
@@ -136,6 +141,11 @@ def render(
                 "-",
                 "-an",
                 *encoder_args(encoder_name, video_crf),
+                "-threads",
+                "4",
+                "-progress",
+                str(output / "encode-progress.log"),
+                "-nostats",
                 "-pix_fmt",
                 "yuv420p",
                 str(silent),
@@ -265,12 +275,30 @@ def render(
             if reference_valid is not None:
                 trusted = reference_valid & (occupied > 0)
                 result[trusted] = base[trusted]
+            if final_recompose and templates and np.any(faint_union):
+                # v7 的第二遍联合纹理合成；在同一原生帧上完成，免去中间有损编码。
+                painted = projected_texture_composite(
+                    original,
+                    result,
+                    faint_union,
+                    templates,
+                    calibration=coefficients if faint else None,
+                    detail_sigma=detail_sigma,
+                )
+                result[faint_union > 0] = painted[faint_union > 0]
             area = float(np.count_nonzero(occupied) / occupied.size)
             max_area = max(max_area, area)
-            if area > 0.2:
-                raise ValueError("原生联合掩膜超过原20%面积门槛")
+            if layer_proof:
+                layer_proof.validate(index, occupied)
+            elif area > 0.2:
+                raise ValueError("联合掩膜超过20%且缺少逐层保护与来源证明")
             timings["composite"] += time.monotonic() - frame_started
-            if fused_detail and templates and np.any(faint_union):
+            if (
+                fused_detail
+                and not final_recompose
+                and templates
+                and np.any(faint_union)
+            ):
                 detail_started = time.monotonic()
                 proposed = projector(
                     original,
@@ -333,8 +361,13 @@ def render(
         cap.release()
         errors.close()
         if encoder and encoder.poll() is None:
+            encoder.stdin.close()
             encoder.terminate()
-            encoder.wait()
+            try:
+                encoder.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                encoder.kill()
+                encoder.wait()
         if torch_engine is not None and torch_engine.device.type == "cuda":
             # 原生渲染结束即归还缓存显存，给下一块串行模型留足空间。
             torch_engine.torch.cuda.synchronize()

@@ -10,13 +10,13 @@
 
 主工作目录 `/workspace/video-dewatermark-github` 的 `feat/hls-ts-segments` 正由另一个会话运行整集。禁止修改、检出、提交主目录文件，禁止停止或向该任务发信号；不得写入其日志 `/tmp/codex-hls-huangguo-8.log`。本树已有的 v7 代码作为独立基线保存，保留已有修改。
 
-Vast 整集任务结束且确认 GPU 空闲之前，禁止同步代码、禁止运行任何 GPU 作业、禁止修改远端 `/workspace/video-dewatermark`，禁止启动或重启 worker。本次任务全程不执行远端基准、不部署。下面部署说明保留作后续参考，不构成本次授权。
+Vast 整集任务结束且确认 GPU 空闲之前，禁止同步代码、禁止运行任何 GPU 作业、禁止修改远端 `/workspace/video-dewatermark`，禁止启动或重启 worker。2026年11月12日最新授权：先合入主分支通用修复，列明并清理可再生成的中间文件；确认整集结束、显卡空闲后，可将本分支同步到独立目录并运行第一块提速对照。禁止覆盖远端原运行目录或正式版产物，禁止操作另一会话的本地正式报告目录。仅本次独立提速基准获得授权。
 
 ## 提速命令与效果对照
 
 本地检查：`INTEGRATION= .venv/bin/python -m pytest worker/tests -q --tb=short`。没有虚拟环境时可只读调用主目录 Python，但设置 `PYTHONDONTWRITEBYTECODE=1`，避免向主目录写缓存。
 
-基准入口：`.venv/bin/python -m scripts.hls_speedup_bench --help`；完整参数、独立目录的部署及 GPU 空闲后的操作见 `docs/speedup-v2.md`。本次不得在 Vast 执行。基准必须区分预期提速与实测结果，记录检测、分割、补画、合成、细节融合和编码的耗时；复用缓存必须校验输入和参数。
+基准入口：`.venv/bin/python -m scripts.hls_speedup_bench --help`；完整参数、独立目录的部署及 GPU 空闲后的操作见 `docs/speedup-v2.md`。按2026年11月12日的新授权，仅在确认设备空闲后于独立目录执行。基准必须区分预期提速与实测结果，记录检测、分割、补画、合成、细节融合和编码的耗时；复用缓存必须校验输入和参数。
 
 正式整集入口 `worker.hls.execute_hls` 默认使用 `speedup-v2` 原生路径。接口参数 `hls_native_path: "v7"` 或环境开关 `HLS_NATIVE_PATH=v7` 可一键回退修复与合成算法，同时保持1080p60交付；显式接口参数优先于环境默认。回退必须覆盖所有提速环境变量，不能混用两条路径的检查点。`hls_encoder` 支持 `libx264` 或 `h264_nvenc`，首次对照保留前者，回退固定使用前者。整集与基准共用 `worker.native_chunk.process_chunk`，不另写单片处理逻辑。
 
@@ -86,3 +86,9 @@ GOFLAGS= go test ./...
 ```
 
 或运行 `make test`。需要连接实际数据库与存储的集成测试在配置齐全且隔离的数据环境运行 `INTEGRATION=1 .venv/bin/python -m pytest worker/tests -q`。每项通用修复补充针对行为的单元测试。最终记录实际通过、跳过及失败数，检查完成后本地提交，绝不推送。
+
+## 当前提速实测约定
+
+先合入主分支截至 `8f15663` 及后续的通用修复和指标修正，解决冲突并完成测试。远端清理必须先记录具体目录、用量、可再生成依据及进程占用检查；不删除源片、各块 `native/chunk1.mp4`、正式版相关文件或模型。只清理核验过的缓存与临时帧，不整目录覆盖。
+
+提速产物与结论使用独立目录，下载到 `/workspace/user-videos/hls-huangguo/bench-speedup-v2/`。不得写入相邻的 `full/` 正式报告目录。分项基线累计3000秒，整集第一块实测3219秒，两者均记录并明确比较范围。清晰度按主分支的新指标排除独立不透明遮挡，不因低于0.7或0.8返工。保留全部原始残留和闪烁证据；未通过不得宣称验收通过。

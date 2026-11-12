@@ -116,7 +116,10 @@ def test_multiple_moving_copies_have_independent_tracks(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("polarity", [1, -1])
-def test_full_icon_remnant_is_detected_without_text_detector(tmp_path, polarity):
+@pytest.mark.parametrize("streaming", [False, True])
+def test_full_icon_remnant_is_detected_without_text_detector(
+    tmp_path, polarity, streaming
+):
     from worker import multitrack
 
     rng = np.random.default_rng(6)
@@ -141,7 +144,16 @@ def test_full_icon_remnant_is_detected_without_text_detector(tmp_path, polarity)
     from worker.process import PipelineError
 
     with pytest.raises(PipelineError, match="多轨迹完整标识"):
-        multitrack.residual_quality(tmp_path, files, detections)
+        multitrack.residual_quality(
+            tmp_path,
+            files,
+            detections,
+            frame_reader=(
+                (lambda i: cv2.imread(str(tmp_path / "composite" / files[i].name)))
+                if streaming
+                else None
+            ),
+        )
     assert (
         __import__("json").loads((tmp_path / "quality.json").read_text())[
             "residual_count"
@@ -152,7 +164,16 @@ def test_full_icon_remnant_is_detected_without_text_detector(tmp_path, polarity)
         cv2.imwrite(
             str(tmp_path / "composite" / path.name), np.full((80, 120), 128, np.uint8)
         )
-    multitrack.residual_quality(tmp_path, files, detections)
+    multitrack.residual_quality(
+        tmp_path,
+        files,
+        detections,
+        frame_reader=(
+            (lambda i: cv2.imread(str(tmp_path / "composite" / files[i].name)))
+            if streaming
+            else None
+        ),
+    )
     assert (
         __import__("json").loads((tmp_path / "quality.json").read_text())[
             "residual_count"

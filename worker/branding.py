@@ -197,6 +197,42 @@ def palette_support(image, palette, distance=22):
     return mask
 
 
+def opaque_brand_ink(image, box, palette):
+    """在自动品牌框内覆盖所有独立前景笔画，不依赖SAM是否把小字分为同一对象。"""
+    from .hls_settings import HLSSettings
+
+    settings = HLSSettings.from_env()
+    colors = cv2.cvtColor(palette.astype(np.uint8)[None], cv2.COLOR_LAB2BGR)[0]
+    centers = cv2.cvtColor(colors[None], cv2.COLOR_BGR2HSV)[0].astype(np.float32)
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV).astype(np.float32)
+    selected = np.zeros(image.shape[:2], np.uint8)
+    for h, s, v in centers:
+        if s > 90:
+            hue = np.minimum(np.abs(hsv[:, :, 0] - h), 180 - np.abs(hsv[:, :, 0] - h))
+            active = (hue < 7) & (hsv[:, :, 1] > s * 0.45) & (hsv[:, :, 2] > v * 0.6)
+        elif v > 215:
+            active = (hsv[:, :, 1] < settings.opaque_white_saturation) & (
+                hsv[:, :, 2]
+                > max(
+                    settings.opaque_white_min_value, v - settings.opaque_palette_margin
+                )
+            )
+        else:
+            continue
+        selected[active] = 255
+    x, y, a, b = map(round, box)
+    pad = round((b - y) * settings.opaque_brand_padding)
+    x, y, a, b = x - pad, y - pad, a + pad, b + pad
+    x, y, a, b = max(0, x), max(0, y), min(image.shape[1], a), min(image.shape[0], b)
+    bounded = np.zeros_like(selected)
+    bounded[y:b, x:a] = selected[y:b, x:a]
+    radius = settings.opaque_ink_radius
+    return cv2.dilate(
+        bounded,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1)),
+    )
+
+
 def play_icons(image):
     """通用圆形播放标识：必须同时具有圆轮廓、内置三角形和合理面积比。"""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -236,9 +272,15 @@ def play_icons(image):
         bright = (patch > max(180, float(np.percentile(patch, 99)) * 0.97)).astype(
             np.uint8
         ) * 255
-        contours, _ = cv2.findContours(
-            bright, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
+        py, px = np.indices(patch.shape)
+        inner = (px + x - cx) ** 2 + (py + y - cy) ** 2 < (r * 0.75) ** 2
+        dark = ((patch < min(80, float(np.percentile(patch, 1)) + 16)) & inner).astype(
+            np.uint8
+        ) * 255
+        contours = [
+            *cv2.findContours(bright, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0],
+            *cv2.findContours(dark, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0],
+        ]
         for contour in contours:
             area = cv2.contourArea(contour)
             if not 0.025 * np.pi * r * r < area < 0.45 * np.pi * r * r:
@@ -287,3 +329,49 @@ def residual_components(result, palette, target_mask):
         ):
             mask[component] = 255
     return cv2.dilate(mask, np.ones((7, 7), np.uint8))
+
+
+def complete_play_support(image, box):
+    """自动轨迹邻域内的圆轮廓与居中三角形共同确认完整播放图形。"""
+    from .hls_settings import HLSSettings
+
+    settings = HLSSettings.from_env()
+    height, width = image.shape[:2]
+    x, y, a, b = map(round, box)
+    side = max(1, b - y)
+    pad = round(side * settings.graphic_search_padding)
+    left, top, right, bottom = (
+        max(0, x - pad),
+        max(0, y - pad),
+        min(width, a + pad),
+        min(height, b + pad),
+    )
+    patch = image[top:bottom, left:right]
+    mask = np.zeros((height, width), np.uint8)
+    evidence = []
+    if not patch.size:
+        return mask, evidence
+    gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+    enhanced = cv2.cvtColor(
+        cv2.createCLAHE(clipLimit=2, tileGridSize=(8, 8)).apply(gray),
+        cv2.COLOR_GRAY2BGR,
+    )
+    for view in [patch, enhanced]:
+        for item in play_icons(view):
+            cx, cy, r = item["circle"]
+            cx += left
+            cy += top
+            if (
+                not side * settings.graphic_size_min_ratio
+                <= 2 * r
+                <= side * settings.graphic_size_max_ratio
+            ):
+                continue
+            overlap = max(0, min(cx + r, a) - max(cx - r, x)) * max(
+                0, min(cy + r, b) - max(cy - r, y)
+            )
+            if overlap < settings.graphic_anchor_overlap * np.pi * r * r:
+                continue
+            cv2.circle(mask, (round(cx), round(cy)), round(r + 3), 255, -1)
+            evidence.append(dict(circle=[cx, cy, r], 依据="圆轮廓与居中三角形共同确认"))
+    return mask, evidence

@@ -323,7 +323,7 @@ def test_encoded_clarity_below_point_seven_is_recorded_without_failure(
     mapping = tmp_path / "mapping.json"
     mapping.write_text(json.dumps({"帧映射": [i // 2 for i in range(12)]}))
     detected = tmp_path / "detected.json"
-    detected.write_text("{}")
+    detected.write_text(json.dumps({"scenes": [[0, 6]], "tracks": []}))
     alpha = tmp_path / "alpha.npz"
     np.savez(alpha, alpha=np.zeros((96, 128), np.float32))
     mask = np.zeros((96, 128), np.uint8)

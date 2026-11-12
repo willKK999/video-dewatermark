@@ -136,11 +136,16 @@ def process(job, dsn, s3, bucket, workdir, engine):
             if job["options"].get("hls"):
                 from .hls import execute_hls
 
-                def progress(current, total, phase):
+                def progress(current, total, phase, **details):
                     store.set_progress(
                         dsn,
                         job,
-                        dict(current_chunk=current, total_chunks=total, phase=phase),
+                        dict(
+                            current_chunk=current,
+                            total_chunks=total,
+                            phase=phase,
+                            **details,
+                        ),
                     )
 
                 result_path, result, timings = execute_hls(

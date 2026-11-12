@@ -103,7 +103,6 @@ class NativeReferences:
             target = index + offset
             if not a <= target < b:
                 continue
-            other = self.guide(target)
             forward = self.motion(index, target)
             backward = self.motion(target, index)
             reverse = cv2.remap(
