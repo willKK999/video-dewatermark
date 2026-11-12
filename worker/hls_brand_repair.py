@@ -1,6 +1,6 @@
 """按编码后品牌证据补修独立小字，原检测、时间轴及画质参数保持不变。"""
 
-import json,time
+import json,time,os
 from pathlib import Path
 import cv2,numpy as np
 from .branding import opaque_brand_ink
@@ -37,6 +37,7 @@ def patch(work, assets_path):
         if saved.exists() and json.loads(saved.read_text()).get('输出摘要')==digest:return
         root.rename(work/('brand-ink-repair-previous-'+str(time.time_ns())))
     root.mkdir();(root/'masks').mkdir()
+    os.link(video,root/'before.mp4')
     mapping=json.loads((work/'native/native-report.json').read_text())['帧映射']
     detected=json.loads(Path(info['detected']).read_text())
     files=sorted((work/'frames').glob('*.png'))
