@@ -50,7 +50,8 @@ def block_report(work, index, plan, review=None):
     return dict(
         块号=index,
         是否通过=passed,
-        自动复检通过=verified.get("通过") is True,
+        自动复检通过=(verified["候选数"] == 0 if verified.get("候选数") is not None else None),
+        误报逐项复核通过=bool(verified.get("人工误报复核")),
         残留=residual,
         低频残留=low,
         闪烁=flicker,

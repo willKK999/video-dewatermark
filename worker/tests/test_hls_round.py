@@ -138,3 +138,12 @@ def test_evidence_export_keeps_v0_values_and_failure_state(tmp_path):
     )
     assert result["各块"][0]["清晰度原始记录"]["全部样本"][0]["retention_ratio"] == 0
     assert json.loads((delivery / "report-v0-原始.json").read_text()) == original
+
+
+def test_manual_false_positive_review_is_not_mislabeled_as_zero_raw_candidates(tmp_path):
+    import json
+    from scripts.hls_v0 import block_report
+    (tmp_path / 'verified.json').write_text(json.dumps(dict(通过=True, 候选数=2, 残留=0, 低频残留=0, 人工误报复核={"逐项复核": [1,2]})))
+    report=block_report(tmp_path,3,{},dict(无闪烁=True,目检通过=True))
+    assert report['是否通过'] and report['误报逐项复核通过']
+    assert report['自动复检通过'] is False
