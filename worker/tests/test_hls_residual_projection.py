@@ -52,3 +52,13 @@ def test_projection_cannot_create_inverse_stamp_after_source_stamp_disappears():
     regions=[dict(id=1,mask=mask)]
     assert visible_support(image,prior,regions,{1:mask}).any()
     assert not visible_support(np.full_like(image,100),prior,regions,{1:mask}).any()
+
+
+def test_subpixel_correction_is_not_rounded_away_and_has_no_temporal_randomness():
+    image = np.full((192,256,3),128,np.uint8)
+    mask = np.full(image.shape[:2],255,np.uint8)
+    correction = np.full(image.shape,.2,np.float32)
+    result = apply_correction(image,correction,mask)
+    assert abs(result.mean()-127.8)<.015
+    assert np.array_equal(result,apply_correction(image,correction,mask))
+    assert np.array_equal(apply_correction(image+np.uint8(3),correction,mask).astype(int)-result.astype(int),np.full_like(result,3))

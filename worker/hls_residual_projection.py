@@ -53,8 +53,24 @@ def fit_correction(template, consensus, mask):
     return out * feather[:, :, None]
 
 
-def apply_correction(image, correction, mask):
-    result = np.clip(np.rint(image.astype(np.float32) - correction), 0, 255).astype(
+def quantize_correction(correction):
+    """静态空间抖动保留亚灰阶校正均值；阈值不随帧或像素内容变化。"""
+    height, width = correction.shape[:2]
+    y, x = np.indices((height, width), dtype=np.uint32)
+    hashed = (x * np.uint32(0x1F123BB5)) ^ (y * np.uint32(0x5F356495))
+    hashed ^= hashed >> np.uint32(16)
+    hashed *= np.uint32(0x7FEB352D)
+    hashed ^= hashed >> np.uint32(15)
+    hashed *= np.uint32(0x846CA68B)
+    hashed ^= hashed >> np.uint32(16)
+    threshold = ((hashed >> np.uint32(8)).astype(np.float32) + .5) / (1 << 24)
+    base = np.floor(correction)
+    return base + ((correction - base) > threshold[:, :, None])
+
+
+def apply_correction(image, correction, mask, prequantized=False):
+    delta = correction if prequantized else quantize_correction(correction)
+    result = np.clip(np.rint(image.astype(np.float32) - delta), 0, 255).astype(
         np.uint8
     )
     result[mask == 0] = image[mask == 0]
@@ -132,7 +148,7 @@ def patch(work, assets_path):
     video = native / "chunk1.mp4"
     digest = sha256(video)
     root = work / "residual-projection"
-    method = "v7编码后多频带时域字形投影校正-2"
+    method = "v7编码后多频带时域字形投影校正-3"
     if (root / "report.json").exists() and json.loads((root / "report.json").read_text()).get("方法") != method:
         root.rename(work / (root.name + "-previous-" + str(time.time_ns())))
     root.mkdir(exist_ok=True)
@@ -192,6 +208,7 @@ def patch(work, assets_path):
     if np.count_nonzero(mask) / mask.size > HLSSettings.from_env().mask_fraction_limit:
         raise PipelineError("MASK_UNCERTAIN", "字形校正单遍超过面积保护", review=True)
     np.savez_compressed(root / "correction.npz", correction=fields, mask=mask)
+    quantized_fields = quantize_correction(fields)
     old = root / f"before-{digest[:12]}.mp4"
     shutil.copyfile(video, old)
     cap = cv2.VideoCapture(str(old))
@@ -259,7 +276,7 @@ def patch(work, assets_path):
             if not ok:
                 raise PipelineError("OUTPUT_INVALID", "残留投影输入帧不足")
             encoder.stdin.write(
-                apply_correction(image, fields, permitted(mapping[n])).tobytes()
+                apply_correction(image, quantized_fields, permitted(mapping[n]), prequantized=True).tobytes()
             )
         encoder.stdin.close()
         if encoder.wait():
