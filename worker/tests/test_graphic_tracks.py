@@ -43,3 +43,12 @@ def test_reciprocal_extent_change_uses_same_rule_for_matching_and_closing():
         [dict(frame=0, boxes=[large]), dict(frame=1, boxes=[small])], [[0, 10]]
     )
     assert [t["scenes"] for t in tracks] == [[[0, 1]], [[1, 10]]]
+
+
+def test_tail_can_shrink_but_observed_jump_growth_and_area_limit_still_fail():
+    from worker.graphic_tracks import valid_area
+
+    assert valid_area(0.05, 0.008, 9, 8)
+    assert not valid_area(0.05, 0.008, 7, 8)
+    assert not valid_area(0.008, 0.05, 9, 8)
+    assert not valid_area(0.05, 0.21, 9, 8)

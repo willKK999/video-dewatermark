@@ -433,3 +433,46 @@ def test_failure_report_keeps_completed_and_partial_stage_times(tmp_path):
     values = bench.recover_timings(tmp_path, {})
     assert values["detect"] == dict(seconds=34, reused=False, completed=True)
     assert values["inpaint"] == dict(seconds=17, reused=False, completed=False)
+
+
+def test_resumed_processing_never_reports_cold_speed_factors(tmp_path, monkeypatch):
+    import sys
+
+    source, baseline = tmp_path / "source.mp4", tmp_path / "baseline.mp4"
+    source.write_bytes(b"source")
+    baseline.write_bytes(b"baseline")
+    output = tmp_path / "output"
+
+    def prepare(args, phases):
+        phases.timings["sam"] = dict(seconds=0, reused=True, original_seconds=356)
+
+    monkeypatch.setattr(bench, "prepare_run", prepare)
+    monkeypatch.setattr(bench, "assess", lambda *a: dict(通过=None))
+    for name in [
+        "PROPAINTER_ROI",
+        "PROPAINTER_ROI_MARGIN",
+        "SAM_SPEEDUP",
+        "SAM_STATE_ON_GPU",
+        "SAM_PREPARE_MAX_EDGE",
+        "SAM_HINT_STRIDE",
+    ]:
+        monkeypatch.setenv(name, "未启用")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "基准",
+            "--run",
+            "--source",
+            str(source),
+            "--baseline",
+            str(baseline),
+            "--output",
+            str(output),
+        ],
+    )
+    bench.main()
+    report = json.loads((output / "report.json").read_text())
+    assert report["复用检查点"] and not report["可用于冷启动提速结论"]
+    assert report["三倍提速目标达成"] is None
+    assert report["相对分项基线倍数"] is None and report["相对整集首块倍数"] is None

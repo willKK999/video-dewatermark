@@ -71,3 +71,13 @@ def associate(rows, scenes):
             finish = min(end, points[-1]["frame"] + 31, track.get("closed", end))
             result.append(dict(scenes=[[points[0]["frame"], finish]], hints=points))
     return result
+
+
+def valid_area(previous, area, frame, last_observation):
+    """带尾部上下文的图形允许退场缩小；观测期突变、尾部增长和面积超限仍拒绝。"""
+    from .workflow import abrupt_area
+
+    return area <= 0.2 and (
+        not abrupt_area(previous, area)
+        or (frame > last_observation and area < previous)
+    )

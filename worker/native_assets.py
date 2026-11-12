@@ -345,6 +345,7 @@ def prepare_graphics(work, detections, assets, fast, check=lambda: None):
     for file in files:
         cv2.imwrite(str(graphic / "masks" / file.name), np.zeros((h, w), np.uint8))
     records, text_review, accepted_intervals = [], [], []
+    lifecycle_transitions = []
     references = None
     known_banks = []
     for identity, seed in enumerate(seeds):
@@ -401,6 +402,7 @@ def prepare_graphics(work, detections, assets, fast, check=lambda: None):
             check,
         )
         from .workflow import bounded_mask, interpolated_box, abrupt_area
+        from .graphic_tracks import valid_area
 
         for start, end in seed["scenes"]:
             previous_area = None
@@ -419,9 +421,22 @@ def prepare_graphics(work, detections, assets, fast, check=lambda: None):
                     component, interpolated_box(hints, index), image
                 )
                 area = np.count_nonzero(component) / component.size
-                if area > 0.2 or abrupt_area(previous_area, area):
+                if not valid_area(
+                    previous_area, area, index, max(p["frame"] for p in hints)
+                ):
                     raise PipelineError(
                         "MASK_UNCERTAIN", "图形分割超过面积或漂移门槛", review=True
+                    )
+                if abrupt_area(previous_area, area):
+                    lifecycle_transitions.append(
+                        dict(
+                            track=identity,
+                            frame=index,
+                            previous_area=previous_area,
+                            area=area,
+                            last_observation=max(p["frame"] for p in hints),
+                            依据="模型最后观测后的尾部缩小，仍须核验原片与编码成品的残留和闪烁",
+                        )
                     )
                 previous_area = area
                 cv2.imwrite(str(file), component)
@@ -484,6 +499,9 @@ def prepare_graphics(work, detections, assets, fast, check=lambda: None):
             )
         cv2.imwrite(str(graphic / "masks" / f"{index:06d}.png"), mask)
     scenes = accepted_intervals
+    (graphic / "lifecycle-transitions.json").write_text(
+        json.dumps(lifecycle_transitions, ensure_ascii=False, indent=2)
+    )
     (graphic / "covered-observations.json").write_text(
         json.dumps(covered_points, ensure_ascii=False, indent=2)
     )

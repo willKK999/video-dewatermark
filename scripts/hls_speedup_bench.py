@@ -843,9 +843,13 @@ def main():
             )
             seconds = report["本次处理耗时秒"]
             report["相对分项基线倍数"] = (
-                sum(BASELINE_SECONDS.values()) / seconds if seconds else None
+                sum(BASELINE_SECONDS.values()) / seconds
+                if seconds and report["可用于冷启动提速结论"]
+                else None
             )
-            report["相对整集首块倍数"] = 3219 / seconds if seconds else None
+            report["相对整集首块倍数"] = (
+                3219 / seconds if seconds and report["可用于冷启动提速结论"] else None
+            )
             report["三倍提速目标达成"] = (
                 report["本次处理耗时秒"] < sum(BASELINE_SECONDS.values()) / 3
                 if report["可用于冷启动提速结论"]
