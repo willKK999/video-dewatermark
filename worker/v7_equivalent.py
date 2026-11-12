@@ -19,6 +19,14 @@ REQUIRED_ASSETS = (
     "variant_seed_image",
     "variant_seed_mask",
 )
+REQUIRED_RUN_ASSETS = (*REQUIRED_ASSETS, "low_band_template")
+
+
+def require_inputs(assets):
+    if any(key not in assets for key in REQUIRED_RUN_ASSETS):
+        raise PipelineError(
+            "MODEL_INVALID", "七版固定输入不完整：须从原片重建核心九项及低频模板"
+        )
 
 
 def run_chunk(
@@ -32,11 +40,7 @@ def run_chunk(
     stage=lambda _: None,
 ):
     """模型、图形、分层和补修全用七版入口，不启用实验提示或局部裁剪。"""
-    missing = [key for key in REQUIRED_ASSETS if key not in assets]
-    if missing:
-        raise PipelineError(
-            "MODEL_INVALID", "七版固定输入不完整，不能用新的图形判定代替"
-        )
+    require_inputs(assets)
     if work.exists() and any(work.iterdir()):
         raise PipelineError(
             "OUTPUT_INVALID", "七版等价处理必须使用全新空块目录，不读取旧阶段检查点"
@@ -79,6 +83,7 @@ def run_chunk(
                 source_sha256=source_hash,
                 **canonical_assets,
                 sha256={k: digest(v) for k, v in assets.items() if Path(v).is_file()},
+                low_band_sha256=digest(assets["low_band_template"]),
             )
         )
     )
@@ -161,6 +166,8 @@ def audit_chunk(source, result, work, plan, assets, check=lambda: None, enforce=
     """编码后核验复用七版函数，只适配整集主体帧范围。"""
     import shutil
 
+    require_inputs(assets)
+
     qa = work / "final-audit-v7"
     if qa.exists():
         shutil.rmtree(qa)
@@ -213,6 +220,8 @@ def audit_chunk(source, result, work, plan, assets, check=lambda: None, enforce=
         qa, canonical_assets, info, source_frame_offset=lo, result_path=target
     )
     verified = json.loads((qa / "verified.json").read_text())
+    if verified.get("低频复检") is None:
+        raise PipelineError("OUTPUT_INVALID", "原低频复检证据缺失，不能记为零残留")
     raw = json.loads((qa / "audit/quality.json").read_text())
     brand = json.loads((qa / "audit/brand.json").read_text())
     clarity = json.loads((qa / "audit/clarity.json").read_text())

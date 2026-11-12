@@ -1,4 +1,4 @@
-"""按七版原始生成顺序，在本次运行内从原片建立九项输入。"""
+"""按七版原始生成顺序，在本次运行内从原片建立核心九项及低频复检素材。"""
 
 import json
 import os
@@ -17,7 +17,30 @@ from .matte import fit_overlay
 from .process import PipelineError, run
 from .roi_inpaint import digest
 from .short_brand import discover
-from .v7_equivalent import REQUIRED_ASSETS
+from .v7_equivalent import REQUIRED_ASSETS, REQUIRED_RUN_ASSETS
+
+
+def low_band_template(samples, prior, root, check=lambda: None):
+    """原低频诊断配方：全部秒级样本缩到共识尺寸，五组中位数再取中位数。"""
+    from .low_frequency import band
+
+    median, _, _, _, _ = multitrack.load_prior(prior)
+    files = sorted(samples.glob("*.jpg"))
+    if len(files) < 15:
+        raise PipelineError("TEMPORAL_UNCERTAIN", "原低频五组共识样本不足", review=True)
+    groups = []
+    for indices in np.array_split(np.arange(len(files)), 5):
+        values = []
+        for index in indices:
+            check()
+            image = cv2.resize(
+                cv2.imread(str(files[index])), (median.shape[1], median.shape[0])
+            )
+            values.append(band(image))
+        groups.append(np.median(np.stack(values), axis=0))
+    np.savez_compressed(
+        root / "low-band.npz", template=np.median(np.stack(groups), axis=0)
+    )
 
 
 def calibrate(samples, prior, root):
@@ -227,6 +250,7 @@ def rebuild(source, root, source_hash, check=lambda: None, seconds=27):
         raise PipelineError("TEMPORAL_UNCERTAIN", "原生秒级样本不足十五帧", review=True)
     perform("calibration", lambda: calibrate(samples, prior, root))
     perform("template", lambda: build(samples, root / "template.npz", 3))
+    perform("low_band_template", lambda: low_band_template(samples, prior, root, check))
 
     bootstrap = root / "bootstrap"
     bootstrap.mkdir()
@@ -454,16 +478,20 @@ def rebuild(source, root, source_hash, check=lambda: None, seconds=27):
         color_seed_mask=root / "color-seed-mask.png",
         variant_seed_image=root / "variant-seed-image.png",
         variant_seed_mask=root / "variant-seed-mask.png",
+        low_band_template=root / "low-band.npz",
     )
-    assert set(assets) == set(REQUIRED_ASSETS)
+    assert set(assets) == set(REQUIRED_RUN_ASSETS)
     (root / "rebuilt-assets.json").write_text(
         json.dumps(
             dict(
                 method="v7",
                 source_sha256=source_hash,
                 本次从原片重建=True,
+                核心项目=list(REQUIRED_ASSETS),
+                复检附加项=["low_band_template"],
                 **{key: str(value.resolve()) for key, value in assets.items()},
                 sha256={key: digest(value) for key, value in assets.items()},
+                low_band_sha256=digest(assets["low_band_template"]),
                 源码摘要={
                     name: digest(Path(__file__).with_name(name))
                     for name in (
@@ -473,6 +501,7 @@ def rebuild(source, root, source_hash, check=lambda: None, seconds=27):
                         "matte.py",
                         "short_brand.py",
                         "sam_stage.py",
+                        "low_frequency.py",
                     )
                 },
             ),

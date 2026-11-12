@@ -99,6 +99,13 @@ def setup_rebuild(tmp_path, monkeypatch, seed_exists=True):
     monkeypatch.setattr(rebuild.vision, "inpaint", inpaint)
     monkeypatch.setattr(rebuild, "Supports", Supports)
     monkeypatch.setattr(rebuild, "calibrate", calibrate)
+    monkeypatch.setattr(
+        rebuild,
+        "low_band_template",
+        lambda samples, prior, root, check: np.savez(
+            root / "low-band.npz", template=mask
+        ),
+    )
     monkeypatch.setattr(rebuild, "discover", seed)
     monkeypatch.setattr(rebuild, "palette_support", lambda *a: np.zeros_like(mask))
     monkeypatch.setattr(rebuild, "run", run)
@@ -128,7 +135,7 @@ def test_all_nine_inputs_are_built_in_order_without_frozen_material(
     source, calls = setup_rebuild(tmp_path, monkeypatch)
     root = tmp_path / "new"
     assets = rebuild.rebuild(source, root, digest(source))
-    assert set(assets) == set(rebuild.REQUIRED_ASSETS)
+    assert set(assets) == set(rebuild.REQUIRED_RUN_ASSETS)
     assert all(path.is_file() and path.is_relative_to(root) for path in assets.values())
     assert (
         calls.index("calibration")
@@ -293,3 +300,55 @@ def test_original_remainder_threshold_and_mask_union(
     if expected:
         assert calls == [[(0, 3)]]
         assert cv2.imread(str(graphic / "masks/000001.png"), 0)[5, 8] == 255
+
+
+def test_original_low_band_uses_five_group_medians_at_prior_resolution(
+    tmp_path, monkeypatch
+):
+    from worker import low_frequency
+
+    samples = tmp_path / "samples"
+    samples.mkdir()
+    values = [0, 0, 255, 255] + [1] * 3 + [2] * 3 + [3] * 3 + [4] * 3
+    for i in range(len(values)):
+        (samples / f"{i:06d}.jpg").touch()
+    monkeypatch.setattr(
+        rebuild.multitrack,
+        "load_prior",
+        lambda _: (np.zeros((4, 8)), None, None, None, None),
+    )
+    monkeypatch.setattr(
+        rebuild.cv2,
+        "imread",
+        lambda name: np.full((8, 16, 3), values[int(Path(name).stem)], np.uint8),
+    )
+    monkeypatch.setattr(
+        low_frequency, "band", lambda image: image[:, :, 0].astype(np.float32)
+    )
+    rebuild.low_band_template(samples, tmp_path / "prior", tmp_path)
+    template = np.load(tmp_path / "low-band.npz")["template"]
+    assert template.shape == (4, 8) and (template == 3).all()
+    assert float(np.median(values)) == 2.5
+
+
+def test_comparison_includes_original_additional_low_band_without_importing_it(
+    tmp_path,
+):
+    root = tmp_path / "rebuilt"
+    reference = tmp_path / "low-band.npz"
+    np.savez(reference, template=np.ones((4, 8), np.float32))
+    manifest = tmp_path / "frozen.json"
+    manifest.write_text(
+        json.dumps(
+            dict(
+                method="v7",
+                source_sha256="原片",
+                low_band_template=str(reference),
+                low_band_sha256=digest(reference),
+            )
+        )
+    )
+    report = compare(root, manifest, "原片")
+    row = next(r for r in report["项目"] if r["项目"] == "low_band_template")
+    assert row["状态"] == "本次尚未重建" and report["项目数"] == 10
+    assert not report["完整重建"] and not root.exists()

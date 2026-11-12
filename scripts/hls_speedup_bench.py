@@ -741,7 +741,7 @@ def parser():
     mode.add_argument(
         "--run",
         action="store_true",
-        help="从原片重建九项输入并运行七版等价完整流程；仅在设备空闲后使用",
+        help="从原片重建九项输入及低频复检素材，运行七版等价完整流程；仅在设备空闲后使用",
     )
     mode.add_argument(
         "--candidate",

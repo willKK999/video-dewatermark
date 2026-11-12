@@ -138,7 +138,7 @@ def test_canonical_chunk_calls_original_prepare_gpu_and_native_stages(
     tmp_path, monkeypatch
 ):
     assets = {}
-    for key in v7_equivalent.REQUIRED_ASSETS:
+    for key in v7_equivalent.REQUIRED_RUN_ASSETS:
         path = tmp_path / (key + ".npz")
         path.write_bytes(key.encode())
         assets[key] = path
@@ -335,7 +335,7 @@ def test_canonical_runner_refuses_old_stage_files_instead_of_claiming_cold_start
     work = tmp_path / "old"
     work.mkdir()
     (work / "prepared.json").write_text("{}")
-    assets = {name: tmp_path / name for name in v7_equivalent.REQUIRED_ASSETS}
+    assets = {name: tmp_path / name for name in v7_equivalent.REQUIRED_RUN_ASSETS}
     with pytest.raises(PipelineError, match="全新空块目录"):
         v7_equivalent.run_chunk(
             tmp_path / "source.mp4",
@@ -374,3 +374,47 @@ def test_model_launcher_keeps_existing_packages_first_and_disables_all_bytecode_
             ["scripts.hls_speedup_bench", "--run", "--output", "独立输出"],
         )
     ]
+
+
+def test_core_inputs_without_low_band_template_cannot_skip_original_gate(tmp_path):
+    from worker.process import PipelineError
+
+    assets = {name: tmp_path / name for name in v7_equivalent.REQUIRED_ASSETS}
+    with pytest.raises(PipelineError, match="低频模板"):
+        v7_equivalent.run_chunk(None, tmp_path / "work", {}, assets, {}, "原片")
+    assert not (tmp_path / "work").exists()
+
+
+def test_missing_low_band_evidence_cannot_be_reported_as_zero_residual(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+    from worker.process import PipelineError
+
+    work = tmp_path / "work"
+    (work / "native").mkdir(parents=True)
+    (work / "native/native-report.json").write_text(
+        json.dumps(dict(帧映射=list(range(12)), 原片帧索引=list(range(12)), 帧数=12))
+    )
+    (work / "prepared.json").write_text("{}")
+    monkeypatch.setattr(
+        v7_equivalent.cv2,
+        "VideoCapture",
+        lambda _: SimpleNamespace(get=lambda _: 12, release=lambda: None),
+    )
+
+    def incomplete_verify(qa, *args, **kwargs):
+        (qa / "verified.json").write_text(
+            json.dumps(dict(通过=True, 残留=0, 低频复检=None))
+        )
+
+    monkeypatch.setattr(hls_v7, "verify_block", incomplete_verify)
+    assets = {name: tmp_path / name for name in v7_equivalent.REQUIRED_RUN_ASSETS}
+    with pytest.raises(PipelineError, match="低频复检证据缺失"):
+        v7_equivalent.audit_chunk(
+            None,
+            tmp_path / "candidate.mp4",
+            work,
+            dict(left=0, start=0, end=12, right=12),
+            assets,
+        )

@@ -24,6 +24,7 @@ def rebuilt_paths(root):
             color_seed_mask="color-seed-mask.png",
             variant_seed_image="variant-bootstrap/seed-image.png",
             variant_seed_mask="variant-bootstrap/seed-mask.png",
+            low_band_template="low-band.npz",
         ).items()
     }
     return paths
@@ -94,11 +95,19 @@ def compare(root, frozen, source_hash):
         raise ValueError("冻结对照与原片摘要不一致")
     rows = []
     for name, current in rebuilt_paths(Path(root)).items():
+        if (
+            name == "low_band_template"
+            and not baseline.get(name)
+            and not current.is_file()
+        ):
+            continue
         row = dict(
             项目=name,
             重建路径=str(current),
             冻结摘要=baseline.get("sha256", {}).get(name),
         )
+        if name == "low_band_template":
+            row["冻结摘要"] = row["冻结摘要"] or baseline.get("low_band_sha256")
         reference = Path(baseline[name]) if name in baseline else None
         if reference is None or not reference.is_file():
             row["状态"] = "冻结项缺失"
@@ -158,7 +167,8 @@ def compare(root, frozen, source_hash):
         冻结结果参与处理=False,
         项目=rows,
         完整重建=all(r["状态"] == "已比较" for r in rows),
-        项目数=len(REQUIRED_ASSETS),
+        项目数=len(rows),
+        核心项目数=len(REQUIRED_ASSETS),
     )
 
 
@@ -171,7 +181,10 @@ def main():
         help="本次运行的素材根目录，可含失败前的部分结果",
     )
     p.add_argument(
-        "--comparison-assets", type=Path, required=True, help="冻结九项清单，只读评价"
+        "--comparison-assets",
+        type=Path,
+        required=True,
+        help="冻结核心九项及附加素材清单，只读评价",
     )
     p.add_argument("--source", type=Path, required=True, help="原片，仅计算摘要")
     p.add_argument("--output", type=Path, required=True, help="独立差异报告")
@@ -179,7 +192,9 @@ def main():
     report = compare(a.rebuilt, a.comparison_assets, digest(a.source))
     protected = [a.source, a.comparison_assets, *rebuilt_paths(a.rebuilt).values()]
     frozen = json.loads(a.comparison_assets.read_text())
-    protected.extend(Path(frozen[name]) for name in REQUIRED_ASSETS if name in frozen)
+    protected.extend(
+        Path(frozen[name]) for name in rebuilt_paths(a.rebuilt) if name in frozen
+    )
     if any(a.output.resolve() == path.resolve() for path in protected):
         p.error("差异报告不得覆盖任一输入")
     a.output.parent.mkdir(parents=True, exist_ok=True)
