@@ -1162,8 +1162,9 @@ def test_graphic_pixel_prompt_excludes_background_and_rejects_missing_support():
     assert not prompt[10, 20]
     with pytest.raises(PipelineError, match="像素提示"):
         graphic_prompt(image, [0, 30, 40, 70], palette)
-    with pytest.raises(PipelineError, match="像素提示"):
-        graphic_prompt(image, [20, 10, 50, 30], np.empty((0, 3)))
+    assert np.array_equal(
+        graphic_prompt(image, [20, 10, 50, 30], np.empty((0, 3))), prompt
+    )
 
 
 def test_graphic_range_guard_does_not_add_background_or_repeat_text_dilation():
@@ -1176,3 +1177,19 @@ def test_graphic_range_guard_does_not_add_background_or_repeat_text_dilation():
     assert not bounded_graphic_mask(np.zeros_like(mask), [40, 10, 100, 80]).any()
     mask[85:95, 130:150] = 255
     assert not bounded_graphic_mask(mask, [50, 20, 90, 40])[85:95].any()
+
+
+def test_graphic_prompt_supports_new_colors_and_excludes_pale_flat_background():
+    from worker.native_assets import graphic_prompt
+
+    image = np.full((120, 180, 3), 225, np.uint8)
+    image[35:45, 45:65] = (0, 255, 255)
+    image[55:65, 75:95] = (0, 255, 0)
+    image[40:48, 100:125] = 255
+    white_palette = cv2.cvtColor(np.uint8([[[255, 255, 255]]]), cv2.COLOR_BGR2LAB)[0]
+    mask = graphic_prompt(image, [30, 25, 140, 85], white_palette)
+    assert np.all(mask[35:45, 45:65])
+    assert np.all(mask[55:65, 75:95])
+    assert np.all(mask[40:48, 100:125])
+    assert not mask[75:85, 40:130].any()
+    assert not mask[:10].any()

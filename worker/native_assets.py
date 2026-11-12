@@ -227,6 +227,8 @@ def confirmed_template(image, box, assets, banks):
 def graphic_prompt(image, box, palette):
     """只用自动检测范围内、源片可验证的品牌颜色引导分割，不能把矩形当作前景。"""
     from .branding import palette_support, grow_brand_components
+    from .hls_settings import HLSSettings
+    from .multitrack import highpass
 
     h, w = image.shape[:2]
     x, y, a, b = map(round, box)
@@ -235,6 +237,17 @@ def graphic_prompt(image, box, palette):
     if a > x and b > y:
         # 颜色支持在整帧计算，不能把检测框边界误当作原片画面边界。
         support = palette_support(image, palette)
+        settings = HLSSettings.from_env()
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        white = (hsv[:, :, 1] < settings.opaque_white_saturation) & (
+            hsv[:, :, 2] > settings.opaque_white_min_value
+        )
+        # 全片先验不能代表所有新图形的颜色。沿用已有通用高饱和度分量判据，
+        # 白色沿用主流程不透明阈值并要求真实明暗笔画，避免把浅色背景当成提示。
+        colorful = (hsv[:, :, 1] > 160) & (hsv[:, :, 2] > 90)
+        white &= np.abs(highpass(image)) >= 0.5
+        support[(hsv[:, :, 1] <= 90) & ~white] = 0
+        support[colorful | white] = 255
         mask[y:b, x:a] = support[y:b, x:a]
         # 检测器可能只框住图标的一部分；复用七版短时品牌的相邻笔画补全。
         mask |= grow_brand_components(support, [box])
