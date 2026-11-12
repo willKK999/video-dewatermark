@@ -68,7 +68,12 @@ def test_real_graphic_masks_match_frozen_main_function_per_frame(tmp_path):
     random = np.random.default_rng(9)
     image = random.integers(20, 90, (96, 128, 3), dtype=np.uint8)
     mask = np.zeros((96, 128), np.uint8)
-    cv2.putText(mask, "A7", (35, 55), cv2.FONT_HERSHEY_SIMPLEX, 1, 255, 2)
+    cv2.putText(
+        mask, "A7", (35, 55), cv2.FONT_HERSHEY_SIMPLEX, 1, 255, 2, lineType=cv2.LINE_8
+    )
+    # 新字库仍可能绘制灰度边缘；合成测试输入须明确为二值，不改变生产掩膜判定。
+    mask = np.where(mask > 0, 255, 0).astype(np.uint8)
+    assert set(np.unique(mask)) <= {0, 255}
     image[mask > 0] = 255
     cv2.imwrite(str(root / "image.png"), image)
     cv2.imwrite(str(root / "mask.png"), mask)
