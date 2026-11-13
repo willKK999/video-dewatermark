@@ -8,10 +8,11 @@ from worker.process import run
 from worker.vision import sha256
 
 
-def source(root, rate=15):
+def source(root, rate=15, video_offset=0):
     (root / 'out').mkdir()
     path = root / 'source.mp4'
-    run(['ffmpeg','-v','error','-y','-f','lavfi','-i',f'testsrc2=size=64x96:rate={rate}',
+    run(['ffmpeg','-v','error','-y','-itsoffset',str(video_offset),
+         '-f','lavfi','-i',f'testsrc2=size=64x96:rate={rate}',
          '-f','lavfi','-i','sine=sample_rate=44100','-t','2.07','-c:v','libx264',
          '-threads','1','-pix_fmt','yuv420p','-c:a','aac',path])
     return path
@@ -79,3 +80,20 @@ def test_delivery_keeps_full_source_audio_and_does_not_claim_acceptance(tmp_path
     assert report['通过'] is False
     assert report['未通过块'] == [1]
     assert report['输出规格']['帧率'] == 15
+
+
+def test_delivery_retains_nonzero_video_origin_relative_to_audio(tmp_path):
+    path = source(tmp_path, video_offset=.2)
+    data = runner.initialize(tmp_path, sha256(path))
+    chunk = tmp_path / 'out/chunk-01'
+    chunk.mkdir()
+    run(['ffmpeg','-v','error','-y','-i',path,'-an','-c:v','copy',chunk/'video.mp4'])
+    runner.write(chunk/'report.json',dict(块号=1,核验={},阶段失败=[]))
+    runner.deliver(tmp_path, data)
+    def origin(media):
+        streams=runner.media.probe(media)['streams']
+        v=next(p for p in streams if p['codec_type']=='video')
+        a=next(p for p in streams if p['codec_type']=='audio')
+        return float(v['start_time'])-float(a['start_time'])
+    assert origin(path) > 0
+    assert abs(origin(path)-origin(tmp_path/'out/整集-v0.mp4')) < .001

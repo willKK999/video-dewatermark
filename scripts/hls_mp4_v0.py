@@ -280,8 +280,13 @@ def deliver(root,data):
     run(["ffmpeg","-v","error","-y","-f","concat","-safe","0","-i",listing,
          "-c","copy",silent])
     result=output/"整集-v0.mp4"
+    original=media.probe(root/"source.mp4")
+    original_video=next(s for s in original["streams"] if s["codec_type"]=="video")
+    video_offset=(float(original_video.get("start_time",0))
+                  -float(original["format"].get("start_time",0)))
     # 不限制音轨时长、不使用 shortest，完整复制原片全部 AAC 包。
-    run(["ffmpeg","-v","error","-y","-i",silent,"-i",root/"source.mp4",
+    run(["ffmpeg","-v","error","-y","-itsoffset",str(video_offset),
+         "-i",silent,"-i",root/"source.mp4",
          "-map","0:v:0","-map","1:a:0?","-c","copy","-movflags","+faststart",result])
     comparison=output/"对比-原片vs整集-v0.mp4"
     run(["ffmpeg","-v","error","-y","-threads","2","-i",root/"source.mp4","-i",result,
