@@ -168,12 +168,24 @@ def execute_one(args):
         if args.prepare_only:
             write(output/'prepared.json',dict(仅准备=True,预算=budget,实际模型补画轮数=0))
             return
-        manifest=step('mask',lambda:vision.masks(work,files,detected,'propainter',budget=budget))
+        def masks():
+            if args.reuse_validated_masks:
+                summary=read(work/'model-mask-summary.json')
+                verified=VerifiedLayers(work/'layers.json',work/'detections.json')
+                if len(summary.get('逐帧',[]))!=len(files):raise PipelineError('MASK_INVALID','分割缓存帧数不完整')
+                for i,item in enumerate(summary['逐帧']):
+                    path=work/item['mask_key']
+                    if vision.sha256(path)!=item['sha256']:raise PipelineError('MASK_INVALID','分割缓存摘要不一致')
+                    verified.validate(i,cv2.imread(str(path),0))
+                log('第1块 mask复用已校验的本输入SAM检查点；不重新分割')
+                return summary['逐帧']
+            return vision.masks(work,files,detected,'propainter',budget=budget)
+        manifest=step('mask',masks)
         summaries=read(work/'layers.json');current=work/'frames'
         for k,layer in enumerate(summaries['layers']):
             layer_root=Path(layer['directory']).parent
             (layer_root/'frames').symlink_to(current,target_is_directory=True)
-            step(f'inpaint-{k+1}',lambda:vision.inpaint(layer_root,sorted((layer_root/'frames').glob('*.png')),detected['scenes'],'propainter',True))
+            step(f'inpaint-{k+1}',lambda:vision.inpaint(layer_root,sorted((layer_root/'frames').glob('*.png')),detected['scenes'],'propainter',True,condition_overlap=args.condition_overlap))
             current=layer_root/'composite'
             if len(list(current.glob('*.png')))!=len(files):raise PipelineError('OUTPUT_INCOMPLETE','补画帧不完整，禁止原帧回退')
         if not summaries['layers']:raise PipelineError('MASK_UNCERTAIN','没有可用的已验证掩膜图层')
@@ -196,7 +208,7 @@ def execute_one(args):
                     总耗时秒=time.monotonic()-started,原帧回退数=0,主体帧数=core,处理输入帧数=len(files),
                     视频=str(video),视频摘要=vision.sha256(video),核验=quality,
                     轨迹数=len(detected['tracks']),预算=budget,
-                    实际补画图层=len(summaries['layers']),模型参数=dict(窗口=HLSSettings.from_env().window_frames,重叠=HLSSettings.from_env().overlap_frames,降分辨率=False),
+                    实际补画图层=len(summaries['layers']),复用分割=args.reuse_validated_masks,模型参数=dict(窗口=HLSSettings.from_env().window_frames,重叠=HLSSettings.from_env().overlap_frames,降分辨率=False,重叠上下文=args.condition_overlap),
                     输出规格=media.probe(video),目检完成=False,说明='模型结果仅作验证；候选与目检未通过不得宣称验收通过')
         write(output/'report.json',report);log(f'第1块 本轮完成 原帧回退=0 残留候选={quality["残留候选数"]} 闪烁候选={len(quality["闪烁候选"])} 清晰度最低={quality["清晰度"]["最小保留比"]}')
     except Exception as exc:
@@ -215,6 +227,8 @@ def main():
     p.add_argument('--context',type=float,default=HLSSettings.from_env().context_seconds)
     p.add_argument('--iteration',type=int,choices=[1,2,3],required=True)
     p.add_argument('--prepare-only',action='store_true')
+    p.add_argument('--reuse-validated-masks',action='store_true')
+    p.add_argument('--condition-overlap',action='store_true')
     args=p.parse_args()
     if args.duration<=0 or args.context<0 or args.duration+args.context>30:p.error('主体与上下文总输入须在30秒内')
     cv2.setNumThreads(2);execute_one(args)
