@@ -49,6 +49,14 @@ def detect_all(frames,output):
     return read(output)
 
 
+def tracked_brand_candidates(image,row,prototypes,labels,allowed):
+    """源片与结果使用同一品牌判据和自动目标包络；原始YOLO输出另行保留。"""
+    from worker.model_tracks import intersection_fraction
+    items=candidates_for_frame(image,row,prototypes,labels,ModelTrackSettings())
+    return [p for p in items if p['kind']=='prototype' or any(
+        intersection_fraction(p['model_box'],box)>.5 for box in allowed)]
+
+
 def verify(work,video,files,detected,prior,labels,core,fps,output):
     start=time.monotonic();encoded=work/'encoded';encoded.mkdir()
     run(['ffmpeg','-v','error','-y','-threads','2','-i',video,'-map','0:v:0','-fps_mode','passthrough','-start_number','0','-threads','2',encoded/'%06d.png'])
@@ -61,13 +69,10 @@ def verify(work,video,files,detected,prior,labels,core,fps,output):
     # 先保存全部YOLO候选；品牌判别与源片使用同一内容绑定模板，字幕不直接算水印。
     for i,p in enumerate(decoded):
         image=cv2.imread(str(p));source=cv2.imread(str(files[i]))
-        items=candidates_for_frame(image,rows[i],proto,labels,ModelTrackSettings())
-        original=candidates_for_frame(source,source_rows[i],proto,labels,ModelTrackSettings())
         allowed=[h['box'] for h in detected['hints'] if h['frame']==i]
-        for item in items:
-            from worker.model_tracks import intersection_fraction
-            if item['kind']=='prototype' or any(intersection_fraction(item['model_box'],b)>.5 for b in allowed):
-                brand_candidates.append(dict(frame=i,**item))
+        items=tracked_brand_candidates(image,rows[i],proto,labels,allowed)
+        original=tracked_brand_candidates(source,source_rows[i],proto,labels,allowed)
+        brand_candidates.extend(dict(frame=i,**p) for p in items)
         v0_candidates.extend(dict(frame=i,**p) for p in original)
     template_records=[];template_candidates=[]
     for track in detected['tracks']:
