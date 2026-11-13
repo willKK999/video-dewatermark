@@ -51,3 +51,4 @@ def test_actual_disagreement_is_never_hidden_or_limit_relaxed(tmp_path,monkeypat
     event=json.loads((tmp_path/'overlap-failure.json').read_text())
     assert event['limit']==35 and event['disagreement_mae']>35
     assert event['conditioned_overlap'] is conditioned
+    assert caught.value.details == event

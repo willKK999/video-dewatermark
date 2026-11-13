@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 import pytest
+import cv2
+import numpy as np
 from scripts import hls_mp4_v0 as runner
 from worker.process import run
 from worker.vision import sha256
@@ -119,3 +121,36 @@ def test_stage_timeout_is_reported_and_does_not_create_original_video(tmp_path,m
     assert record['阶段失败'][0]['详情']['timeout_seconds']==1234
     assert not (tmp_path/'out/chunk-01/video.mp4').exists()
     assert '失败块=1 失败阶段=mask' in (tmp_path/'out/progress.log').read_text()
+
+
+@pytest.mark.parametrize('failed_stage',['切块','先验校验','模型帧完整性','主体编码','编码后核验'])
+def test_failures_outside_model_execution_also_report_block_and_stage(tmp_path,monkeypatch,failed_stage):
+    from worker.process import PipelineError
+    path=source(tmp_path)
+    data=runner.initialize(tmp_path,sha256(path))
+    scratch=tmp_path/'scratch';scratch.mkdir()
+    original_run=runner.run
+    def command(args,*a,**kw):
+        if failed_stage=='切块' or (failed_stage=='主体编码' and Path(args[-1]).name=='video.mp4'):
+            raise PipelineError('PROCESS_FAILED','合成命令失败')
+        return original_run(args,*a,**kw)
+    monkeypatch.setattr(runner,'run',command)
+    if failed_stage=='先验校验':
+        def prior(*a):raise PipelineError('SOURCE_CHANGED','先验摘要不匹配')
+        monkeypatch.setattr(runner,'validated_prior',prior)
+    def model(clip,work,*a):
+        if failed_stage=='模型帧完整性':return
+        (work/'frames').mkdir();(work/'composite').mkdir()
+        for i in range(data['计划'][0]['right']):
+            image=np.zeros((96,64,3),np.uint8)
+            cv2.imwrite(str(work/'frames'/f'{i:06d}.png'),image)
+            cv2.imwrite(str(work/'composite'/f'{i:06d}.png'),image)
+        runner.write(work/'detections.json',{})
+    monkeypatch.setattr(runner,'execute',model)
+    def audit(*a):raise PipelineError('OUTPUT_INVALID','核验失败')
+    monkeypatch.setattr(runner,'audit_block',audit)
+    with pytest.raises(PipelineError):runner.process_block(tmp_path,scratch,1,data)
+    record=json.loads((tmp_path/'out/chunk-01/report.json').read_text())
+    assert record['阶段失败'][0]['阶段']==failed_stage
+    assert record['原帧回退数']==0 and record['通过'] is False
+    assert f'失败块=1 失败阶段={failed_stage}' in (tmp_path/'out/progress.log').read_text()

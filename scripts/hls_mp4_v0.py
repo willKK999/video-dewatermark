@@ -214,6 +214,28 @@ def audit_block(root, work, video, plan, fps, detected):
 
 def process_block(root, scratch, index, data):
     started = time.monotonic()
+    state = dict(stage="准备", phases={})
+    output = root / "out" / f"chunk-{index:02d}"
+    if output.exists():
+        raise FileExistsError(f"保留已有块输出，禁止覆盖：{output}")
+    try:
+        return _process_block(root, scratch, index, data, state)
+    except Exception as exc:
+        output.mkdir(parents=True, exist_ok=True)
+        code = getattr(exc, "code", type(exc).__name__)
+        failure = dict(阶段=state["stage"], 错误码=code,
+                       详情=getattr(exc, "details", {}))
+        row = dict(块号=index, 计划=data["计划"][index-1], 通过=False,
+                   目检通过=False, 阶段失败=[failure], 阶段耗时秒=state["phases"],
+                   原帧回退数=0, 完整产物=None,
+                   本轮墙时秒=time.monotonic()-started)
+        write(output / "report.json", row)
+        log(root, f"失败块={index} 失败阶段={state['stage']} 错误码={code} 原帧回退=禁止 通过=False")
+        raise
+
+
+def _process_block(root, scratch, index, data, state):
+    started = time.monotonic()
     plan = data["计划"][index-1]
     work = scratch / f"chunk-{index:02d}"
     output = root / "out" / f"chunk-{index:02d}"
@@ -221,46 +243,40 @@ def process_block(root, scratch, index, data):
     work.mkdir()
     fps = data["处理帧率"]
     count = plan["right"]-plan["left"]
-    phases, failures = {}, []
-    current_stage = "切块"
+    phases, failures = state["phases"], []
     def stage(name):
-        nonlocal current_stage
-        current_stage = name
+        state["stage"] = name
         log(root, f"块号={index} 阶段={name}")
     clip = work / "input.mp4"
     log(root, f"块号={index}/{len(data['计划'])} 开始")
+    stage("切块")
     cut_start=time.monotonic()
     run(["ffmpeg","-v","error","-y","-threads","2","-ss",str(plan["left"]/fps),
          "-i",root/"source.mp4","-an","-vf",f"fps={fps}","-frames:v",str(count),
          "-c:v","libx264","-preset","ultrafast","-crf","0","-threads","2",clip])
     phases["切块"] = time.monotonic()-cut_start
     options = dict(hls=True, adaptive_timeouts=True)
+    stage("先验校验")
     prior = validated_prior(root, data["源摘要"])
     if prior:
         options["multitrack_prior"] = str(prior)
     try:
         execute(clip,work,options,"propainter",True,stage)
-    except Exception as exc:
-        code = getattr(exc,"code",type(exc).__name__)
-        failure = dict(阶段=current_stage,错误码=code,详情=getattr(exc,"details",{}))
-        row = dict(块号=index,计划=plan,通过=False,目检通过=False,阶段失败=[failure],
-                   阶段耗时秒={k:v/1000 for k,v in read(work/"phase_ms.json").items()},
-                   原帧回退数=0,缺失模型输出=True,完整产物=None,
-                   本轮墙时秒=time.monotonic()-started)
-        write(output/"report.json",row)
-        log(root, f"失败块={index} 失败阶段={current_stage} 错误码={code} 原帧回退=禁止 通过=False")
+    except Exception:
+        phases.update({k:v/1000 for k,v in read(work/"phase_ms.json").items()})
         raise
     phases.update({k:v/1000 for k,v in read(work/"phase_ms.json").items()})
     selected = work/"selected"
+    stage("模型帧完整性")
     if (work/"frames").exists() and len(list((work/"frames").glob("*.png"))) == count:
         missing = select_frames(work,count,selected)
         frame_input=["-framerate",str(fps),"-start_number",str(plan["start"]-plan["left"]),
                      "-i",selected/"%06d.png"]
     else:
         from worker.process import PipelineError
-        log(root,f"失败块={index} 失败阶段=主体编码 错误码=OUTPUT_INCOMPLETE 原帧回退=禁止")
         raise PipelineError("OUTPUT_INCOMPLETE","缺少完整模型帧，禁止生成回退成片")
     video=output/"video.mp4"
+    stage("主体编码")
     t=time.monotonic()
     run(["ffmpeg","-v","error","-y",*frame_input,"-an","-frames:v",
          str(plan["end"]-plan["start"]),"-c:v","libx264","-preset","fast",
@@ -268,17 +284,15 @@ def process_block(root, scratch, index, data):
     phases["主体编码"] = time.monotonic()-t
     audit={}
     if (work/"detections.json").exists():
-        try:
-            audit=audit_block(root,work,video,plan,fps,read(work/"detections.json"))
-            phases["编码后核验"]=audit["耗时秒"]
-        except Exception as exc:
-            failures.append(dict(阶段="编码后核验",错误码=getattr(exc,"code",type(exc).__name__)))
+        stage("编码后核验")
+        audit=audit_block(root,work,video,plan,fps,read(work/"detections.json"))
+        phases["编码后核验"]=audit["耗时秒"]
     row=dict(块号=index,计划=plan,源摘要=data["源摘要"],版本="0e4dc7b通用流程单轮",
              视频摘要=vision.sha256(video),阶段耗时秒=phases,本轮墙时秒=time.monotonic()-started,
              阶段失败=failures,原帧回退帧号=missing,原帧回退数=len(missing),核验=audit,
              基础核验=read(work/"quality.json"),模型窗口=read(work/"performance.json"),
              通过=False,目检通过=False,
-             说明="稳定基础流程仅运行一轮；不套用旧片专属资产，不自动进入逐块多轮补修。缺失模型输出明确回退原帧。")
+             说明="稳定基础流程仅运行一轮；不套用旧片专属资产。任何阶段失败明确报错，缺失模型输出禁止原帧补齐。")
     write(output/"report.json",row)
     log(root,f"块号={index}/{len(data['计划'])} 耗时秒={row['本轮墙时秒']:.3f} "
         f"残留={audit.get('编码后残留',{}).get('residual_count')} "

@@ -447,16 +447,18 @@ def _composite_window(
             from .hls_settings import HLSSettings
 
             if disagreement > HLSSettings.from_env().overlap_mae_limit:
-                (root / "overlap-failure.json").write_text(json.dumps(dict(
+                failure = dict(
                     frame=j, window_start=start, window_end=end,
                     disagreement_mae=disagreement,
                     limit=HLSSettings.from_env().overlap_mae_limit,
                     conditioned_overlap=performance.get("conditioned_overlap",False),
-                    mask_sha256=sha256(root / "masks" / files[j].name))))
+                    mask_sha256=sha256(root / "masks" / files[j].name))
+                (root / "overlap-failure.json").write_text(json.dumps(failure))
                 raise PipelineError(
                     "SEAM_UNCERTAIN",
                     "overlap disagreement requires review",
                     review=True,
+                    details=failure,
                 )
             weight = (j - start + 1) / (overlap + 1)
             repair = cv2.addWeighted(repair, weight, previous, 1 - weight, 0)
