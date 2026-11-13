@@ -81,6 +81,19 @@ def select_frames(work, count, destination):
     return missing
 
 
+def validated_prior(root, source_digest):
+    """内容缓存必须同时绑定源片及先验摘要，不能借用其他输入的先验。"""
+    report = read(root / "prior-report.json")
+    if report.get("通过") is not True:
+        return None
+    path = root / "multitrack-prior.npz"
+    if (report.get("源摘要") != source_digest
+            or not path.is_file()
+            or vision.sha256(path) != report.get("先验摘要")):
+        raise ValueError("自动先验缓存与本片内容摘要不一致")
+    return path
+
+
 def cropped_references(detected, first, last):
     if detected.get("tracks") is not None:
         return cut_references(detected, first, last)
@@ -215,8 +228,9 @@ def process_block(root, scratch, index, data):
          "-c:v","libx264","-preset","ultrafast","-crf","0","-threads","2",clip])
     phases["切块"] = time.monotonic()-cut_start
     options = dict(hls=True)
-    if read(root/"prior-report.json").get("通过"):
-        options["multitrack_prior"] = str(root/"multitrack-prior.npz")
+    prior = validated_prior(root, data["源摘要"])
+    if prior:
+        options["multitrack_prior"] = str(prior)
     try:
         execute(clip,work,options,"propainter",True,
                 lambda name: log(root,f"块号={index} 阶段={name}"))

@@ -45,6 +45,19 @@ def test_partial_model_frames_keep_originals_and_report_missing(tmp_path):
     assert [p.read_bytes() for p in sorted(dest.iterdir())] == [b'original', b'repaired', b'original']
 
 
+def test_prior_cache_rejects_other_source_and_modified_template(tmp_path):
+    prior = tmp_path / 'multitrack-prior.npz'
+    prior.write_bytes(b'automatic-content-template')
+    report = dict(通过=True, 源摘要='source-a', 先验摘要=sha256(prior))
+    runner.write(tmp_path / 'prior-report.json', report)
+    assert runner.validated_prior(tmp_path, 'source-a') == prior
+    with pytest.raises(ValueError, match='内容摘要不一致'):
+        runner.validated_prior(tmp_path, 'source-b')
+    prior.write_bytes(b'modified-template')
+    with pytest.raises(ValueError, match='内容摘要不一致'):
+        runner.validated_prior(tmp_path, 'source-a')
+
+
 def test_single_track_references_trim_context(tmp_path):
     detected = dict(scenes=[[0, 6], [6, 10]], hints=[dict(frame=i, box=[0,0,1,1]) for i in range(10)])
     result = runner.cropped_references(detected, 3, 8)
