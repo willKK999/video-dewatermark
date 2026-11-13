@@ -51,9 +51,16 @@ def execute(
         "detect",
         lambda: vision.detect(files, vision.shots(files, check), options, root, check),
     )
+    def create_masks():
+        if options.get("adaptive_timeouts"):
+            from .stage_budget import sam_budget
+            budget = sam_budget(detections, len(files), info["width"]*info["height"])
+            (root / "mask-budget.json").write_text(json.dumps(budget, indent=2))
+            return vision.masks(root, files, detections, engine, check, budget=budget)
+        return vision.masks(root, files, detections, engine, check)
     try:
         manifest = step(
-            "mask", lambda: vision.masks(root, files, detections, engine, check)
+            "mask", create_masks
         )
     except PipelineError as exc:
         if exc.code not in ("TRACKING_DRIFT", "MASK_UNCERTAIN") or not (
@@ -69,7 +76,7 @@ def execute(
             ),
         )
         manifest = step(
-            "mask", lambda: vision.masks(root, files, detections, engine, check)
+            "mask", create_masks
         )
     for frame in manifest:
         frame["pts_ms"] = round(frame["frame_index"] * 1000 / info["fps"], 3)

@@ -66,17 +66,19 @@ def initialize(root, expected):
 
 
 def select_frames(work, count, destination):
-    """仅完整模型帧优先；缺失帧使用原帧，并明确记录未经处理的帧号。"""
+    """缺少模型帧时明确失败，禁止把原帧静默混入成片。"""
+    missing = [i for i in range(count) if not (work / "composite" / f"{i:06d}.png").is_file()]
+    if missing:
+        from worker.process import PipelineError
+        raise PipelineError("OUTPUT_INCOMPLETE", "模型输出帧不完整，禁止回退原帧",
+                            details=dict(missing_count=len(missing), missing_frames=missing))
     destination.mkdir()
     missing = []
     for i in range(count):
         name = f"{i:06d}.png"
         path = work / "composite" / name
         if not path.exists():
-            path = work / "frames" / name
-            missing.append(i)
-        if not path.exists():
-            raise ValueError("模型及规范化原帧均缺失，不能制造完整结果")
+            raise ValueError("模型帧已丢失，禁止回退原帧")
         os.link(path, destination / name)
     return missing
 
@@ -220,6 +222,11 @@ def process_block(root, scratch, index, data):
     fps = data["处理帧率"]
     count = plan["right"]-plan["left"]
     phases, failures = {}, []
+    current_stage = "切块"
+    def stage(name):
+        nonlocal current_stage
+        current_stage = name
+        log(root, f"块号={index} 阶段={name}")
     clip = work / "input.mp4"
     log(root, f"块号={index}/{len(data['计划'])} 开始")
     cut_start=time.monotonic()
@@ -227,15 +234,22 @@ def process_block(root, scratch, index, data):
          "-i",root/"source.mp4","-an","-vf",f"fps={fps}","-frames:v",str(count),
          "-c:v","libx264","-preset","ultrafast","-crf","0","-threads","2",clip])
     phases["切块"] = time.monotonic()-cut_start
-    options = dict(hls=True)
+    options = dict(hls=True, adaptive_timeouts=True)
     prior = validated_prior(root, data["源摘要"])
     if prior:
         options["multitrack_prior"] = str(prior)
     try:
-        execute(clip,work,options,"propainter",True,
-                lambda name: log(root,f"块号={index} 阶段={name}"))
+        execute(clip,work,options,"propainter",True,stage)
     except Exception as exc:
-        failures.append(dict(阶段="稳定基础流程",错误码=getattr(exc,"code",type(exc).__name__)))
+        code = getattr(exc,"code",type(exc).__name__)
+        failure = dict(阶段=current_stage,错误码=code,详情=getattr(exc,"details",{}))
+        row = dict(块号=index,计划=plan,通过=False,目检通过=False,阶段失败=[failure],
+                   阶段耗时秒={k:v/1000 for k,v in read(work/"phase_ms.json").items()},
+                   原帧回退数=0,缺失模型输出=True,完整产物=None,
+                   本轮墙时秒=time.monotonic()-started)
+        write(output/"report.json",row)
+        log(root, f"失败块={index} 失败阶段={current_stage} 错误码={code} 原帧回退=禁止 通过=False")
+        raise
     phases.update({k:v/1000 for k,v in read(work/"phase_ms.json").items()})
     selected = work/"selected"
     if (work/"frames").exists() and len(list((work/"frames").glob("*.png"))) == count:
@@ -243,8 +257,9 @@ def process_block(root, scratch, index, data):
         frame_input=["-framerate",str(fps),"-start_number",str(plan["start"]-plan["left"]),
                      "-i",selected/"%06d.png"]
     else:
-        missing=list(range(count))
-        frame_input=["-ss",str((plan["start"]-plan["left"])/fps),"-i",clip]
+        from worker.process import PipelineError
+        log(root,f"失败块={index} 失败阶段=主体编码 错误码=OUTPUT_INCOMPLETE 原帧回退=禁止")
+        raise PipelineError("OUTPUT_INCOMPLETE","缺少完整模型帧，禁止生成回退成片")
     video=output/"video.mp4"
     t=time.monotonic()
     run(["ffmpeg","-v","error","-y",*frame_input,"-an","-frames:v",

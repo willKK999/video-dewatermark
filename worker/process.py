@@ -5,19 +5,22 @@ import signal
 import subprocess
 import tempfile
 import time
+import json
+from pathlib import Path
 
 
 class PipelineError(Exception):
-    def __init__(self, code, message, retryable=False, review=False):
+    def __init__(self, code, message, retryable=False, review=False, details=None):
         super().__init__(message)
         self.code, self.retryable, self.review = code, retryable, review
+        self.details = details or {}
 
 
 class LeaseLost(Exception):
     pass
 
 
-def run(args, check=lambda: None, cwd=None, timeout=900):
+def run(args, check=lambda: None, cwd=None, timeout=900, *, stage=None, event_path=None, workload=None):
     check()
     # File-backed capture prevents pipe deadlock and unbounded RAM consumption.
     with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
@@ -29,12 +32,21 @@ def run(args, check=lambda: None, cwd=None, timeout=900):
             start_new_session=True,
         )
         started = time.monotonic()
+        event = dict(stage=stage, timeout_seconds=timeout, status="running",
+                     workload=workload or {}, command=Path(str(args[0])).name)
+        def record():
+            if event_path is not None:
+                Path(event_path).write_text(json.dumps(event, ensure_ascii=False, indent=2))
         try:
+            record()
             while p.poll() is None:
                 check()
                 if time.monotonic() - started > timeout:
                     raise PipelineError(
-                        "PROCESS_TIMEOUT", "stage execution timed out", retryable=True
+                        "PROCESS_TIMEOUT", "stage execution timed out", retryable=True,
+                        details=dict(stage=stage, timeout_seconds=timeout,
+                                     elapsed_seconds=time.monotonic()-started,
+                                     workload=workload or {})
                     )
                 time.sleep(0.1)
             check()
@@ -51,7 +63,11 @@ def run(args, check=lambda: None, cwd=None, timeout=900):
                     f"{os.path.basename(str(args[0]))} exited {p.returncode}",
                 )
             out.seek(0)
+            event["status"] = "complete"
             return out.read()
+        except BaseException as exc:
+            event.update(status="failed", error_code=getattr(exc,"code",type(exc).__name__))
+            raise
         finally:
             if p.poll() is None:
                 os.killpg(p.pid, signal.SIGTERM)
@@ -60,3 +76,5 @@ def run(args, check=lambda: None, cwd=None, timeout=900):
                 except subprocess.TimeoutExpired:
                     os.killpg(p.pid, signal.SIGKILL)
                     p.wait()
+            event["elapsed_seconds"] = time.monotonic()-started
+            record()

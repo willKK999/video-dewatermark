@@ -35,15 +35,19 @@ def test_plans_derive_portrait_geometry_rate_and_duration(tmp_path, rate):
     assert all((p['right'] - p['left']) / data['处理帧率'] <= 30 for p in data['计划'])
 
 
-def test_partial_model_frames_keep_originals_and_report_missing(tmp_path):
+def test_partial_model_frames_fail_without_mixing_originals(tmp_path):
     for name in ['frames', 'composite']:
         (tmp_path / name).mkdir()
     for i in range(3):
         (tmp_path / 'frames' / f'{i:06d}.png').write_bytes(b'original')
     (tmp_path / 'composite/000001.png').write_bytes(b'repaired')
     dest = tmp_path / 'selected'
-    assert runner.select_frames(tmp_path, 3, dest) == [0, 2]
-    assert [p.read_bytes() for p in sorted(dest.iterdir())] == [b'original', b'repaired', b'original']
+    from worker.process import PipelineError
+    with pytest.raises(PipelineError) as caught:
+        runner.select_frames(tmp_path, 3, dest)
+    assert caught.value.code == 'OUTPUT_INCOMPLETE'
+    assert caught.value.details['missing_frames'] == [0,2]
+    assert not dest.exists()
 
 
 def test_prior_cache_rejects_other_source_and_modified_template(tmp_path):
@@ -97,3 +101,21 @@ def test_delivery_retains_nonzero_video_origin_relative_to_audio(tmp_path):
         return float(v['start_time'])-float(a['start_time'])
     assert origin(path) > 0
     assert abs(origin(path)-origin(tmp_path/'out/整集-v0.mp4')) < .001
+
+
+def test_stage_timeout_is_reported_and_does_not_create_original_video(tmp_path,monkeypatch):
+    from worker.process import PipelineError
+    path=source(tmp_path)
+    data=runner.initialize(tmp_path,sha256(path))
+    scratch=tmp_path/'scratch';scratch.mkdir()
+    def fail(source,work,options,engine,low_memory,stage):
+        stage('mask')
+        raise PipelineError('PROCESS_TIMEOUT','stage execution timed out',details={'stage':'mask','timeout_seconds':1234})
+    monkeypatch.setattr(runner,'execute',fail)
+    with pytest.raises(PipelineError):runner.process_block(tmp_path,scratch,1,data)
+    record=json.loads((tmp_path/'out/chunk-01/report.json').read_text())
+    assert record['通过'] is False and record['原帧回退数']==0
+    assert record['阶段失败'][0]['阶段']=='mask'
+    assert record['阶段失败'][0]['详情']['timeout_seconds']==1234
+    assert not (tmp_path/'out/chunk-01/video.mp4').exists()
+    assert '失败块=1 失败阶段=mask' in (tmp_path/'out/progress.log').read_text()

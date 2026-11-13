@@ -247,10 +247,13 @@ def detect(files, scenes, options, root, check=lambda: None, dense=False):
     return result
 
 
-def masks(root, files, detections, engine, check=lambda: None):
+def masks(root, files, detections, engine, check=lambda: None, budget=None):
     dest = root / "masks"
     dest.mkdir()
     if engine == "propainter":
+        execution = ({"timeout": budget["timeout_seconds"], "stage": "mask",
+                      "event_path": root / "process-mask.json", "workload": budget["workload"]}
+                     if budget is not None else {})
         run(
             [
                 os.environ["TRACK_PYTHON"],
@@ -259,6 +262,7 @@ def masks(root, files, detections, engine, check=lambda: None):
                 root,
             ],
             check,
+            **execution,
         )
     else:
         # Explicit CPU smoke mode: interpolate operator boxes, never advertised as SAM.
@@ -282,6 +286,9 @@ def masks(root, files, detections, engine, check=lambda: None):
 
 def validate_masks(root, files, detections, check=lambda: None):
     """对已完成的 SAM 输出执行同一套完整覆盖及面积校验，供失败阶段续跑。"""
+    if detections.get("schema") == "yolo-model-tracks-1":
+        from .model_tracks import validate
+        return validate(root, files, detections, check)
     dest = root / "masks"
     if len(list(dest.glob("*.png"))) != len(files):
         raise PipelineError("MASK_INVALID", "mask count differs")
