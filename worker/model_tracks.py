@@ -418,7 +418,7 @@ def validate(root,files,detections,check=lambda:None,progress=None):
             if not raw.exists():raise PipelineError('MASK_INVALID','SAM未输出预期的对象帧，禁止伪装为完成')
             sam=cv2.imread(str(raw),0)
             if sam is None:raise PipelineError('MASK_INVALID','SAM对象掩膜不可读')
-            mask=support | (sam & cv2.dilate(support,np.ones((7,7),np.uint8)))
+            mask=(sam|support) if track.get('coverage_reference') else (support | (sam & cv2.dilate(support,np.ones((7,7),np.uint8))))
             mask,policy=adaptive_mask(mask,base,alpha,p.get('template_box',p['box']),p['confidence'],shape)
             fraction=float(np.count_nonzero(mask)/mask.size)
             if fraction>.2:raise PipelineError('MASK_UNCERTAIN','单条模型轨迹超过20%面积保护')

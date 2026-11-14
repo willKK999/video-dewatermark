@@ -2,7 +2,8 @@
 
 
 def groups_for_scene(detections, start, end):
-    hints = [p for p in detections["hints"] if start <= p["frame"] < end]
+    cached=set(detections.get('precomputed_track_ids',[]))
+    hints = [p for p in detections["hints"] if start <= p["frame"] < end and p.get('track_id') not in cached]
     if not detections.get("multitrack"):
         return [(start, end, hints)]
     by_id = {}

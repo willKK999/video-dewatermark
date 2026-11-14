@@ -172,6 +172,9 @@ def execute_one(args):
             detected=read(work/'detections.json')
         else:
             detected=step('模型约束轨迹',lambda:build(files,vision.shots(files),rows,args.prior,labels,work,fps))
+            if args.coverage_reference:
+                from worker.coverage_reference import merge
+                detected=step('同源覆盖基线合并',lambda:merge(work,args.coverage_reference,detected,progress=log))
             write(work/'model-prepared.json',dict(frames_binding_sha256=signature,prior_sha256=vision.sha256(args.prior),
                 detected_sha256=vision.sha256(work/'detections.json'),assets={str(p.relative_to(work)):vision.sha256(p)
                 for folder in ['templates','prompts'] for p in (work/folder).glob('*') if p.is_file()}))
@@ -194,6 +197,9 @@ def execute_one(args):
                 return summary['逐帧']
             return vision.masks(work,files,detected,'propainter',budget=budget,progress=log)
         manifest=step('mask',masks)
+        if args.coverage_reference:
+            from worker.coverage_reference import verify_coverage
+            step('基线覆盖逐像素复核',lambda:verify_coverage(work,args.coverage_reference))
         summaries=read(work/'layers.json');current=work/'frames';roi=None
         if not summaries['layers']:raise PipelineError('MASK_UNCERTAIN','没有可用的已验证掩膜图层')
         if args.inpaint_mode=='roi':
@@ -257,6 +263,7 @@ def main():
     p.add_argument('--tiled-detection',action='store_true')
     p.add_argument('--flipped-detection',action='store_true')
     p.add_argument('--inpaint-mode',choices=['roi','legacy-full-frame'],default='roi')
+    p.add_argument('--coverage-reference',type=Path)
     args=p.parse_args()
     if args.duration<=0 or args.context<0 or args.duration+args.context>30:p.error('主体与上下文总输入须在30秒内')
     cv2.setNumThreads(2);execute_one(args)
