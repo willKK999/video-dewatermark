@@ -62,3 +62,48 @@ def test_transparent_expansion_exceeds_opaque_without_moving_coordinates():
     opaque,_=adaptive_mask(mask,base,np.full(base.shape,.9,np.float32),[500,300,520,310],.9,mask.shape)
     assert policy['半透明外扩像素']>=12 and policy['不透明外扩像素']==3
     assert np.count_nonzero(semi)>np.count_nonzero(opaque) and np.all(semi[mask>0]==255)
+
+
+def test_layer_tasks_do_not_import_other_layers_inside_padded_roi(tmp_path,monkeypatch):
+    files,d,_=fixture(tmp_path)
+    shape=(240,320);first=np.zeros(shape,np.uint8);first[40:200,70:150]=255
+    second=np.zeros(shape,np.uint8);second[40:200,150:230]=255
+    (tmp_path/'layer-01/masks').mkdir(parents=True)
+    (tmp_path/'validated-objects/2').mkdir()
+    for p in files:
+        for folder,mask in [('masks',first|second),('layer-00/masks',first),
+                            ('layer-01/masks',second),('validated-objects/1',first),
+                            ('validated-objects/2',second)]:cv2.imwrite(str(tmp_path/folder/p.name),mask)
+    (tmp_path/'layers.json').write_text(json.dumps(dict(layers=[dict(directory=str(tmp_path/f'layer-{n:02d}/masks')) for n in range(2)])))
+    d['tracks'].append(dict(id=2,hints=[dict(frame=i) for i in range(6)]))
+    monkeypatch.setenv('INPAINT_PYTHON','python');monkeypatch.setenv('PROPAINTER_ROOT',str(tmp_path))
+    fractions=[]
+    def checked_model(args,*a,**kw):
+        for p in Path(args[args.index('--mask')+1]).glob('*.png'):
+            mask=cv2.imread(str(p),0);fraction=np.count_nonzero(mask)/first.size
+            fractions.append(fraction)
+            assert fraction<=.2
+            # 两个目标在裁块中相邻；每遍只能有一个目标的面积。
+            assert np.count_nonzero(mask)<=np.count_nonzero(first)
+        fake_model(args)
+    monkeypatch.setattr(roi,'run',checked_model)
+    result=roi.execute(tmp_path,files,d,cfg=roi.ROISettings(maximum_frames=5,minimum_frames=3,minimum_context=64,overlap_frames=1))
+    assert fractions and result['覆盖核验通过'] and result['实际图层数']==2
+    assert all(r['模型掩膜最大原帧占比']<=.2 for r in result['任务'])
+    for p in files:
+        covered=cv2.imread(str(tmp_path/'roi-coverage'/p.name),0)
+        assert np.array_equal(covered,first|second)
+
+
+def test_owned_over_limit_is_rejected_with_frame_and_roi():
+    mask=np.full((40,50),255,np.uint8)
+    with pytest.raises(PipelineError) as caught:
+        roi.task_mask(mask,np.zeros_like(mask),[0,0,50,40],mask.size,.2,3,67)
+    assert caught.value.code=='MASK_UNCERTAIN'
+    assert caught.value.details==dict(task=3,frame=67,roi=[0,0,50,40],pixels=2000,source_pixels=2000,fraction=1.,limit=.2)
+
+
+def test_completed_pixels_and_empty_context_never_enter_model():
+    mask=np.zeros((40,50),np.uint8);mask[2:5,3:6]=255
+    effective,fraction=roi.task_mask(mask,mask,[0,0,50,40],mask.size,.2,1,0)
+    assert not effective.any() and fraction==0

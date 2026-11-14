@@ -89,6 +89,19 @@ def assert_coverage(work,files):
     if missing:raise PipelineError('ROI_INCOMPLETE','存在未补画的水印像素，禁止原帧补齐',details=dict(missing=missing,missing_pixels=pixels))
 
 
+def task_mask(owned,done,box,source_pixels,limit,task,frame):
+    """模型只处理本任务所属像素，不能从联合掩膜引入其他图层。"""
+    effective=owned & ~done
+    a,b,c,d=box
+    pixels=int(np.count_nonzero(effective[b:d,a:c]))
+    fraction=pixels/source_pixels
+    if fraction>limit:
+        raise PipelineError('MASK_UNCERTAIN','ROI模型输入掩膜超过20%原帧面积保护',
+                            details=dict(task=task,frame=frame,roi=box,pixels=pixels,
+                                         source_pixels=source_pixels,fraction=fraction,limit=limit))
+    return effective,fraction
+
+
 def execute(work,files,detected,log=lambda message:None,cfg=None):
     cfg=cfg or ROISettings.from_env();started=time.monotonic();shape=cv2.imread(str(files[0])).shape[:2]
     source_pixels=shape[0]*shape[1];dest=work/'composite';dest.mkdir();coverage=work/'roi-coverage';coverage.mkdir()
@@ -127,13 +140,12 @@ def execute(work,files,detected,log=lambda message:None,cfg=None):
         left=max(scene[0],start-2);right=min(scene[1],end+2)
         counter+=1;task=work/f'roi-{counter:04d}';task.mkdir();(task/'frames').mkdir();(task/'masks').mkdir()
         a,b,c,d=box;native_h,native_w=d-b,c-a
-        before=[];model_masks=[]
+        before=[];model_masks=[];maximum_fraction=0.
         for j in range(left,right):
             image=cv2.imread(str(dest/files[j].name));done=cv2.imread(str(coverage/files[j].name),0)
-            effective=masks[j]&~done
-            clipped=effective[b:d,a:c]
-            if np.count_nonzero(clipped)/source_pixels>settings.mask_fraction_limit:
-                raise PipelineError('MASK_UNCERTAIN','ROI模型输入掩膜超过20%原帧面积保护')
+            effective,fraction=task_mask(owned.get(j,np.zeros(shape,np.uint8)),done,box,
+                                         source_pixels,settings.mask_fraction_limit,counter,j)
+            maximum_fraction=max(maximum_fraction,fraction)
             before.append(image);model_masks.append(crop(effective,box,True))
             atomic_png(task/'frames'/f'{j-left:06d}.png',crop(image,box))
             atomic_png(task/'masks'/f'{j-left:06d}.png',model_masks[-1])
@@ -144,7 +156,7 @@ def execute(work,files,detected,log=lambda message:None,cfg=None):
         area=crop(before[0],box).shape[0]*crop(before[0],box).shape[1]
         length=min(frame_budget(area,cfg),max(2,right-left))
         row=dict(任务=counter,ROI=box,开始帧=left,结束帧=right,原生裁块尺寸=[native_w,native_h],
-                 模型面积=area,subvideo_length=length,fp16=cfg.fp16,降分辨率=False,重试深度=depth,通过=False)
+                 模型面积=area,模型掩膜最大原帧占比=maximum_fraction,subvideo_length=length,fp16=cfg.fp16,降分辨率=False,重试深度=depth,通过=False)
         records.append(row);begin=time.monotonic()
         args=[os.environ['INPAINT_PYTHON'],str(Path(__file__).with_name('torch_stage.py')),
               '--metrics',task/'metrics.json','--frames-only','--script',Path(os.environ['PROPAINTER_ROOT'])/'inference_propainter.py',
