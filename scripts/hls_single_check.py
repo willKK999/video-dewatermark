@@ -52,8 +52,8 @@ def prepare(source,work,expected,duration,context):
     return metadata,video,fps,core,files
 
 
-def detect_all(frames,output,enhance=False,tiles=False,flips=False):
-    run([os.environ['DETECT_PYTHON'],'-m','scripts.hls_candidates','--frames',frames,'--output',output,
+def detect_all(frames,output,enhance=False,tiles=False,flips=False,mask_source="current"):
+    run([os.environ['DETECT_PYTHON'],'-m',('scripts.hls_candidates_v7' if mask_source=='v7' else 'scripts.hls_candidates'),'--frames',frames,'--output',output,
          *(['--enhance'] if enhance else []),*(['--tiles'] if tiles else []),*(['--flips'] if flips else [])],timeout=1800)
     return read(output)
 
@@ -140,6 +140,11 @@ def verify(work,video,files,detected,prior,labels,core,fps,output,enhance=False,
 
 def execute_one(args):
     started=time.monotonic();work=args.work.resolve();output=args.output.resolve()
+    build_tracks=build
+    if args.mask_source == "v7":
+        from worker.model_tracks_v7 import build as build_tracks
+        if args.enhance_detection or args.tiled_detection or args.flipped_detection or args.coverage_reference:
+            raise PipelineError("CONFIG_INVALID","v7掩膜策略禁止混用后续版本检测增强或覆盖合并")
     work.mkdir(parents=True,exist_ok=True);output.mkdir(parents=True,exist_ok=True)
     phase='准备';timings={};events=[]
     def log(message):
@@ -155,6 +160,12 @@ def execute_one(args):
             log(f'第1块 第{args.iteration}轮 阶段结束={name} 耗时秒={timings[name]:.3f}')
             write(output/'timings.json',timings)
     try:
+        policy=dict(mask_source=args.mask_source)
+        saved_policy=read(work/'mask-policy.json')
+        if saved_policy != policy and ((work/'model-prepared.json').exists() or (work/'all-yolo.json').exists()):
+            if args.mask_source != 'current' or saved_policy:
+                raise PipelineError('SOURCE_CHANGED','检测或掩膜缓存策略不一致，须使用独立工作目录')
+        write(work/'mask-policy.json',policy)
         metadata,source_video,fps,core,files=step('准备',lambda:prepare(args.source,work,args.sha256,args.duration,args.context))
         prior_record=read(args.prior.parent/'prior-report.json')
         if (prior_record.get('通过') is not True or prior_record.get('源摘要')!=args.sha256
@@ -166,7 +177,7 @@ def execute_one(args):
             if read(binding).get('frames_binding_sha256')!=signature or read(binding).get('detected_sha256')!=vision.sha256(raw):raise PipelineError('SOURCE_CHANGED','检测缓存缺少输入帧绑定')
             rows=read(raw)
         else:
-            rows=step('YOLO逐帧检测',lambda:detect_all(work/'frames',raw,enhance=args.enhance_detection,tiles=args.tiled_detection,flips=args.flipped_detection))
+            rows=step('YOLO逐帧检测',lambda:detect_all(work/'frames',raw,enhance=args.enhance_detection,tiles=args.tiled_detection,flips=args.flipped_detection,mask_source=args.mask_source))
             write(binding,dict(frames_binding_sha256=signature,detected_sha256=vision.sha256(raw)))
         labels={int(k):str(v).lower() for k,v in read(raw.with_suffix('.timing.json'))['类别'].items()}
         prepared=read(work/'model-prepared.json')
@@ -179,7 +190,7 @@ def execute_one(args):
                 if vision.sha256(work/name)!=h:raise PipelineError('SOURCE_CHANGED','模板或提示摘要不一致')
             detected=read(work/'detections.json')
         else:
-            detected=step('模型约束轨迹',lambda:build(files,vision.shots(files),rows,args.prior,labels,work,fps))
+            detected=step('模型约束轨迹',lambda:build_tracks(files,vision.shots(files),rows,args.prior,labels,work,fps))
             if args.coverage_reference:
                 from worker.coverage_reference import merge
                 detected=step('同源覆盖基线合并',lambda:merge(work,args.coverage_reference,detected,progress=log))
@@ -203,11 +214,14 @@ def execute_one(args):
                     verified.validate(i,cv2.imread(str(path),0))
                 log('第1块 mask复用已校验的本输入SAM检查点；不重新分割')
                 return summary['逐帧']
-            return vision.masks(work,files,detected,'propainter',budget=budget,progress=log)
+            return vision.masks(work,files,detected,'propainter',budget=budget,progress=log,mask_source=args.mask_source)
         manifest=step('mask',masks)
         if args.coverage_reference:
             from worker.coverage_reference import verify_coverage
             step('基线覆盖逐像素复核',lambda:verify_coverage(work,args.coverage_reference))
+        if args.mask_reference:
+            from worker.mask_equivalence import compare
+            step('v1掩膜等价核验',lambda:compare(work,args.mask_reference,output/'掩膜对比-v1-v4.json'))
         summaries=read(work/'layers.json');current=work/'frames';roi=None
         if not summaries['layers']:raise PipelineError('MASK_UNCERTAIN','没有可用的已验证掩膜图层')
         if args.inpaint_mode=='roi':
@@ -245,7 +259,7 @@ def execute_one(args):
                     总耗时秒=time.monotonic()-started,原帧回退数=0,主体帧数=core,处理输入帧数=len(files),
                     视频=str(video),视频摘要=vision.sha256(video),核验=quality,
                     轨迹数=len(detected['tracks']),预算=budget,
-                    实际补画图层=len(summaries['layers']),ROI=roi,复用分割=args.reuse_validated_masks,联合纹理投影=detail,模型参数=dict(窗口=HLSSettings.from_env().window_frames,重叠=HLSSettings.from_env().overlap_frames,降分辨率=False,重叠上下文=args.condition_overlap),
+                    实际补画图层=len(summaries['layers']),ROI=roi,复用分割=args.reuse_validated_masks,掩膜策略=args.mask_source,联合纹理投影=detail,模型参数=dict(窗口=HLSSettings.from_env().window_frames,重叠=HLSSettings.from_env().overlap_frames,降分辨率=False,重叠上下文=args.condition_overlap),
                     输出规格=media.probe(video),目检完成=False,说明='模型结果仅作验证；候选与目检未通过不得宣称验收通过')
         write(output/'report.json',report);log(f'第1块 本轮完成 原帧回退=0 残留候选={quality["残留候选数"]} 闪烁候选={len(quality["闪烁候选"])} 清晰度最低={quality["清晰度"]["最小保留比"]}')
     except Exception as exc:
@@ -262,7 +276,7 @@ def main():
     for name in ['source','prior','work','output']:p.add_argument('--'+name,type=Path,required=True)
     p.add_argument('--sha256',required=True);p.add_argument('--duration',type=float,default=HLSSettings.from_env().block_seconds)
     p.add_argument('--context',type=float,default=HLSSettings.from_env().context_seconds)
-    p.add_argument('--iteration',type=int,choices=[1,2,3],required=True)
+    p.add_argument('--iteration',type=int,choices=[1,2,3,4],required=True)
     p.add_argument('--prepare-only',action='store_true')
     p.add_argument('--reuse-validated-masks',action='store_true')
     p.add_argument('--condition-overlap',action='store_true')
@@ -272,6 +286,8 @@ def main():
     p.add_argument('--flipped-detection',action='store_true')
     p.add_argument('--inpaint-mode',choices=['roi','legacy-full-frame'],default='roi')
     p.add_argument('--coverage-reference',type=Path)
+    p.add_argument('--mask-source',choices=['current','v7'],default='current')
+    p.add_argument('--mask-reference',type=Path)
     args=p.parse_args()
     if args.duration<=0 or args.context<0 or args.duration+args.context>30:p.error('主体与上下文总输入须在30秒内')
     cv2.setNumThreads(2);execute_one(args)
