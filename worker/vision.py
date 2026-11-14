@@ -247,7 +247,7 @@ def detect(files, scenes, options, root, check=lambda: None, dense=False):
     return result
 
 
-def masks(root, files, detections, engine, check=lambda: None, budget=None):
+def masks(root, files, detections, engine, check=lambda: None, budget=None, progress=None):
     dest = root / "masks"
     dest.mkdir()
     if engine == "propainter":
@@ -264,6 +264,7 @@ def masks(root, files, detections, engine, check=lambda: None, budget=None):
             check,
             **execution,
         )
+        if progress:progress('SAM子进程已完成，GPU阶段结束；开始CPU掩膜扩展与覆盖核验')
     else:
         # Explicit CPU smoke mode: interpolate operator boxes, never advertised as SAM.
         for start, end in detections["scenes"]:
@@ -281,14 +282,15 @@ def masks(root, files, detections, engine, check=lambda: None, budget=None):
                 x1, y1, x2, y2 = map(lambda x: int(round(x)), box)
                 mask[y1:y2, x1:x2] = 255
                 cv2.imwrite(str(dest / files[i].name), mask)
-    return validate_masks(root, files, detections, check)
+    return (validate_masks(root, files, detections, check, progress=progress)
+            if progress is not None else validate_masks(root, files, detections, check))
 
 
-def validate_masks(root, files, detections, check=lambda: None):
+def validate_masks(root, files, detections, check=lambda: None, progress=None):
     """对已完成的 SAM 输出执行同一套完整覆盖及面积校验，供失败阶段续跑。"""
     if detections.get("schema") == "yolo-model-tracks-1":
         from .model_tracks import validate
-        return validate(root, files, detections, check)
+        return validate(root, files, detections, check,progress=progress)
     dest = root / "masks"
     if len(list(dest.glob("*.png"))) != len(files):
         raise PipelineError("MASK_INVALID", "mask count differs")

@@ -16,15 +16,16 @@ def place_field(field,box,shape):
     return out
 
 
-def fields(points,templates,shape):
-    glyph=np.zeros(shape,np.float32);exclude=np.zeros(shape,np.uint8)
+def fields(points,templates,shape,return_support=False):
+    glyph=np.zeros(shape,np.float32);exclude=np.zeros(shape,np.uint8);known=np.zeros(shape,np.uint8)
     for p in points:
         data=templates[p['track_id']];box=p.get('template_box',p['box'])
         support=data['mask']>0
         glyph+=place_field(np.where(support,data['feature'],0),box,shape)
+        known|=(place_field(support.astype(np.uint8)*255,box,shape)>0).astype(np.uint8)*255
         opaque=np.where(support & (data['alpha']>.45),255,0).astype(np.uint8)
         exclude|=(place_field(opaque,box,shape)>0).astype(np.uint8)*255
-    return glyph,exclude
+    return (glyph,exclude,known) if return_support else (glyph,exclude)
 
 
 def render(work,files,detected,fps):
@@ -37,7 +38,8 @@ def render(work,files,detected,fps):
     for i in selected:
         source=cv2.imread(str(files[i]));base=cv2.imread(str(work/'composite'/files[i].name))
         mask=cv2.imread(str(work/'masks'/files[i].name),0)
-        glyph,exclude=fields(byframe.get(int(i),[]),templates,shape)
+        glyph,exclude,known=fields(byframe.get(int(i),[]),templates,shape,True)
+        exclude|=mask&~known
         projected_texture_composite(source,base,mask,glyph,exclude,accumulator=acc,detail_sigma=cfg.detail_sigma)
     calibration=solve_projection(acc)
     (work/'detail-calibration.json').write_text(json.dumps(calibration))
@@ -46,7 +48,8 @@ def render(work,files,detected,fps):
         source=cv2.imread(str(file));base=cv2.imread(str(work/'composite'/file.name))
         if base is None:raise PipelineError('OUTPUT_INCOMPLETE','细节合成缺少补画结果，禁止原帧补齐')
         mask=cv2.imread(str(work/'masks'/file.name),0)
-        glyph,exclude=fields(byframe.get(i,[]),templates,shape)
+        glyph,exclude,known=fields(byframe.get(i,[]),templates,shape,True)
+        exclude|=mask&~known
         result=projected_texture_composite(source,base,mask,glyph,exclude,
                 calibration=calibration,detail_sigma=cfg.detail_sigma)
         cv2.imwrite(str(dest/file.name),result)

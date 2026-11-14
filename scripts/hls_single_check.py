@@ -188,17 +188,22 @@ def execute_one(args):
                     verified.validate(i,cv2.imread(str(path),0))
                 log('第1块 mask复用已校验的本输入SAM检查点；不重新分割')
                 return summary['逐帧']
-            return vision.masks(work,files,detected,'propainter',budget=budget)
+            return vision.masks(work,files,detected,'propainter',budget=budget,progress=log)
         manifest=step('mask',masks)
-        summaries=read(work/'layers.json');current=work/'frames'
-        for k,layer in enumerate(summaries['layers']):
-            layer_root=Path(layer['directory']).parent
-            (layer_root/'frames').symlink_to(current,target_is_directory=True)
-            step(f'inpaint-{k+1}',lambda:vision.inpaint(layer_root,sorted((layer_root/'frames').glob('*.png')),detected['scenes'],'propainter',True,condition_overlap=args.condition_overlap,reference_masks=work/'masks'))
-            current=layer_root/'composite'
-            if len(list(current.glob('*.png')))!=len(files):raise PipelineError('OUTPUT_INCOMPLETE','补画帧不完整，禁止原帧回退')
+        summaries=read(work/'layers.json');current=work/'frames';roi=None
         if not summaries['layers']:raise PipelineError('MASK_UNCERTAIN','没有可用的已验证掩膜图层')
-        (work/'composite').symlink_to(current,target_is_directory=True)
+        if args.inpaint_mode=='roi':
+            from worker.roi_inpaint import execute as execute_roi
+            roi=step('ROI补画',lambda:execute_roi(work,files,detected,log=log))
+            current=work/'composite'
+        else:
+            for k,layer in enumerate(summaries['layers']):
+                layer_root=Path(layer['directory']).parent
+                (layer_root/'frames').symlink_to(current,target_is_directory=True)
+                step(f'inpaint-{k+1}',lambda:vision.inpaint(layer_root,sorted((layer_root/'frames').glob('*.png')),detected['scenes'],'propainter',True,condition_overlap=args.condition_overlap,reference_masks=work/'masks'))
+                current=layer_root/'composite'
+                if len(list(current.glob('*.png')))!=len(files):raise PipelineError('OUTPUT_INCOMPLETE','补画帧不完整，禁止原帧回退')
+            (work/'composite').symlink_to(current,target_is_directory=True)
         verification=VerifiedLayers(work/'layers.json',work/'detections.json')
         for i,file in enumerate(files):verification.validate(i,cv2.imread(str(work/'masks'/file.name),0))
         detail=None
@@ -222,7 +227,7 @@ def execute_one(args):
                     总耗时秒=time.monotonic()-started,原帧回退数=0,主体帧数=core,处理输入帧数=len(files),
                     视频=str(video),视频摘要=vision.sha256(video),核验=quality,
                     轨迹数=len(detected['tracks']),预算=budget,
-                    实际补画图层=len(summaries['layers']),复用分割=args.reuse_validated_masks,联合纹理投影=detail,模型参数=dict(窗口=HLSSettings.from_env().window_frames,重叠=HLSSettings.from_env().overlap_frames,降分辨率=False,重叠上下文=args.condition_overlap),
+                    实际补画图层=len(summaries['layers']),ROI=roi,复用分割=args.reuse_validated_masks,联合纹理投影=detail,模型参数=dict(窗口=HLSSettings.from_env().window_frames,重叠=HLSSettings.from_env().overlap_frames,降分辨率=False,重叠上下文=args.condition_overlap),
                     输出规格=media.probe(video),目检完成=False,说明='模型结果仅作验证；候选与目检未通过不得宣称验收通过')
         write(output/'report.json',report);log(f'第1块 本轮完成 原帧回退=0 残留候选={quality["残留候选数"]} 闪烁候选={len(quality["闪烁候选"])} 清晰度最低={quality["清晰度"]["最小保留比"]}')
     except Exception as exc:
@@ -247,6 +252,7 @@ def main():
     p.add_argument('--preserve-detail',action='store_true')
     p.add_argument('--tiled-detection',action='store_true')
     p.add_argument('--flipped-detection',action='store_true')
+    p.add_argument('--inpaint-mode',choices=['roi','legacy-full-frame'],default='roi')
     args=p.parse_args()
     if args.duration<=0 or args.context<0 or args.duration+args.context>30:p.error('主体与上下文总输入须在30秒内')
     cv2.setNumThreads(2);execute_one(args)

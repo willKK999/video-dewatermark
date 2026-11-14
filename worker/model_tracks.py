@@ -22,6 +22,9 @@ class ModelTrackSettings:
     support_radius: int = 3
     minimum_template_frames: int = 15
     maximum_prototypes: int = 12
+    transparent_expansion: int = 12
+    opaque_expansion: int = 3
+    mask_reference_pixels: int = 1280*720
 
 
 def intersection_fraction(a,b):
@@ -344,24 +347,38 @@ def place(base,box,shape):
     return result
 
 
-def validate(root,files,detections,check=lambda:None):
+def adaptive_mask(mask,base,alpha,box,confidence,shape,settings=None):
+    """按透明度和可信度扩展淡影；只改变自动掩膜，不改变验收阈值。"""
+    opacity=place(np.where((base>0)&(alpha>.45),255,0).astype(np.uint8),box,shape)
+    opacity=cv2.dilate(opacity,np.ones((7,7),np.uint8)) & mask
+    transparent=mask & ~opacity
+    cfg=settings or ModelTrackSettings();scale=math.sqrt((shape[0]*shape[1])/cfg.mask_reference_pixels)
+    semi=max(round(cfg.transparent_expansion/2),min(cfg.transparent_expansion*2,round(cfg.transparent_expansion*scale*(1+.5*(1-confidence)))))
+    opaque=max(2,min(cfg.opaque_expansion*2,round(cfg.opaque_expansion*scale)))
+    expanded=cv2.dilate(transparent,cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(2*semi+1,2*semi+1)))
+    expanded|=cv2.dilate(opacity,cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(2*opaque+1,2*opaque+1)))
+    return expanded,dict(半透明外扩像素=semi,不透明外扩像素=opaque)
+
+
+def validate(root,files,detections,check=lambda:None,progress=None):
     from .vision import sha256
     from .hls_layers import track_bins,write_manifest,VerifiedLayers
     byframe={};maximum={};areas={};object_masks=root/'validated-objects';object_masks.mkdir(exist_ok=True)
     for track in detections['tracks']:
         (object_masks/str(track['id'])).mkdir(exist_ok=True)
-        data=np.load(track['template'],allow_pickle=False);base=data['mask']
-        for p in track['hints']:byframe.setdefault(p['frame'],[]).append((track,p,base))
+        data=np.load(track['template'],allow_pickle=False);base=data['mask'];alpha=data.get('alpha',np.ones(base.shape,np.float32))
+        for p in track['hints']:byframe.setdefault(p['frame'],[]).append((track,p,base,alpha))
     manifests=[]
     for i,file in enumerate(files):
         check();image=cv2.imread(str(file));shape=image.shape[:2];joint=np.zeros(shape,np.uint8)
-        for track,p,base in byframe.get(i,[]):
+        for track,p,base,alpha in byframe.get(i,[]):
             support=place(base,p.get('template_box',p['box']),shape)
             raw=root/'object-masks'/str(track['id'])/file.name
             if not raw.exists():raise PipelineError('MASK_INVALID','SAM未输出预期的对象帧，禁止伪装为完成')
             sam=cv2.imread(str(raw),0)
             if sam is None:raise PipelineError('MASK_INVALID','SAM对象掩膜不可读')
             mask=support | (sam & cv2.dilate(support,np.ones((7,7),np.uint8)))
+            mask,policy=adaptive_mask(mask,base,alpha,p.get('template_box',p['box']),p['confidence'],shape)
             fraction=float(np.count_nonzero(mask)/mask.size)
             if fraction>.2:raise PipelineError('MASK_UNCERTAIN','单条模型轨迹超过20%面积保护')
             maximum[track['id']]=max(maximum.get(track['id'],0),fraction)
@@ -369,6 +386,7 @@ def validate(root,files,detections,check=lambda:None):
             cv2.imwrite(str(object_masks/str(track['id'])/file.name),mask);joint|=mask
         cv2.imwrite(str(root/'masks'/file.name),joint)
         manifests.append(dict(frame_index=i,mask_key='masks/'+file.name,sha256=sha256(root/'masks'/file.name)))
+        if progress and ((i+1)%100==0 or i+1==len(files)):progress(f'CPU掩膜扩展与覆盖核验 {i+1}/{len(files)}帧')
     bins=temporal_bins(areas);layers=[]
     for k,identities in enumerate(bins):
         directory=root/f'layer-{k:02d}'/'masks';directory.mkdir(parents=True,exist_ok=True)
