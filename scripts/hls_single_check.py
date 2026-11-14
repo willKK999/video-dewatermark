@@ -221,7 +221,7 @@ def execute_one(args):
             step('基线覆盖逐像素复核',lambda:verify_coverage(work,args.coverage_reference))
         if args.mask_reference:
             from worker.mask_equivalence import compare
-            step('v1掩膜等价核验',lambda:compare(work,args.mask_reference,output/'掩膜对比-v1-v4.json'))
+            step('v1掩膜等价核验',lambda:compare(work,args.mask_reference,output/f'掩膜对比-v1-v{args.iteration}.json'))
         summaries=read(work/'layers.json');current=work/'frames';roi=None
         if not summaries['layers']:raise PipelineError('MASK_UNCERTAIN','没有可用的已验证掩膜图层')
         if args.inpaint_mode=='roi':
@@ -279,7 +279,7 @@ def main():
     for name in ['source','prior','work','output']:p.add_argument('--'+name,type=Path,required=True)
     p.add_argument('--sha256',required=True);p.add_argument('--duration',type=float,default=HLSSettings.from_env().block_seconds)
     p.add_argument('--context',type=float,default=HLSSettings.from_env().context_seconds)
-    p.add_argument('--iteration',type=int,choices=[1,2,3,4],required=True)
+    p.add_argument('--iteration',type=int,required=True)
     p.add_argument('--prepare-only',action='store_true')
     p.add_argument('--reuse-validated-masks',action='store_true')
     p.add_argument('--condition-overlap',action='store_true')
@@ -295,6 +295,7 @@ def main():
     p.add_argument('--roi-context-ratio',type=float,default=.25)
     p.add_argument('--roi-min-context',type=int,default=32)
     args=p.parse_args()
+    if args.iteration<=0:p.error('轮次须为正整数')
     if args.duration<=0 or args.context<0 or args.duration+args.context>30:p.error('主体与上下文总输入须在30秒内')
     if args.roi_context_ratio<0 or args.roi_min_context<0:p.error('ROI背景外扩不得为负')
     cv2.setNumThreads(2);execute_one(args)
