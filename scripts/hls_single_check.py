@@ -1,4 +1,12 @@
 """通用单段自动模型验证：只运行指定主体和上下文，失败不回退原帧。"""
+
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    import sys as _json_sys
+    from pathlib import Path as _JSONPath
+    _json_sys.path.insert(0,str(_JSONPath(__file__).resolve().parents[1]))
+    from worker.json_types import json_native
 import argparse,json,os,time,subprocess,hashlib
 from pathlib import Path
 from fractions import Fraction
@@ -16,7 +24,7 @@ from worker.matte import temporal_detail
 from scripts.hls_chunk_check import audio_hash
 
 
-def write(path,data):path.write_text(json.dumps(data,ensure_ascii=False,indent=2))
+def write(path,data):path.write_text(json.dumps(json_native(data),ensure_ascii=False,indent=2))
 def read(path):return json.loads(path.read_text()) if path.exists() else {}
 
 

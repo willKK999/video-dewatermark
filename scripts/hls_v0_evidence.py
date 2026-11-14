@@ -1,5 +1,13 @@
 """补齐v0原始证据，不重算指标、不修改验收结论。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    import sys as _json_sys
+    from pathlib import Path as _JSONPath
+    _json_sys.path.insert(0,str(_JSONPath(__file__).resolve().parents[1]))
+    from worker.json_types import json_native
+
 import argparse, json, shutil
 from pathlib import Path
 
@@ -47,7 +55,7 @@ def enrich(work_root, delivery):
     report["指标说明"] = (
         "本文件保留v0原始测量及结论；清晰度只记录，接近0的值尚待第二阶段排查。未修改阈值或重算样本。"
     )
-    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2))
+    report_path.write_text(json.dumps(json_native(report), ensure_ascii=False, indent=2))
     (delivery / "report-v0.json").write_text(report_path.read_text())
     return report
 

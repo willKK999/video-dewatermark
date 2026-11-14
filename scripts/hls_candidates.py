@@ -1,5 +1,13 @@
 """视频去水印系统：逐帧保存专用模型的全部候选，不把字幕直接作为修复对象。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    import sys as _json_sys
+    from pathlib import Path as _JSONPath
+    _json_sys.path.insert(0,str(_JSONPath(__file__).resolve().parents[1]))
+    from worker.json_types import json_native
+
 import argparse, json, os, time
 from pathlib import Path
 
@@ -66,10 +74,10 @@ def main():
                 boxes=selected,
             )
         )
-    a.output.write_text(json.dumps(rows))
+    a.output.write_text(json.dumps(json_native(rows)))
     a.output.with_suffix(".timing.json").write_text(
         json.dumps(
-            dict(耗时秒=time.monotonic() - started, 类别=model.names,低对比增强=a.enhance,重叠分区检测=a.tiles,翻转检测=a.flips),
+            json_native(dict(耗时秒=time.monotonic() - started, 类别=model.names,低对比增强=a.enhance,重叠分区检测=a.tiles,翻转检测=a.flips)),
             ensure_ascii=False,
         )
     )

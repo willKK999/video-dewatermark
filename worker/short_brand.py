@@ -1,5 +1,10 @@
 """发现全片共识之外的短时品牌：模型定位、自动品牌文本验证、图形前景补全。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    from json_types import json_native
+
 import json
 from pathlib import Path
 import cv2, numpy as np
@@ -109,5 +114,5 @@ def discover(files, detections, prior, rows, palette, root, stride=15):
             foreground_area=float(np.count_nonzero(mask) / mask.size),
         ),
     )
-    (root / "detections.json").write_text(json.dumps(result))
+    (root / "detections.json").write_text(json.dumps(json_native(result)))
     return result

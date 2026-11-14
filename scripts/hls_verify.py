@@ -1,5 +1,13 @@
 """视频去水印系统：对最终 MP4 与 HLS 做离线时序、音频、残留及接缝审计。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    import sys as _json_sys
+    from pathlib import Path as _JSONPath
+    _json_sys.path.insert(0,str(_JSONPath(__file__).resolve().parents[1]))
+    from worker.json_types import json_native
+
 import argparse
 import hashlib
 from fractions import Fraction
@@ -338,12 +346,12 @@ def verify(source, result, playlist, report, references, output, detect=False):
             ]
         )
         (output / "composite").symlink_to(frames.resolve(), target_is_directory=True)
-        (output / "detections.json").write_text(json.dumps(references))
+        (output / "detections.json").write_text(json.dumps(json_native(references)))
         references = {
             **references,
             "scenes": vision.shots(sorted(frames.glob("*.png"))),
         }
-        (output / "detections.json").write_text(json.dumps(references))
+        (output / "detections.json").write_text(json.dumps(json_native(references)))
         vision.residual_quality(output, sorted(frames.glob("*.png")), references)
         quality = json.loads((output / "quality.json").read_text())
         assert (
@@ -377,7 +385,7 @@ def verify(source, result, playlist, report, references, output, detect=False):
         "full_sampled_frames": len(list(output.glob("full-*s.jpg"))),
     }
     (output / "verification.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2)
+        json.dumps(json_native(summary), ensure_ascii=False, indent=2)
     )
     if frames.exists():
         (output / "composite").unlink()

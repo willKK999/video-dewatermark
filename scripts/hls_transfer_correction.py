@@ -1,5 +1,13 @@
 """从对齐的已处理帧估计固定叠加差，仅转移去水印修正，保留当前原片的全部纹理。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    import sys as _json_sys
+    from pathlib import Path as _JSONPath
+    _json_sys.path.insert(0,str(_JSONPath(__file__).resolve().parents[1]))
+    from worker.json_types import json_native
+
 import argparse, json, time, subprocess
 from functools import lru_cache
 from pathlib import Path
@@ -185,7 +193,7 @@ def transfer(
         )
     )
     (output / "native-report.json").write_text(
-        json.dumps(meta, ensure_ascii=False, indent=2)
+        json.dumps(json_native(meta), ensure_ascii=False, indent=2)
     )
     print(
         "固定叠加差转移检查", meta["清晰度通过"], meta["清晰度最小保留比"], flush=True

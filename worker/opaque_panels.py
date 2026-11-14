@@ -1,5 +1,10 @@
 """模型确认的不透明面板独立补修；位置、轮廓和生命周期全部来自源片。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    from json_types import json_native
+
 from .hls_settings import is_residual_score, HLSSettings
 
 import json, os, shutil, time, subprocess
@@ -235,7 +240,7 @@ def patch(work, assets_path):
         if not marker.exists() or json.loads(marker.read_text()).get("方法") != method or not bound:
             root.rename(work / f"opaque-panels-before-v3-{time.time_ns()}")
     root.mkdir(exist_ok=True)
-    (root / "method.json").write_text(json.dumps(dict(方法=method), ensure_ascii=False))
+    (root / "method.json").write_text(json.dumps(json_native(dict(方法=method)), ensure_ascii=False))
     report_path = root / "report.json"
     if report_path.exists():
         previous = json.loads(report_path.read_text())
@@ -258,12 +263,12 @@ def patch(work, assets_path):
     current_frames = root / "current-frames"
     if not (root / "current-frames.json").exists():
         missing = capture(final, mapping, current_frames, sorted((Path(info["coarse"]) / "composite").glob("*.png")))
-        (root / "current-frames.json").write_text(json.dumps(dict(输入摘要=vision.sha256(final), 补齐未映射帧=missing), ensure_ascii=False))
+        (root / "current-frames.json").write_text(json.dumps(json_native(dict(输入摘要=vision.sha256(final), 补齐未映射帧=missing)), ensure_ascii=False))
     detected_path = root / "observations.json"
     if not detected_path.exists():
         detected_path.write_text(
             json.dumps(
-                observations(json.loads((work / "all-yolo.json").read_text()), files)
+                json_native(observations(json.loads((work / "all-yolo.json").read_text()), files))
             )
         )
     tracks = groups(json.loads(detected_path.read_text()), d["scenes"])
@@ -314,7 +319,7 @@ def patch(work, assets_path):
     if not active:
         report_path.write_text(
             json.dumps(
-                dict(无需补修=True, 证据=evidence, 输出摘要=vision.sha256(final)),
+                json_native(dict(无需补修=True, 证据=evidence, 输出摘要=vision.sha256(final))),
                 ensure_ascii=False,
                 indent=2,
             )
@@ -348,7 +353,7 @@ def patch(work, assets_path):
                 )
             ],
         )
-        (target / "detections.json").write_text(json.dumps(detect))
+        (target / "detections.json").write_text(json.dumps(json_native(detect)))
         if not (target / "complete.json").exists():
             run(
                 [
@@ -501,7 +506,7 @@ def patch(work, assets_path):
             (work / name).rename(work / f"{name}-before-opaque-{time.time_ns()}")
     report_path.write_text(
         json.dumps(
-            dict(
+            json_native(dict(
                 方法=method,
                 证据=evidence,
                 补修轨迹数=len(active),
@@ -509,7 +514,7 @@ def patch(work, assets_path):
                 耗时秒=time.monotonic() - started,
                 输出摘要=vision.sha256(final),
                 音频原样复制=True,
-            ),
+            )),
             ensure_ascii=False,
             indent=2,
         )

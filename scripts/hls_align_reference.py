@@ -1,5 +1,13 @@
 """按解码内容校准模型序列与原片帧号，保留无重编码的原生参考像素。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    import sys as _json_sys
+    from pathlib import Path as _JSONPath
+    _json_sys.path.insert(0,str(_JSONPath(__file__).resolve().parents[1]))
+    from worker.json_types import json_native
+
 import argparse, json, time
 from pathlib import Path
 from fractions import Fraction
@@ -53,7 +61,7 @@ def align(source, frames, output, model_fps=30):
         方法="有限时域窗口逐帧内容匹配，保留原始解码像素，帧号单调不减",
     )
     (output / "alignment.json").write_text(
-        json.dumps(report, ensure_ascii=False, indent=2)
+        json.dumps(json_native(report), ensure_ascii=False, indent=2)
     )
     print("原生参考时间校准完成", flush=True)
 

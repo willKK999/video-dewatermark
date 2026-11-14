@@ -1,5 +1,10 @@
 """视频去水印系统：有界 HLS 快照、带上下文分块与连续时间轴封装。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    from json_types import json_native
+
 import http.client
 import hashlib
 import ipaddress
@@ -340,7 +345,7 @@ def record_failed_chunk(root, work, index, chunk_started, started):
             (time.monotonic() - chunk_started) * 1000
         )
         measured["hls_total_to_failure"] = round((time.monotonic() - started) * 1000)
-        (root / "phase_ms.json").write_text(json.dumps(measured))
+        (root / "phase_ms.json").write_text(json.dumps(json_native(measured)))
     except (OSError, ValueError):
         pass
 
@@ -587,7 +592,7 @@ def checkpoint_hash(digest, options, engine, low_memory, execution_fingerprint="
     }
     return hashlib.sha256(
         json.dumps(
-            dict(
+            json_native(dict(
                 strategy="hls-multitrack-lifetimes-v8",
                 source=digest,
                 options=options,
@@ -597,7 +602,7 @@ def checkpoint_hash(digest, options, engine, low_memory, execution_fingerprint="
                 low_memory=low_memory,
                 execution_fingerprint=execution_fingerprint,
                 settings=settings,
-            ),
+            )),
             sort_keys=True,
         ).encode()
     ).hexdigest()
@@ -710,7 +715,7 @@ def execute_hls(
         s3.put_object(
             Bucket=bucket,
             Key=descriptor_key,
-            Body=json.dumps(saved).encode(),
+            Body=json.dumps(json_native(saved)).encode(),
             ContentType="application/json",
         )
     info = probe(full, check)
@@ -894,7 +899,7 @@ def execute_hls(
             if restored_draft and prior_path:
                 draft_detection = json.loads((work / "detections.json").read_text())
                 draft_detection["prior"] = str(prior_path)
-                (work / "detections.json").write_text(json.dumps(draft_detection))
+                (work / "detections.json").write_text(json.dumps(json_native(draft_detection)))
             if restored_draft:
                 from . import vision
 
@@ -986,13 +991,13 @@ def execute_hls(
             s3.put_object(
                 Bucket=bucket,
                 Key=cache + ".timing.json",
-                Body=json.dumps(phase).encode(),
+                Body=json.dumps(json_native(phase)).encode(),
                 ContentType="application/json",
             )
             s3.put_object(
                 Bucket=bucket,
                 Key=cache + ".refinements.json",
-                Body=json.dumps(refinements).encode(),
+                Body=json.dumps(json_native(refinements)).encode(),
                 ContentType="application/json",
             )
             composite = work / "composite"
@@ -1000,7 +1005,7 @@ def execute_hls(
             chunk_detection = json.loads((work / "detections.json").read_text())
             if chunk_detection.get("multitrack"):
                 chunk_detection["prior"] = str(prior_path)
-                (work / "detections.json").write_text(json.dumps(chunk_detection))
+                (work / "detections.json").write_text(json.dumps(json_native(chunk_detection)))
             previous_hints = [
                 dict(h, frame=h["frame"] + p["left"])
                 for h in json.loads((work / "detections.json").read_text())["hints"]
@@ -1025,13 +1030,13 @@ def execute_hls(
         )
         (root / "metrics-hls.json").write_text(
             json.dumps(
-                dict(
+                json_native(dict(
                     chunks=times,
                     source_sha256=digest,
                     checkpoint_fingerprint=cache_hash,
                     completed_chunks=i + 1,
                     total_chunks=len(plans),
-                ),
+                )),
                 ensure_ascii=False,
             )
         )
@@ -1053,7 +1058,7 @@ def execute_hls(
             from .multitrack import combine_tracks
 
             detections = combine_tracks(detections, prior_path)
-        (root / "detections.json").write_text(json.dumps(detections))
+        (root / "detections.json").write_text(json.dumps(json_native(detections)))
     stage("encode")
     progress(len(plans), len(plans), "encode")
     cuts = [sum(durations[:i]) for i in range(1, len(durations))]
@@ -1313,7 +1318,7 @@ def execute_hls(
         **audio_timing,
     )
     (root / "metrics-hls.json").write_text(
-        json.dumps(report, ensure_ascii=False, indent=2)
+        json.dumps(json_native(report), ensure_ascii=False, indent=2)
     )
     with zipfile.ZipFile(
         root / "hls.zip", "w", compression=zipfile.ZIP_STORED

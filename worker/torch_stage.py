@@ -1,5 +1,10 @@
 """Wrap an upstream script and capture PyTorch GPU high-water marks on exit."""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    from json_types import json_native
+
 import argparse
 import importlib.util
 import json
@@ -49,13 +54,13 @@ def main():
         torch.cuda.synchronize()
         Path(args.metrics).write_text(
             json.dumps(
-                {
+                json_native({
                     "script_seconds": time.perf_counter()-started,
                     "preview_seconds": previews["seconds"],
                     "skipped_previews": previews["skipped"],
                     "allocated_mib": round(torch.cuda.max_memory_allocated() / 2**20),
                     "reserved_mib": round(torch.cuda.max_memory_reserved() / 2**20),
-                }
+                })
             )
         )
 

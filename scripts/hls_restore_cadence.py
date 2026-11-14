@@ -1,5 +1,13 @@
 """以固定水印轨迹内的真实帧差恢复原始帧率，禁止把移动水印差分加回。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    import sys as _json_sys
+    from pathlib import Path as _JSONPath
+    _json_sys.path.insert(0,str(_JSONPath(__file__).resolve().parents[1]))
+    from worker.json_types import json_native
+
 import argparse, json, subprocess, time
 from pathlib import Path
 import cv2, numpy as np
@@ -156,7 +164,7 @@ def restore(
         )
     )
     (output / "native-report.json").write_text(
-        json.dumps(report, ensure_ascii=False, indent=2)
+        json.dumps(json_native(report), ensure_ascii=False, indent=2)
     )
     print("原生时序恢复完成，清晰度检查", report["清晰度通过"], flush=True)
 

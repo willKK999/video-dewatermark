@@ -1,5 +1,10 @@
 """PostgreSQL is authoritative; Redis messages are only delivery hints."""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    from json_types import json_native
+
 import hashlib
 import json
 import random
@@ -54,7 +59,7 @@ def claim(
                 "overlap": 8 if job["low_memory"] else 12,
             }
             job["config_hash"] = hashlib.sha256(
-                json.dumps(job["execution_config"], sort_keys=True).encode()
+                json.dumps(json_native(job["execution_config"]), sort_keys=True).encode()
             ).hexdigest()
             db.execute(
                 """INSERT INTO attempts(job_id,attempt_no,worker_id,config_hash,image_digest,model_versions)
@@ -176,7 +181,7 @@ def finish(
 
 
 def config_hash(config):
-    return hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
+    return hashlib.sha256(json.dumps(json_native(config), sort_keys=True).encode()).hexdigest()
 
 
 def set_progress(dsn, job, progress):

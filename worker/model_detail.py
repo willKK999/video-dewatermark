@@ -1,4 +1,9 @@
 """复用v7标准差3的联合纹理投影；不透明区域禁止回灌源水印细节。"""
+
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    from json_types import json_native
 import json
 from pathlib import Path
 import cv2,numpy as np
@@ -42,7 +47,7 @@ def render(work,files,detected,fps):
         exclude|=mask&~known
         projected_texture_composite(source,base,mask,glyph,exclude,accumulator=acc,detail_sigma=cfg.detail_sigma)
     calibration=solve_projection(acc)
-    (work/'detail-calibration.json').write_text(json.dumps(calibration))
+    (work/'detail-calibration.json').write_text(json.dumps(json_native(calibration)))
     opaque_pixels=0;masked_pixels=0
     for i,file in enumerate(files):
         source=cv2.imread(str(file));base=cv2.imread(str(work/'composite'/file.name))
@@ -56,5 +61,5 @@ def render(work,files,detected,fps):
         masked_pixels+=np.count_nonzero(mask);opaque_pixels+=np.count_nonzero(exclude&mask)
     stats=dict(标准差=cfg.detail_sigma,校准样本数=len(selected),处理帧数=len(files),
                掩膜像素=int(masked_pixels),不透明排除像素=int(opaque_pixels),透明反解=False)
-    (work/'detail-summary.json').write_text(json.dumps(stats,ensure_ascii=False,indent=2))
+    (work/'detail-summary.json').write_text(json.dumps(json_native(stats),ensure_ascii=False,indent=2))
     return dest,stats

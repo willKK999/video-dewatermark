@@ -1,3 +1,8 @@
+
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    from json_types import json_native
 import json
 import os
 import shutil
@@ -31,7 +36,7 @@ def execute(
             timings[name] = timings.get(name, 0) + round(
                 (time.monotonic() - start) * 1000
             )
-            (root / "phase_ms.json").write_text(json.dumps(timings))
+            (root / "phase_ms.json").write_text(json.dumps(json_native(timings)))
 
     short = options.get("max_short_edge", 720)
     if low_memory and options.get("allow_downgrade"):
@@ -55,7 +60,7 @@ def execute(
         if options.get("adaptive_timeouts"):
             from .stage_budget import sam_budget
             budget = sam_budget(detections, len(files), info["width"]*info["height"])
-            (root / "mask-budget.json").write_text(json.dumps(budget, indent=2))
+            (root / "mask-budget.json").write_text(json.dumps(json_native(budget), indent=2))
             return vision.masks(root, files, detections, engine, check, budget=budget)
         return vision.masks(root, files, detections, engine, check)
     try:
@@ -88,7 +93,7 @@ def execute(
         "media": info,
         "frames": manifest,
     }
-    (root / "manifest.json").write_text(json.dumps(metadata, indent=2))
+    (root / "manifest.json").write_text(json.dumps(json_native(metadata), indent=2))
     step(
         "inpaint",
         lambda: vision.inpaint(

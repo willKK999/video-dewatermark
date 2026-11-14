@@ -1,5 +1,10 @@
 """Only dedicated watermark weights; generic COCO models are not acceptable."""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    from json_types import json_native
+
 import argparse
 import json
 import os
@@ -190,14 +195,14 @@ def main():
             results.append(candidate)
             previous_box = candidate["box"]
     Path(args.output).with_name('metrics.'+Path(args.output).name).write_text(
-        json.dumps(dict(model_load_seconds=load_seconds,
+        json.dumps(json_native(dict(model_load_seconds=load_seconds,
                         detection_seconds=time.perf_counter()-started,
                         uncovered_watermark_frames=len({p['frame'] for p in uncovered}),
-                        uncovered_nontext_candidates=uncovered[:32])))
+                        uncovered_nontext_candidates=uncovered[:32]))))
     if len(uncertain) > max(2, len(results)*.1):
-        Path(args.output).write_text(json.dumps({'uncertain': True}))
+        Path(args.output).write_text(json.dumps(json_native({'uncertain': True})))
     else:
-        Path(args.output).write_text(json.dumps(results))
+        Path(args.output).write_text(json.dumps(json_native(results)))
 
 
 if __name__ == "__main__":

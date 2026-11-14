@@ -1,5 +1,13 @@
 """保留已修复的底色，重新合成原片真实纹理；不以模板幅度抑制皮肤细节。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    import sys as _json_sys
+    from pathlib import Path as _JSONPath
+    _json_sys.path.insert(0,str(_JSONPath(__file__).resolve().parents[1]))
+    from worker.json_types import json_native
+
 import argparse, json, subprocess, time
 from pathlib import Path
 import cv2, numpy as np
@@ -181,7 +189,7 @@ def recompose(
         )
     )
     (output / "native-report.json").write_text(
-        json.dumps(meta, ensure_ascii=False, indent=2)
+        json.dumps(json_native(meta), ensure_ascii=False, indent=2)
     )
     print(
         "原片细节重合成检查", meta["清晰度通过"], meta["清晰度最小保留比"], flush=True

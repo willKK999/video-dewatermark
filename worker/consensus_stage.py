@@ -1,5 +1,10 @@
 """在时域共识图上运行专用模型，多尺度验证淡色与斜向标识。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    from json_types import json_native
+
 import argparse, json
 from pathlib import Path
 from ultralytics import YOLO
@@ -27,7 +32,7 @@ def main():
                     class_id=int(b.cls[0]),
                 )
             )
-    Path(a.output).write_text(json.dumps(items))
+    Path(a.output).write_text(json.dumps(json_native(items)))
 
 
 if __name__ == "__main__":

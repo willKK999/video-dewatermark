@@ -1,5 +1,10 @@
 """Run via TRACK_PYTHON with pinned SAM 2.1 installed. Exits after each job."""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    from json_types import json_native
+
 import argparse
 import json
 import os
@@ -99,12 +104,12 @@ def main():
                     predictor.reset_state(state)
     (root / "metrics.sam.json").write_text(
         json.dumps(
-            {
+            json_native({
                 "model_load_seconds": load_seconds,
                 "segmentation_seconds": time.perf_counter() - started,
                 "allocated_mib": round(torch.cuda.max_memory_allocated() / 2**20),
                 "reserved_mib": round(torch.cuda.max_memory_reserved() / 2**20),
-            }
+            })
         )
     )
 

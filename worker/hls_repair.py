@@ -1,5 +1,10 @@
 """视频去水印系统：以自动残留证据触发带上下文的局部复修。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    from json_types import json_native
+
 import json
 import os
 from pathlib import Path
@@ -78,7 +83,7 @@ def reseed_masks(work, root, files, detections, candidates, affected, ranges, ch
             for start, end in ranges
         ]
     (target / "detections.json").write_text(
-        json.dumps(dict(scenes=ranges, hints=hints, dense=True))
+        json.dumps(json_native(dict(scenes=ranges, hints=hints, dense=True)))
     )
     run(
         [
@@ -250,7 +255,7 @@ def refine(root, files, detections, engine, low_memory, fps, stage, check, round
             )
         )
     (root / "hls-refinements.json").write_text(
-        json.dumps(records, ensure_ascii=False, indent=2)
+        json.dumps(json_native(records), ensure_ascii=False, indent=2)
     )
     final = json.loads((root / "quality.json").read_text())
     if final["residual_count"] or final["needs_review"]:

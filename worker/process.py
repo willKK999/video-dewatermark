@@ -1,5 +1,10 @@
 """Interruptible subprocesses. No shell expansion; kill descendants on lease loss."""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    from json_types import json_native
+
 import os
 import signal
 import subprocess
@@ -36,7 +41,7 @@ def run(args, check=lambda: None, cwd=None, timeout=900, *, stage=None, event_pa
                      workload=workload or {}, command=Path(str(args[0])).name)
         def record():
             if event_path is not None:
-                Path(event_path).write_text(json.dumps(event, ensure_ascii=False, indent=2))
+                Path(event_path).write_text(json.dumps(json_native(event), ensure_ascii=False, indent=2))
         try:
             record()
             while p.poll() is None:

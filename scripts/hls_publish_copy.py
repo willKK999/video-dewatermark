@@ -1,5 +1,13 @@
 """视频去水印系统：把成功产物复制到独立安全前缀，不输出内部租约标识。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    import sys as _json_sys
+    from pathlib import Path as _JSONPath
+    _json_sys.path.insert(0,str(_JSONPath(__file__).resolve().parents[1]))
+    from worker.json_types import json_native
+
 import argparse, json, os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -55,7 +63,7 @@ def copy_result(job_id, prefix, output):
         "对象数": len(objects),
     }
     (output / "结果前缀.json").write_text(
-        json.dumps(safe, ensure_ascii=False, indent=2)
+        json.dumps(json_native(safe), ensure_ascii=False, indent=2)
     )
     print("已复制到独立结果前缀：" + prefix + "，对象数：" + str(len(objects)))
     return safe

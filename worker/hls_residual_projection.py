@@ -1,5 +1,10 @@
 """在已确认淡水印笔画内校正编码后残留投影；保留低频和时变纹理。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    from json_types import json_native
+
 import argparse, json, shutil, subprocess, time
 from pathlib import Path
 import cv2, numpy as np
@@ -168,7 +173,7 @@ def patch(work, assets_path):
     if not wanted:
         report_path.write_text(
             json.dumps(
-                dict(方法=method, 无需校正=True, 修复前=before, 输出摘要=digest),
+                json_native(dict(方法=method, 无需校正=True, 修复前=before, 输出摘要=digest)),
                 ensure_ascii=False,
                 indent=2,
             )
@@ -305,7 +310,7 @@ def patch(work, assets_path):
         音频原样复制=True,
         低频策略="只校正已证实的字形方向，保留v7低频基底及无关时变纹理",
     )
-    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2))
+    report_path.write_text(json.dumps(json_native(report), ensure_ascii=False, indent=2))
     output.replace(video)
     for name in ["audit", "verified.json"]:
         if (work / name).exists():

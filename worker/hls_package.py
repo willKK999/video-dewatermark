@@ -1,5 +1,10 @@
 """沿用既有校验规则，把原规格视频封装为保持原分片时间轴的 HLS。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    from json_types import json_native
+
 import json, time, zipfile
 from .hls import audio_timeline_metrics, seam_metrics
 from .media import probe
@@ -244,7 +249,7 @@ def package(
         **audio_timing,
     )
     (root / "metrics-hls.json").write_text(
-        json.dumps(report, ensure_ascii=False, indent=2)
+        json.dumps(json_native(report), ensure_ascii=False, indent=2)
     )
     with zipfile.ZipFile(
         root / "hls.zip", "w", compression=zipfile.ZIP_STORED

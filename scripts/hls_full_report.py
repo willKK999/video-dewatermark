@@ -1,5 +1,13 @@
 """视频去水印系统：汇总完整证据；清晰度只记录，待目检不能写成通过。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    import sys as _json_sys
+    from pathlib import Path as _JSONPath
+    _json_sys.path.insert(0,str(_JSONPath(__file__).resolve().parents[1]))
+    from worker.json_types import json_native
+
 import argparse, json
 from pathlib import Path
 from worker.hls_acceptance import clarity_summary, hard_acceptance
@@ -93,9 +101,9 @@ def build(root):
     prefix = root / "结果前缀.json"
     if prefix.exists():
         report["结果R2前缀"] = json.loads(prefix.read_text())
-    (root / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2))
+    (root / "report.json").write_text(json.dumps(json_native(report), ensure_ascii=False, indent=2))
     (root / "清晰度低于0.7样本.json").write_text(
-        json.dumps(clarity["低于0.7样本"], ensure_ascii=False, indent=2)
+        json.dumps(json_native(clarity["低于0.7样本"]), ensure_ascii=False, indent=2)
     )
     return report
 

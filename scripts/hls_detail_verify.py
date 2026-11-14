@@ -1,5 +1,13 @@
 """记录编码后的清晰度样本；覆盖两个帧率相位及生命周期边界，不作为验收硬门槛。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    import sys as _json_sys
+    from pathlib import Path as _JSONPath
+    _json_sys.path.insert(0,str(_JSONPath(__file__).resolve().parents[1]))
+    from worker.json_types import json_native
+
 import argparse, json, time
 from pathlib import Path
 import cv2, numpy as np
@@ -116,7 +124,7 @@ def verify(
         不透明排除图层=[str(p) for p in occluder_roots],
         核验方式="每半秒相邻两对覆盖帧率两个相位，并加采转场、移动目标生命周期边界；清晰度只记录，低于0.7单列；残留和闪烁另做全帧复检"
     )
-    output.write_text(json.dumps(report, ensure_ascii=False, indent=2))
+    output.write_text(json.dumps(json_native(report), ensure_ascii=False, indent=2))
     print(
         "编码后清晰度记录完成，低于0.7样本数",
         report["低于0.7样本数"],

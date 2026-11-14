@@ -1,4 +1,9 @@
 """复用同一输入经模型验证的历史掩膜；摘要不同即拒绝，不把缓存变成固定坐标规则。"""
+
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    from json_types import json_native
 import hashlib,json,shutil
 from pathlib import Path
 import cv2,numpy as np
@@ -50,8 +55,8 @@ def merge(work,reference,detected,progress=None):
     detected['precomputed_track_ids']=precomputed
     detected['coverage_reference']=dict(源摘要=current['source']['source_sha256'],检测摘要=sha(reference/'detections.json'),
                                       联合掩膜摘要=sha(reference/'model-mask-summary.json'),轨迹数=len(precomputed),逐帧摘要=[p['sha256'] for p in summary['逐帧']])
-    (work/'detections.json').write_text(json.dumps(detected))
-    (work/'coverage-reference.json').write_text(json.dumps(detected['coverage_reference'],ensure_ascii=False,indent=2))
+    (work/'detections.json').write_text(json.dumps(json_native(detected)))
+    (work/'coverage-reference.json').write_text(json.dumps(json_native(detected['coverage_reference']),ensure_ascii=False,indent=2))
     return detected
 
 
@@ -63,6 +68,6 @@ def verify_coverage(work,reference):
         missed=int(np.count_nonzero((old>0)&(new==0)))
         rows.append(dict(帧=int(path.stem),基线像素=int(np.count_nonzero(old)),本轮像素=int(np.count_nonzero(new)),缺失像素=missed))
     report=dict(逐帧=rows,缺失像素总数=sum(r['缺失像素'] for r in rows),通过=all(r['缺失像素']==0 for r in rows))
-    (work/'coverage-comparison.json').write_text(json.dumps(report,ensure_ascii=False,indent=2))
+    (work/'coverage-comparison.json').write_text(json.dumps(json_native(report),ensure_ascii=False,indent=2))
     if not report['通过']:raise PipelineError('COVERAGE_REGRESSION','本轮丢失已验证的同源基线水印覆盖',details=report)
     return report

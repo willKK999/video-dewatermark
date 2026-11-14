@@ -1,5 +1,10 @@
 """由跨时段共识建立多水印先验，不使用影片坐标或字幕位置规则。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    from json_types import json_native
+
 from .hls_settings import is_residual_score
 
 import json
@@ -133,7 +138,7 @@ def save_prior(path, median, signal, regions, variants, metrics):
         variants=variants,
         metrics=metrics,
     )
-    arrays = dict(median=median, signal=signal, metadata=np.array(json.dumps(metadata)))
+    arrays = dict(median=median, signal=signal, metadata=np.array(json.dumps(json_native(metadata))))
     arrays.update({f'mask_{r["id"]}': r["mask"] for r in regions})
     np.savez_compressed(path, **arrays)
 
@@ -326,7 +331,7 @@ def make_tracks(files, scenes, prior_path, root, check=lambda: None, fps=30):
         prior=str(root / "multitrack-prior.npz"),
         metrics=metrics,
     )
-    (root / "detections.json").write_text(json.dumps(result))
+    (root / "detections.json").write_text(json.dumps(json_native(result)))
     return result
 
 
@@ -436,7 +441,7 @@ def prepare(source, root, check=lambda: None):
     )
     path = root / "multitrack-prior.npz"
     save_prior(path, median, signal, regions, variants, metrics)
-    (root / "multitrack-metrics.json").write_text(json.dumps(metrics))
+    (root / "multitrack-metrics.json").write_text(json.dumps(json_native(metrics)))
     return path
 
 
@@ -604,8 +609,8 @@ def residual_quality(root, files, detections, check=lambda: None, frame_reader=N
         moving_evidence=moving_evidence,
         method="全帧移动完整模板与固定轨迹时域共识复检",
     )
-    (root / "quality.json").write_text(json.dumps(quality))
-    (root / "quality-detections.json").write_text(json.dumps(moving_evidence))
+    (root / "quality.json").write_text(json.dumps(json_native(quality)))
+    (root / "quality-detections.json").write_text(json.dumps(json_native(moving_evidence)))
     if count:
         raise PipelineError(
             "RESIDUAL_UNCERTAIN", "多轨迹完整标识复检发现残留证据", review=True
@@ -686,7 +691,7 @@ def refine(root, files, detections, engine, low_memory, fps, stage, check):
             )
         )
         shutil.rmtree(work)
-    (root / "hls-refinements.json").write_text(json.dumps(records, ensure_ascii=False))
+    (root / "hls-refinements.json").write_text(json.dumps(json_native(records), ensure_ascii=False))
     if json.loads((root / "quality.json").read_text())["residual_count"]:
         raise PipelineError(
             "RESIDUAL_UNCERTAIN", "多目标复修后仍有完整标识残留", review=True

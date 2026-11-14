@@ -1,5 +1,13 @@
 """跨背景共同估计固定字形系数，避免逐帧投影抹掉人物运动纹理。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    import sys as _json_sys
+    from pathlib import Path as _JSONPath
+    _json_sys.path.insert(0,str(_JSONPath(__file__).resolve().parents[1]))
+    from worker.json_types import json_native
+
 import argparse, json
 from pathlib import Path
 import cv2, numpy as np
@@ -51,10 +59,10 @@ def fit(
         used.append(int(i))
     if len(used) < 15:
         raise ValueError("跨背景校准样本不足，禁止逐帧过拟合")
-    output.write_text(json.dumps(solve_projection(acc)))
+    output.write_text(json.dumps(json_native(solve_projection(acc))))
     output.with_suffix(".samples.json").write_text(
         json.dumps(
-            dict(模型采样帧=used, 样本数=len(used)), ensure_ascii=False, indent=2
+            json_native(dict(模型采样帧=used, 样本数=len(used))), ensure_ascii=False, indent=2
         )
     )
     print("固定字形跨背景校准完成，样本数", len(used), flush=True)

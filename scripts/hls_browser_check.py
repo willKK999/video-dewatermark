@@ -1,5 +1,13 @@
 """视频去水印系统 HLS 浏览器验收；凭证从文件读取，不记录网络地址。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    import sys as _json_sys
+    from pathlib import Path as _JSONPath
+    _json_sys.path.insert(0,str(_JSONPath(__file__).resolve().parents[1]))
+    from worker.json_types import json_native
+
 import argparse
 import json
 from pathlib import Path
@@ -43,7 +51,7 @@ with sync_playwright() as pw:
             "() => document.getElementById('uploadStatus').textContent.includes('HLS 任务已提交')"
         )
         job = page.evaluate("selectedJob")
-        (out / "job.json").write_text(json.dumps({"id": job}))
+        (out / "job.json").write_text(json.dumps(json_native({"id": job})))
         print("浏览器已提交 HLS 任务：" + job, flush=True)
     else:
         job = json.loads((out / "job.json").read_text())["id"]
@@ -72,9 +80,9 @@ with sync_playwright() as pw:
             page.locator("#workspace").wait_for(state="visible")
             page.evaluate("id=>selectJob(id)", job)
             continue
-        state = (data["status"], data.get("stage"), json.dumps(data.get("progress")))
+        state = (data["status"], data.get("stage"), json.dumps(json_native(data.get("progress"))))
         if state != previous:
-            print("任务进度：" + json.dumps(state, ensure_ascii=False), flush=True)
+            print("任务进度：" + json.dumps(json_native(state), ensure_ascii=False), flush=True)
             previous = state
             page.screenshot(path=str(out / "console-progress.png"), full_page=True)
         if data["status"] == "SUCCEEDED":
@@ -129,11 +137,11 @@ with sync_playwright() as pw:
             assert (
                 hashlib.sha256(archive.read(item["name"])).hexdigest() == item["sha256"]
             )
-    (out / "browser-segments.json").write_text(json.dumps(segment_hashes, indent=2))
+    (out / "browser-segments.json").write_text(json.dumps(json_native(segment_hashes), indent=2))
     page.screenshot(path=str(out / "console-playback.png"), full_page=True)
     (out / "browser.json").write_text(
         json.dumps(
-            {
+            json_native({
                 "job": job,
                 "durations": duration,
                 "hls_playback": True,
@@ -142,7 +150,7 @@ with sync_playwright() as pw:
                 "mp4_download": True,
                 "zip_download": True,
                 "verified_remote_segments": len(segment_hashes),
-            },
+            }),
             ensure_ascii=False,
             indent=2,
         )

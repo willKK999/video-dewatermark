@@ -1,4 +1,9 @@
 """自动轨迹ROI补画：原生裁块、默认半精度、逐像素覆盖核验，不回退失败原帧。"""
+
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    from json_types import json_native
 from dataclasses import dataclass,asdict
 from pathlib import Path
 import json,math,os,time,shutil
@@ -150,7 +155,7 @@ def execute(work,files,detected,log=lambda message:None,cfg=None):
         try:run(args,cwd=os.environ['PROPAINTER_ROOT'],timeout=900,stage='ROI-ProPainter')
         except PipelineError as exc:
             row.update(错误码=exc.code,耗时秒=time.monotonic()-begin)
-            (work/'roi-report.json').write_text(json.dumps(dict(配置=asdict(cfg),任务=records),ensure_ascii=False,indent=2))
+            (work/'roi-report.json').write_text(json.dumps(json_native(dict(配置=asdict(cfg),任务=records)),ensure_ascii=False,indent=2))
             if exc.code=='GPU_OOM' and depth<cfg.maximum_retries and end-start>cfg.minimum_frames:
                 log(f'ROI任务={row["任务"]} 显存不足，保留失败记录，仅拆分该任务时间范围重试')
                 middle=(start+end)//2;overlap=min(8,max(1,(end-start)//8))
@@ -190,7 +195,7 @@ def execute(work,files,detected,log=lambda message:None,cfg=None):
         # 只清本任务已核验的临时裁块，保留任务报告及完整原生结果。
         for name in ['frames','masks','out']:shutil.rmtree(task/name)
         log(f'ROI任务={row["任务"]} 完成 耗时秒={row["耗时秒"]:.3f} 贴回像素={changed}')
-        (work/'roi-report.json').write_text(json.dumps(dict(配置=asdict(cfg),任务=records),ensure_ascii=False,indent=2))
+        (work/'roi-report.json').write_text(json.dumps(json_native(dict(配置=asdict(cfg),任务=records)),ensure_ascii=False,indent=2))
     for layer_number,layer in enumerate(layers):
         layer_masks=[cv2.imread(str(Path(layer['directory'])/p.name),0) for p in files]
         for scene in detected['scenes']:
@@ -222,5 +227,5 @@ def execute(work,files,detected,log=lambda message:None,cfg=None):
     summary=dict(配置=asdict(cfg),任务=records,任务数=len(records),实际图层数=len(layers),
         总耗时秒=time.monotonic()-started,施工像素=real_pixels,模型像素帧=model_pixels,
         原整帧六层像素帧=source_pixels*len(files)*6,原帧回退数=0,覆盖核验通过=True)
-    (work/'roi-report.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2))
+    (work/'roi-report.json').write_text(json.dumps(json_native(summary),ensure_ascii=False,indent=2))
     return summary

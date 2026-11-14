@@ -1,5 +1,10 @@
 """单轮分块流程：失败保留产物、继续后续阶段，验收状态如实记录。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    from json_types import json_native
+
 import json, time, os
 from pathlib import Path
 from .vision import sha256
@@ -44,13 +49,13 @@ def execute_round(work, stages, video, prior_attempts=None):
             report["未通过原因"].append(name + "：" + row["错误码"])
         row["本轮耗时秒"] = time.monotonic() - started
         report["阶段"].append(row)
-        path.write_text(json.dumps(report, ensure_ascii=False, indent=2))
+        path.write_text(json.dumps(json_native(report), ensure_ascii=False, indent=2))
     report.update(
         完成=True,
         产物可用=video.is_file() and video.stat().st_size > 0,
         视频摘要=sha256(video) if video.exists() else None,
     )
-    path.write_text(json.dumps(report, ensure_ascii=False, indent=2))
+    path.write_text(json.dumps(json_native(report), ensure_ascii=False, indent=2))
     return report
 
 

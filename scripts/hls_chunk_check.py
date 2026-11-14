@@ -1,5 +1,13 @@
 """视频去水印系统：只运行一个带上下文的处理块，绝不调度后续块。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    import sys as _json_sys
+    from pathlib import Path as _JSONPath
+    _json_sys.path.insert(0,str(_JSONPath(__file__).resolve().parents[1]))
+    from worker.json_types import json_native
+
 import argparse
 from fractions import Fraction
 import hashlib
@@ -100,7 +108,7 @@ def run_one(source, prior, output, duration=25, context=2, resume_root=None):
             raise ValueError("续跑必须包含完整多轨迹检测")
         checked = time.monotonic()
         manifest = vision.validate_masks(work, files, detections)
-        (work / "validated-masks.json").write_text(json.dumps(manifest))
+        (work / "validated-masks.json").write_text(json.dumps(json_native(manifest)))
         phases["mask_validation"] = round((time.monotonic() - checked) * 1000)
         model = json.loads((work / "metrics.sam.json").read_text())
         phases["mask"] = round(model["segmentation_seconds"] * 1000)
@@ -165,7 +173,7 @@ def run_one(source, prior, output, duration=25, context=2, resume_root=None):
             lambda: None,
         )
         phases["residual_refine"] = sum(p["elapsed_ms"] for p in refinements)
-    (work / "phase_ms.json").write_text(json.dumps(phases))
+    (work / "phase_ms.json").write_text(json.dumps(json_native(phases)))
     refs = cut_references(detections, 0, core)
     final = output / "chunk1.mp4"
     silent = output / "core-video.mp4"
@@ -253,7 +261,7 @@ def verify_one(
         audit.rename(output / f"audit-before-{time.time_ns()}")
     audit.mkdir()
     (audit / "composite").symlink_to(encoded.resolve(), target_is_directory=True)
-    (audit / "detections.json").write_text(json.dumps(refs))
+    (audit / "detections.json").write_text(json.dumps(json_native(refs)))
     vision.residual_quality(audit, sorted(encoded.glob("*.png")), refs)
     quality = json.loads((audit / "quality.json").read_text())
     out_info = media.probe(final, count=True)
@@ -419,7 +427,7 @@ def verify_one(
             report["总耗时秒"] + phases.get("mask", 0) / 1000
         )
     (output / "report.json").write_text(
-        json.dumps(report, ensure_ascii=False, indent=2)
+        json.dumps(json_native(report), ensure_ascii=False, indent=2)
     )
     print(
         "单块自动验收"
@@ -450,7 +458,7 @@ def main():
         started = time.monotonic()
         previous = json.loads((a.output / "report.json").read_text())
         (a.output / f"report-before-{time.time_ns()}.json").write_text(
-            json.dumps(previous, ensure_ascii=False, indent=2)
+            json.dumps(json_native(previous), ensure_ascii=False, indent=2)
         )
         silent = a.output / "core-video.mp4"
         run(

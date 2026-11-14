@@ -1,5 +1,13 @@
 """视频去水印系统：从自动确认的完整品牌图案学习新变体，不使用影片坐标或品牌常量。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    import sys as _json_sys
+    from pathlib import Path as _JSONPath
+    _json_sys.path.insert(0,str(_JSONPath(__file__).resolve().parents[1]))
+    from worker.json_types import json_native
+
 from pathlib import Path
 import argparse, json, time
 import cv2, numpy as np
@@ -96,7 +104,7 @@ for row in rows:
         print("完整品牌变体匹配帧数", index, flush=True)
 (root / "tracks.json").write_text(
     json.dumps(
-        dict(seed=best, frames=records, seconds=time.monotonic() - started),
+        json_native(dict(seed=best, frames=records, seconds=time.monotonic() - started)),
         ensure_ascii=False,
         indent=2,
     )

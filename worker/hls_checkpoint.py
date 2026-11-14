@@ -1,5 +1,10 @@
 """视频去水印系统：原始检测及 SAM 已完成时保存可复修的无损草稿。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    from json_types import json_native
+
 import json
 from pathlib import Path
 import re
@@ -32,7 +37,7 @@ def save_draft(s3, bucket, key, root, fps, check):
     )
     archive = root / "draft.zip"
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as out:
-        out.writestr("draft.json", json.dumps(dict(sha256=sha256(movie))))
+        out.writestr("draft.json", json.dumps(json_native(dict(sha256=sha256(movie)))))
         for name in (
             "detections.json",
             "phase_ms.json",

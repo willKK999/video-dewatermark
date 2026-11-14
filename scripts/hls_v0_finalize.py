@@ -1,5 +1,13 @@
 """在其他磁盘续做已编码整集的技术检查和报告，不改变逐块验收结论。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    import sys as _json_sys
+    from pathlib import Path as _JSONPath
+    _json_sys.path.insert(0,str(_JSONPath(__file__).resolve().parents[1]))
+    from worker.json_types import json_native
+
 import argparse
 import json
 from datetime import datetime, timezone
@@ -65,11 +73,11 @@ def finalize(root, source, output, timing=None):
         backup = output / "report-封装前.json"
         if not backup.exists():
             backup.write_bytes(path.read_bytes())
-    path.write_text(json.dumps(report, ensure_ascii=False, indent=2))
+    path.write_text(json.dumps(json_native(report), ensure_ascii=False, indent=2))
     enrich(root, output)
     with (output / "progress.log").open("a") as stream:
         stream.write(now.isoformat() + " 整集 v0 完成；技术规格及音频复制通过；未通过块=" + str(report["未通过块"]) + "\n")
-    (output / "v0-local-ready.json").write_text(json.dumps(dict(完成时间=now.isoformat(), 成品摘要=report["成品摘要"], 预览摘要=report["预览摘要"]), ensure_ascii=False, indent=2))
+    (output / "v0-local-ready.json").write_text(json.dumps(json_native(dict(完成时间=now.isoformat(), 成品摘要=report["成品摘要"], 预览摘要=report["预览摘要"])), ensure_ascii=False, indent=2))
     return report
 
 

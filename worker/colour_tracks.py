@@ -1,5 +1,10 @@
 """从已确认品牌的完整模板定位独立目标，按镜头分别初始化 SAM 并补足动画前后图形。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    from json_types import json_native
+
 import json, os, time
 from pathlib import Path
 import cv2, numpy as np
@@ -79,7 +84,7 @@ def complete(work, assets, detected, check):
                 )
             ],
         )
-        (root / "detections.json").write_text(json.dumps(d))
+        (root / "detections.json").write_text(json.dumps(json_native(d)))
         if not (root / "complete.json").exists():
             run(
                 [
@@ -138,12 +143,12 @@ def complete(work, assets, detected, check):
             else:
                 intervals.append([i, i + 1])
     for name in ["color", "graphics"]:
-        (work / name / "detections.json").write_text(json.dumps(dict(scenes=intervals)))
+        (work / name / "detections.json").write_text(json.dumps(json_native(dict(scenes=intervals))))
     info = dict(
         独立图形轨迹数=len(candidates),
         耗时秒=time.monotonic() - started,
         空帧允许=True,
         依据="完整品牌模板定位、逐镜头独立SAM状态、自动种子及既有固定副本排除",
     )
-    marker.write_text(json.dumps(info, ensure_ascii=False, indent=2))
+    marker.write_text(json.dumps(json_native(info), ensure_ascii=False, indent=2))
     return info

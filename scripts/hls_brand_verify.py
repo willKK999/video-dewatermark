@@ -1,5 +1,13 @@
 """编码后逐帧核验完整图形及其局部部件，覆盖图标、文字和反色残留。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    import sys as _json_sys
+    from pathlib import Path as _JSONPath
+    _json_sys.path.insert(0,str(_JSONPath(__file__).resolve().parents[1]))
+    from worker.json_types import json_native
+
 import argparse, json
 from functools import lru_cache
 from pathlib import Path
@@ -129,7 +137,7 @@ def verify(
         判定阈值=dict(绝对相关=0.55, 相对幅度=0.15),
         证据=evidence,
     )
-    output.write_text(json.dumps(report, ensure_ascii=False, indent=2))
+    output.write_text(json.dumps(json_native(report), ensure_ascii=False, indent=2))
     print("完整图形复检结果", report["通过"], "证据数", len(evidence), flush=True)
 
 

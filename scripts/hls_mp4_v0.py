@@ -1,5 +1,13 @@
 """本地明文 MP4 的通用单轮整集调度；复用稳定模型流程，失败继续且不宣称验收通过。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    import sys as _json_sys
+    from pathlib import Path as _JSONPath
+    _json_sys.path.insert(0,str(_JSONPath(__file__).resolve().parents[1]))
+    from worker.json_types import json_native
+
 import argparse
 from dataclasses import asdict, dataclass
 from fractions import Fraction
@@ -29,7 +37,7 @@ class AuditSettings:
 
 
 def write(path, data):
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+    path.write_text(json.dumps(json_native(data), ensure_ascii=False, indent=2))
 
 
 def read(path):
@@ -371,7 +379,7 @@ def main():
     elif a.deliver:
         deliver(a.root,data)
     else:
-        print(json.dumps(data,ensure_ascii=False))
+        print(json.dumps(json_native(data),ensure_ascii=False))
 
 
 if __name__ == "__main__":

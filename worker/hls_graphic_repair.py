@@ -1,5 +1,10 @@
 """视频去水印系统：对已证实的完整图形低频残留进行小范围时序补修。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    from json_types import json_native
+
 import argparse, json, os, shutil, subprocess, time
 from pathlib import Path
 from functools import lru_cache
@@ -82,7 +87,7 @@ def patch(work, assets_path, low_template_path, complete_ink=False):
         if not marker.exists() or json.loads(marker.read_text()).get("方法") != method:
             root.rename(work / (root.name + "-previous-" + str(time.time_ns())))
     root.mkdir(exist_ok=True)
-    (root / "method.json").write_text(json.dumps(dict(方法=method), ensure_ascii=False))
+    (root / "method.json").write_text(json.dumps(json_native(dict(方法=method)), ensure_ascii=False))
     report_path = root / "report.json"
     if report_path.exists():
         saved = json.loads(report_path.read_text())
@@ -98,7 +103,7 @@ def patch(work, assets_path, low_template_path, complete_ink=False):
             )
     before = verify_low(final, low, regions)
     (root / "low-before.json").write_text(
-        json.dumps(before, ensure_ascii=False, indent=2)
+        json.dumps(json_native(before), ensure_ascii=False, indent=2)
     )
     identities = {r["region"] for r in before["区域"] if r["residual"]}
     if complete_ink:
@@ -110,9 +115,9 @@ def patch(work, assets_path, low_template_path, complete_ink=False):
     if not identities:
         report_path.write_text(
             json.dumps(
-                dict(
+                json_native(dict(
                     无需复修=True, 低频复检=before, 修复后视频摘要=vision.sha256(final)
-                ),
+                )),
                 ensure_ascii=False,
                 indent=2,
             )
@@ -160,7 +165,7 @@ def patch(work, assets_path, low_template_path, complete_ink=False):
                 )
                 missing.append(file.name)
         (root / "frames-complete.json").write_text(
-            json.dumps(dict(补齐无原生对应帧=missing))
+            json.dumps(json_native(dict(补齐无原生对应帧=missing)))
         )
     (root / "masks").mkdir(exist_ok=True)
     areas = []
@@ -224,11 +229,11 @@ def patch(work, assets_path, low_template_path, complete_ink=False):
         )
         (root / "gpu-complete.json").write_text(
             json.dumps(
-                dict(
+                json_native(dict(
                     耗时秒=time.monotonic() - gpu_started,
                     自动裁剪范围=[rx, ry, ra, rb],
                     像素缩放=1,
-                ),
+                )),
                 ensure_ascii=False,
             )
         )
@@ -379,7 +384,7 @@ def patch(work, assets_path, low_template_path, complete_ink=False):
         掩膜外像素策略="复用v7成品；中间RGB无损编码，最终HLS统一编码",
         高频策略=("真实笔画内使用补画结果" if complete_ink else "保留v7成品高频，只加减当前基底的标准差3低频差分"),
     )
-    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2))
+    report_path.write_text(json.dumps(json_native(report), ensure_ascii=False, indent=2))
     patched.replace(final)
     # 旧版本检查不能冒充新视频的检查，保留后重新测量。
     if (work / "audit").exists():
@@ -395,7 +400,7 @@ def patch(work, assets_path, low_template_path, complete_ink=False):
         high_after, temporary = scan(final, prior, regions)
         del temporary
         report["修复后高通复检"] = high_after
-        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2))
+        report_path.write_text(json.dumps(json_native(report), ensure_ascii=False, indent=2))
     if after["残留区域数"] or (
         high_after
         and any(p["residual"] for p in high_after if p["region"] in identities)

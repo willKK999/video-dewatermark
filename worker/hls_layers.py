@@ -1,5 +1,10 @@
 """视频去水印系统：每遍保持20%施工保护，多目标按已验证图层联合合成。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    from json_types import json_native
+
 from functools import lru_cache
 from pathlib import Path
 import hashlib, json
@@ -89,7 +94,7 @@ def write_manifest(coarse, detected, directories, files):
         detected_sha256=hashlib.sha256(Path(detected).read_bytes()).hexdigest(),
         layers=rows,
     )
-    (coarse / "layers.json").write_text(json.dumps(data))
+    (coarse / "layers.json").write_text(json.dumps(json_native(data)))
 
 
 class VerifiedLayers:

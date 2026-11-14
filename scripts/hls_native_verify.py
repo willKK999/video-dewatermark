@@ -1,5 +1,13 @@
 """对原规格单块编码后逐帧复检，并导出反馈时间点的真实对比图。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    import sys as _json_sys
+    from pathlib import Path as _JSONPath
+    _json_sys.path.insert(0,str(_JSONPath(__file__).resolve().parents[1]))
+    from worker.json_types import json_native
+
 import argparse
 import json
 from pathlib import Path
@@ -33,7 +41,7 @@ def verify(source, result, detected, native_report, output):
     mapping = json.loads(native_report.read_text())["帧映射"]
     detections = json.loads(detected.read_text())
     references = remap_references(detections, mapping)
-    (output / "detections.json").write_text(json.dumps(references))
+    (output / "detections.json").write_text(json.dumps(json_native(references)))
     cap = cv2.VideoCapture(str(result))
     count = 0
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -59,15 +67,15 @@ def verify(source, result, detected, native_report, output):
         "全部编码帧检查已知移动轨迹，固定轨迹检查时间共识；另须检查短时图形与全画面新候选，不能单凭本项声明零残留"
     )
     (output / "编码后检查.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2)
+        json.dumps(json_native(summary), ensure_ascii=False, indent=2)
     )
     print(
         json.dumps(
-            {
+            json_native({
                 k: v
                 for k, v in summary.items()
                 if k not in {"moving_evidence", "fixed_template_scores"}
-            },
+            }),
             ensure_ascii=False,
         )
     )

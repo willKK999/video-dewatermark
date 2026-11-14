@@ -1,5 +1,13 @@
 """统计全部水印候选；增强只用于检测，不改变待处理视频。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    import sys as _json_sys
+    from pathlib import Path as _JSONPath
+    _json_sys.path.insert(0,str(_JSONPath(__file__).resolve().parents[1]))
+    from worker.json_types import json_native
+
 import argparse
 import json
 import os
@@ -116,7 +124,7 @@ def main():
                 cv2.imwrite(str(out / f"检测-{ts:03d}秒-{cutoff:.2f}.jpg"), image)
         if (index + 1) % 25 == 0:
             print("已统计秒级样本：" + str(index + 1), flush=True)
-    (out / "detections.json").write_text(json.dumps(records, ensure_ascii=False))
+    (out / "detections.json").write_text(json.dumps(json_native(records), ensure_ascii=False))
     summary = {
         "样本数量": len(records),
         "检测尺度": sizes,
@@ -141,7 +149,7 @@ def main():
         summary["置信度分布"][f"{low:.2f}至{min(high,1):.2f}"] = sum(
             low <= b["confidence"] < high for r in records for b in r["merged"]
         )
-    (out / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2))
+    (out / "summary.json").write_text(json.dumps(json_native(summary), ensure_ascii=False, indent=2))
     print("秒级多尺度统计完成", flush=True)
 
 

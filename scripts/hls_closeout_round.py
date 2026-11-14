@@ -1,4 +1,12 @@
 """通用检查点收尾：每块仅一轮，阶段失败继续，保留并选择完整版本。"""
+
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    import sys as _json_sys
+    from pathlib import Path as _JSONPath
+    _json_sys.path.insert(0,str(_JSONPath(__file__).resolve().parents[1]))
+    from worker.json_types import json_native
 import argparse
 import json
 import os
@@ -46,7 +54,7 @@ def closeout(root, assets_path, blocks):
                     低频残留=qc.get("低频残留"), 闪烁=None,
                     清晰度最低值=qc.get("清晰度最低值"), 核验=qc,
                 )
-                (target / (name + ".json")).write_text(json.dumps(record, ensure_ascii=False, indent=2))
+                (target / (name + ".json")).write_text(json.dumps(json_native(record), ensure_ascii=False, indent=2))
                 candidates.append(record)
 
             snapshot("本轮前")
@@ -67,8 +75,8 @@ def closeout(root, assets_path, blocks):
             selected = best_version(candidates)
             result = dict(块号=index, 已选=selected, 候选=candidates, 单轮=report,
                           耗时秒=time.monotonic()-started, 说明="仅比较本轮前后同口径完整版本；旧口径报告保留但不能直接冒充更优")
-            marker.write_text(json.dumps(result, ensure_ascii=False, indent=2))
-            print("收尾单轮完成", work.name, json.dumps({k: selected[k] for k in ["版本", "残留", "低频残留", "清晰度最低值"]}, ensure_ascii=False),
+            marker.write_text(json.dumps(json_native(result), ensure_ascii=False, indent=2))
+            print("收尾单轮完成", work.name, json.dumps(json_native({k: selected[k] for k in ["版本", "残留", "低频残留", "清晰度最低值"]}), ensure_ascii=False),
                   "耗时秒=" + str(result["耗时秒"]), flush=True)
 
 

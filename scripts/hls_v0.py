@@ -1,5 +1,13 @@
 """通用HLS检查点单轮预览：阶段失败不阻止拼接，预览不代表正式验收通过。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    import sys as _json_sys
+    from pathlib import Path as _JSONPath
+    _json_sys.path.insert(0,str(_JSONPath(__file__).resolve().parents[1]))
+    from worker.json_types import json_native
+
 import argparse, json, time, threading, subprocess, os
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -102,7 +110,7 @@ def deliver(root, source, assets_path, output, reviews=None):
             # 基础阶段异常也不影响其他块；缺少完整视频时最后明确拒绝拼接。
             (work / "v0-error.json").write_text(
                 json.dumps(
-                    dict(错误码=getattr(exc, "code", type(exc).__name__)),
+                    json_native(dict(错误码=getattr(exc, "code", type(exc).__name__))),
                     ensure_ascii=False,
                 )
             )
@@ -115,7 +123,7 @@ def deliver(root, source, assets_path, output, reviews=None):
             report["是否通过"] = False
         report["本轮墙时秒"] = time.monotonic() - waiting
         (work / "v0-block.json").write_text(
-            json.dumps(report, ensure_ascii=False, indent=2)
+            json.dumps(json_native(report), ensure_ascii=False, indent=2)
         )
         with lock:
             records.append(report)
@@ -208,7 +216,7 @@ def deliver(root, source, assets_path, output, reviews=None):
         预览摘要=sha256(preview),
     )
     (output / "report.json").write_text(
-        json.dumps(report, ensure_ascii=False, indent=2)
+        json.dumps(json_native(report), ensure_ascii=False, indent=2)
     )
     log("整集 v0 完成")
     return report

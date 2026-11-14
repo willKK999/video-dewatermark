@@ -1,4 +1,12 @@
 """无干净真值的成对质量审计；指标仅作伪影线索，不能代替目检。"""
+
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    import sys as _json_sys
+    from pathlib import Path as _JSONPath
+    _json_sys.path.insert(0,str(_JSONPath(__file__).resolve().parents[1]))
+    from worker.json_types import json_native
 import argparse
 import json
 from pathlib import Path
@@ -94,8 +102,8 @@ def audit(root, baseline, output, times):
     summary['frames'] = len(rows)
     summary['aligned_pairs'] = sum('after_flicker_mae' in r for r in rows)
     summary['outside_support_changed_pixels'] = outside_changed
-    (output/(root.name+'-metrics.json')).write_text(json.dumps({'summary':summary,'frames':rows},ensure_ascii=False,indent=2))
-    print(json.dumps({'clip':root.name,**summary},ensure_ascii=False))
+    (output/(root.name+'-metrics.json')).write_text(json.dumps(json_native({'summary':summary,'frames':rows}),ensure_ascii=False,indent=2))
+    print(json.dumps(json_native({'clip':root.name,**summary}),ensure_ascii=False))
 
 
 if __name__ == '__main__':

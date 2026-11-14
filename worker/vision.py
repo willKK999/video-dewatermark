@@ -1,5 +1,10 @@
 """Detection, manifest validation and bounded compositing. Torch runs in child environments."""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    from json_types import json_native
+
 import hashlib
 import json
 import os
@@ -122,7 +127,7 @@ def detect(files, scenes, options, root, check=lambda: None, dense=False):
     for seed in seeds:
         hints.setdefault(int(seed["frame"]), dict(seed))
     if seeds:
-        (root / "hls-seeds.json").write_text(json.dumps(seeds))
+        (root / "hls-seeds.json").write_text(json.dumps(json_native(seeds)))
     if any(i >= len(files) for i in hints):
         raise PipelineError(
             "INVALID_PROMPT", "prompt frame is outside normalized video"
@@ -137,7 +142,7 @@ def detect(files, scenes, options, root, check=lambda: None, dense=False):
 
     def sample(indices):
         if detector == "yolo":
-            (root / "detect-indices.json").write_text(json.dumps(sorted(indices)))
+            (root / "detect-indices.json").write_text(json.dumps(json_native(sorted(indices))))
             run(
                 [
                     os.environ["DETECT_PYTHON"],
@@ -243,7 +248,7 @@ def detect(files, scenes, options, root, check=lambda: None, dense=False):
         "dense": dense or bool(missing),
         **({"hls": True} if options.get("hls") else {}),
     }
-    (root / "detections.json").write_text(json.dumps(result))
+    (root / "detections.json").write_text(json.dumps(json_native(result)))
     return result
 
 
@@ -455,7 +460,7 @@ def _composite_window(
                     limit=HLSSettings.from_env().overlap_mae_limit,
                     conditioned_overlap=performance.get("conditioned_overlap",False),
                     mask_sha256=sha256(root / "masks" / files[j].name))
-                (root / "overlap-failure.json").write_text(json.dumps(failure))
+                (root / "overlap-failure.json").write_text(json.dumps(json_native(failure)))
                 raise PipelineError(
                     "SEAM_UNCERTAIN",
                     "overlap disagreement requires review",
@@ -520,7 +525,7 @@ def inpaint(
     )
 
     def save_performance():
-        (root / "performance.json").write_text(json.dumps(performance))
+        (root / "performance.json").write_text(json.dumps(json_native(performance)))
 
     # 单一合成线程严格保留重叠顺序；至多一个窗口合成与下一窗口推理重叠。
     with ThreadPoolExecutor(max_workers=1) as compositor:
@@ -571,7 +576,7 @@ def inpaint(
                         os.link(files[j], frames / name)
                         os.link(root / "masks" / files[j].name, masks_dir / name)
                 if conditioned:
-                    (window / "conditioned.json").write_text(json.dumps(conditioned))
+                    (window / "conditioned.json").write_text(json.dumps(json_native(conditioned)))
                 singleton = end - start == 1
                 if singleton:
                     # 单帧镜头没有跨帧光流；复制同帧，绝不借用转场另一侧的画面。
@@ -641,7 +646,7 @@ def inpaint(
             restoration_stats.append(
                 dict(scene=[scene_start, scene_end], **references.stats)
             )
-            (root / "restoration.json").write_text(json.dumps(restoration_stats))
+            (root / "restoration.json").write_text(json.dumps(json_native(restoration_stats)))
 
 
 def residual_quality(root, files, detections, check=lambda: None):
@@ -657,7 +662,7 @@ def residual_quality(root, files, detections, check=lambda: None):
     confidence = setting("RESIDUAL_CONFIDENCE", 0.35)
     if hls:
         confidence = min(confidence, setting("HLS_RESIDUAL_CONFIDENCE", 0.15))
-    (root / "quality-indices.json").write_text(json.dumps(indices))
+    (root / "quality-indices.json").write_text(json.dumps(json_native(indices)))
     run(
         [
             os.environ["DETECT_PYTHON"],
@@ -696,9 +701,9 @@ def residual_quality(root, files, detections, check=lambda: None):
     )
     (root / "quality.json").write_text(
         json.dumps(
-            dict(
+            json_native(dict(
                 sample_count=len(indices), residual_count=count, needs_review=uncertain
-            )
+            ))
         )
     )
     if uncertain:

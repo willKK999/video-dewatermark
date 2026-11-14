@@ -1,5 +1,10 @@
 """视频去水印系统：最终编码逐帧流式复检，不落全片高清图片。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    from json_types import json_native
+
 from .hls_settings import is_residual_score
 
 import hashlib
@@ -185,7 +190,7 @@ def audit(full, result, references, works, plans, assets, persistent, check):
         for item in flashes:
             candidates.append(dict(类型="修复时域突变", 详情=item))
         candidate_digest = hashlib.sha256(
-            json.dumps(candidates, sort_keys=True).encode()
+            json.dumps(json_native(candidates), sort_keys=True).encode()
         ).hexdigest()
         summary = dict(
             视频摘要=digest,
@@ -202,7 +207,7 @@ def audit(full, result, references, works, plans, assets, persistent, check):
             时域全部样本=metrics,
             检查帧数=count,
         )
-        cached.write_text(json.dumps(summary, ensure_ascii=False, indent=2))
+        cached.write_text(json.dumps(json_native(summary), ensure_ascii=False, indent=2))
     count = summary["原始候选数"]
     review = (
         approved_review(
@@ -212,7 +217,7 @@ def audit(full, result, references, works, plans, assets, persistent, check):
         else False
     )
     summary.update(误报逐项复核通过=review, 通过=count == 0 or review)
-    cached.write_text(json.dumps(summary, ensure_ascii=False, indent=2))
+    cached.write_text(json.dumps(json_native(summary), ensure_ascii=False, indent=2))
     if not summary["通过"]:
         raise PipelineError(
             "RESIDUAL_UNCERTAIN",

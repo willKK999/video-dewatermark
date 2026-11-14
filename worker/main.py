@@ -1,3 +1,8 @@
+
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    from json_types import json_native
 import fcntl
 import json
 import logging
@@ -255,7 +260,7 @@ def process(job, dsn, s3, bucket, workdir, engine):
                 )
             )
             (root / "publish_ms.json").write_text(
-                json.dumps(dict(result=result_ms, artifacts=artifacts_ms))
+                json.dumps(json_native(dict(result=result_ms, artifacts=artifacts_ms)))
             )
             timings["publish"] = round((time.monotonic() - started) * 1000)
             result.update(
@@ -315,7 +320,7 @@ def process(job, dsn, s3, bucket, workdir, engine):
         )
         log.info(
             json.dumps(
-                {
+                json_native({
                     "event": "attempt_finished",
                     "job_id": job["id"],
                     "attempt": job["attempt"],
@@ -323,7 +328,7 @@ def process(job, dsn, s3, bucket, workdir, engine):
                     "accepted": accepted,
                     "phase_ms": timings,
                     "peak_vram_mib": guard.peak,
-                }
+                })
             )
         )
 
@@ -364,13 +369,13 @@ def main():
     os.environ["MODEL_LOCK_HASH"] = model_hash
     log.info(
         json.dumps(
-            {
+            json_native({
                 "event": "worker_started",
                 "pipeline_version": version,
                 "engine": engine,
                 "image_digest": os.getenv("IMAGE_DIGEST", "unrecorded"),
                 "model_lock_hash": model_hash,
-            }
+            })
         )
     )
     if engine == "propainter":

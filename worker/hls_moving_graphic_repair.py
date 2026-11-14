@@ -1,4 +1,9 @@
 """补齐移动淡标识的完整图形内部，不将灰阶填色遗漏为干净背景。"""
+
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    from json_types import json_native
 import json,time,os
 from pathlib import Path
 import cv2,numpy as np
@@ -47,7 +52,7 @@ def patch(work,assets_path):
     if not active:raise PipelineError('MASK_UNCERTAIN','移动残留缺少自动轨迹掩膜',review=True)
     output,ranges,missing=process(work,root,info,mapping,files,detected['scenes'],active,settings)
     result_digest=vision.sha256(output)
-    (root/'report.json').write_text(json.dumps(dict(方法='移动轨迹完整播放图形与真实笔画-1',输入摘要=digest,输出摘要=result_digest,目标轨迹=sorted(wanted),原始证据=quality['moving_evidence'],自动几何=shapes,实际补修帧=active,上下文区间=ranges,最大面积比例=maximum,补齐未映射帧=missing,掩膜来源清单摘要=vision.sha256(root/'layers.json'),耗时秒=time.monotonic()-started,音频原样复制=True),ensure_ascii=False,indent=2))
+    (root/'report.json').write_text(json.dumps(json_native(dict(方法='移动轨迹完整播放图形与真实笔画-1',输入摘要=digest,输出摘要=result_digest,目标轨迹=sorted(wanted),原始证据=quality['moving_evidence'],自动几何=shapes,实际补修帧=active,上下文区间=ranges,最大面积比例=maximum,补齐未映射帧=missing,掩膜来源清单摘要=vision.sha256(root/'layers.json'),耗时秒=time.monotonic()-started,音频原样复制=True)),ensure_ascii=False,indent=2))
     output.replace(video)
     for name in ['audit','verified.json']:
         path=work/name

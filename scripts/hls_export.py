@@ -1,5 +1,13 @@
 """视频去水印系统：按任务导出可离线复验的 HLS、MP4 和安全审计记录。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    import sys as _json_sys
+    from pathlib import Path as _JSONPath
+    _json_sys.path.insert(0,str(_JSONPath(__file__).resolve().parents[1]))
+    from worker.json_types import json_native
+
 import argparse
 from datetime import datetime
 import json
@@ -97,11 +105,11 @@ def export(job_id, output, detect):
             )
         ref_file.write_text(
             json.dumps(
-                dict(
+                json_native(dict(
                     hls=True,
                     scenes=[[0, report["chunks"][-1]["end"]]],
                     hints=sorted(hints, key=lambda h: h["frame"]),
-                )
+                ))
             )
         )
     references = json.loads(ref_file.read_text())
@@ -109,7 +117,7 @@ def export(job_id, output, detect):
         prior = output / "multitrack-prior.npz"
         download(prefix + "/multitrack-prior.npz", prior)
         references["prior"] = str(prior.resolve())
-        ref_file.write_text(json.dumps(references))
+        ref_file.write_text(json.dumps(json_native(references)))
     safe = dict(
         id=job_id,
         status=job["status"],
@@ -121,7 +129,7 @@ def export(job_id, output, detect):
     )
     (output / "timing.json").write_text(
         json.dumps(
-            safe,
+            json_native(safe),
             ensure_ascii=False,
             indent=2,
             default=lambda value: (

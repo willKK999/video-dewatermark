@@ -1,5 +1,10 @@
 """视频去水印系统：复用已接受的通用先验，有界并行准备、补画、原生合成与核验。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    from json_types import json_native
+
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -21,7 +26,7 @@ from .hls_acceptance import clarity_summary
 
 def write_json(path, value):
     temporary = path.with_suffix(path.suffix + ".writing")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2))
+    temporary.write_text(json.dumps(json_native(value), ensure_ascii=False, indent=2))
     temporary.replace(path)
 
 
@@ -593,7 +598,7 @@ def verify_block(work, assets, info):
     from .hls_final_audit import approved_review
     ledger = block_candidates(quality, brand, panel, low)
     import hashlib
-    candidate_digest = hashlib.sha256(json.dumps(ledger, sort_keys=True).encode()).hexdigest()
+    candidate_digest = hashlib.sha256(json.dumps(json_native(ledger), sort_keys=True).encode()).hexdigest()
     summary.update(原始候选=ledger, 候选摘要=candidate_digest)
     review_path = work / "review.json"
     if ledger and approved_review(review_path, summary["视频摘要"], candidate_digest, len(ledger)):
@@ -603,7 +608,7 @@ def verify_block(work, assets, info):
     print(
         "单块编码后核验完成："
         + json.dumps(
-            {
+            json_native({
                 k: summary.get(k)
                 for k in [
                     "通过",
@@ -612,7 +617,7 @@ def verify_block(work, assets, info):
                     "清晰度最低值",
                     "清晰度低于0点7样本数",
                 ]
-            },
+            }),
             ensure_ascii=False,
         ),
         flush=True,
@@ -792,7 +797,7 @@ def execute_native(
     fingerprint = hashlib.sha256(
         (
             source_digest
-            + json.dumps(assets["sha256"], sort_keys=True)
+            + json.dumps(json_native(assets["sha256"]), sort_keys=True)
             + "v7-native60-record-clarity-1"
         ).encode()
     ).hexdigest()[:24]

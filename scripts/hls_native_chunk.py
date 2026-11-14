@@ -1,5 +1,13 @@
 """视频去水印系统：原分辨率、原帧率合成单块；只在自动支持范围内替换像素。"""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    import sys as _json_sys
+    from pathlib import Path as _JSONPath
+    _json_sys.path.insert(0,str(_JSONPath(__file__).resolve().parents[1]))
+    from worker.json_types import json_native
+
 import argparse, json, time, subprocess, math
 from pathlib import Path
 from fractions import Fraction
@@ -330,7 +338,7 @@ def render(
         联合掩膜最大面积比例=max_area,
     )
     (output / "native-report.json").write_text(
-        json.dumps(report, ensure_ascii=False, indent=2)
+        json.dumps(json_native(report), ensure_ascii=False, indent=2)
     )
     print(
         "高清合成完成，清晰度历史参考结果（仅记录）：" + str(report["清晰度通过"]),

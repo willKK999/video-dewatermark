@@ -1,4 +1,9 @@
 """逐帧专用YOLO印证的多目标轨迹与内容绑定支持；旧v7路径不调用本模块。"""
+
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    from json_types import json_native
 from dataclasses import dataclass,asdict
 from pathlib import Path
 import json,math
@@ -310,7 +315,7 @@ def save_prototypes(path,prototypes):
         item['example_count']=len(p['examples']);metadata.append(item)
         for k in item['array_keys']:arrays[f'{i}-{k}']=p[k]
         for j,value in enumerate(p['examples']):arrays[f'{i}-example-{j}']=value
-    np.savez_compressed(path,metadata=json.dumps(metadata),**arrays)
+    np.savez_compressed(path,metadata=json.dumps(json_native(metadata)),**arrays)
 
 
 def load_prototypes(path):
@@ -374,7 +379,7 @@ def build(files,scenes,rows,prior,labels,root,fps=30,settings=None,check=lambda:
                 hints=sorted([p for t in tracks for p in t['hints']],key=lambda p:(p['frame'],p['track_id'])),
                 settings=asdict(cfg),raw_model_boxes=sum(len(r['boxes']) for r in rows),
                 evidence='目标由逐帧YOLO可靠观测建立，短缺口仅在可靠前后观测间有界插值；文本需本输入模型/共识模板印证；不以全画面模板峰新增轨迹')
-    (root/'detections.json').write_text(json.dumps(result))
+    (root/'detections.json').write_text(json.dumps(json_native(result)))
     return result
 
 
@@ -445,6 +450,6 @@ def validate(root,files,detections,check=lambda:None,progress=None):
     write_manifest(root,root/'detections.json',layers,files)
     verified=VerifiedLayers(root/'layers.json',root/'detections.json')
     for i,file in enumerate(files):verified.validate(i,cv2.imread(str(root/'masks'/file.name),0))
-    (root/'model-mask-summary.json').write_text(json.dumps(dict(层数=len(layers),轨迹数=len(detections['tracks']),逐帧=manifests,最大轨迹面积=maximum,
-          分层方式='逐帧实际面积装箱，图层像素互斥，联合掩膜保持不变'),ensure_ascii=False))
+    (root/'model-mask-summary.json').write_text(json.dumps(json_native(dict(层数=len(layers),轨迹数=len(detections['tracks']),逐帧=manifests,最大轨迹面积=maximum,
+          分层方式='逐帧实际面积装箱，图层像素互斥，联合掩膜保持不变')),ensure_ascii=False))
     return manifests
