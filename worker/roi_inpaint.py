@@ -24,6 +24,7 @@ class ROISettings:
     overlap_frames:int=16
     maximum_retries:int=2
     fp16:bool=True
+    sequential_layers:bool=False
 
     @classmethod
     def from_env(cls):
@@ -103,7 +104,11 @@ def task_mask(owned,done,box,source_pixels,limit,task,frame):
 
 
 def execute(work,files,detected,log=lambda message:None,cfg=None):
-    cfg=cfg or ROISettings.from_env();started=time.monotonic();shape=cv2.imread(str(files[0])).shape[:2]
+    cfg=cfg or ROISettings.from_env()
+    if cfg.sequential_layers:
+        from .roi_layers import execute as execute_layers
+        return execute_layers(work,files,detected,log,cfg)
+    started=time.monotonic();shape=cv2.imread(str(files[0])).shape[:2]
     source_pixels=shape[0]*shape[1];dest=work/'composite';dest.mkdir();coverage=work/'roi-coverage';coverage.mkdir()
     for file in files:
         os.link(file,dest/file.name);atomic_png(coverage/file.name,np.zeros(shape,np.uint8))

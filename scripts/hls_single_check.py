@@ -225,8 +225,11 @@ def execute_one(args):
         summaries=read(work/'layers.json');current=work/'frames';roi=None
         if not summaries['layers']:raise PipelineError('MASK_UNCERTAIN','没有可用的已验证掩膜图层')
         if args.inpaint_mode=='roi':
-            from worker.roi_inpaint import execute as execute_roi
-            roi=step('ROI补画',lambda:execute_roi(work,files,detected,log=log))
+            from worker.roi_inpaint import execute as execute_roi, ROISettings
+            from dataclasses import replace
+            roi_cfg=replace(ROISettings.from_env(), sequential_layers=args.roi_layered,
+                            context_ratio=args.roi_context_ratio, minimum_context=args.roi_min_context)
+            roi=step('ROI补画',lambda:execute_roi(work,files,detected,log=log,cfg=roi_cfg))
             current=work/'composite'
         else:
             for k,layer in enumerate(summaries['layers']):
@@ -288,8 +291,12 @@ def main():
     p.add_argument('--coverage-reference',type=Path)
     p.add_argument('--mask-source',choices=['current','v7'],default='current')
     p.add_argument('--mask-reference',type=Path)
+    p.add_argument('--roi-layered',action='store_true')
+    p.add_argument('--roi-context-ratio',type=float,default=.25)
+    p.add_argument('--roi-min-context',type=int,default=32)
     args=p.parse_args()
     if args.duration<=0 or args.context<0 or args.duration+args.context>30:p.error('主体与上下文总输入须在30秒内')
+    if args.roi_context_ratio<0 or args.roi_min_context<0:p.error('ROI背景外扩不得为负')
     cv2.setNumThreads(2);execute_one(args)
 
 

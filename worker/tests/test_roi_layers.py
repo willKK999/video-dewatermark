@@ -1,0 +1,77 @@
+"""通用逐层ROI的输入顺序、跨层重叠、时间窗及失败保护。"""
+import json
+from pathlib import Path
+import cv2,numpy as np,pytest
+from worker import roi_layers,roi_inpaint
+from worker.process import PipelineError
+from worker.tests.test_roi_inpaint import fixture
+
+
+class References:
+    def __init__(self,*args):pass
+    def restore(self,original,mask,repair):return repair
+
+
+def setup(monkeypatch,tmp_path):
+    monkeypatch.setenv('INPAINT_PYTHON','python');monkeypatch.setenv('PROPAINTER_ROOT',str(tmp_path))
+    monkeypatch.setattr(roi_layers,'CleanReferences',References)
+    monkeypatch.setattr(roi_layers,'soft_composite',lambda original,repair,mask:repair)
+
+
+def test_layer_overlap_is_repainted_from_previous_layer(tmp_path,monkeypatch):
+    files,d,mask=fixture(tmp_path);setup(monkeypatch,tmp_path)
+    # 同一掩膜分两遍，验证全局覆盖记录不会取消第二层。
+    manifest=json.loads((tmp_path/'layers.json').read_text());manifest['layers']*=2
+    (tmp_path/'layers.json').write_text(json.dumps(manifest));inputs=[]
+    def model(args,**kw):
+        frame_dir=Path(args[args.index('--video')+1]);mask_dir=Path(args[args.index('--mask')+1]);out=Path(args[args.index('--output')+1])/'frames/frames';out.mkdir(parents=True)
+        assert args[args.index('--subvideo_length')+1]=='36'
+        assert args[args.index('--neighbor_length')+1]=='6'
+        assert args[args.index('--ref_stride')+1]=='20' and '--fp16' in args
+        for p in sorted(frame_dir.glob('*.png')):
+            image=cv2.imread(str(p));m=cv2.imread(str(mask_dir/p.name),0)
+            inputs.append(float(image[m>0].mean()));image[m>0]+=40;cv2.imwrite(str(out/p.name),image)
+    monkeypatch.setattr(roi_layers,'run',model)
+    result=roi_inpaint.execute(tmp_path,files,d,cfg=roi_inpaint.ROISettings(sequential_layers=True,context_ratio=.75,minimum_context=96))
+    assert result['实际图层数']==2 and result['覆盖核验通过']
+    assert inputs[:6]==list(range(20,26)) and inputs[6:]==list(range(60,66))
+    for p in files:
+        original=cv2.imread(str(p));final=cv2.imread(str(tmp_path/'composite'/p.name))
+        assert np.array_equal(final[mask==0],original[mask==0])
+        assert np.all(final[mask>0]==original[mask>0]+80)
+
+
+def test_overlap_windows_read_frozen_previous_layer_and_mix(tmp_path,monkeypatch):
+    files,d,mask=fixture(tmp_path);setup(monkeypatch,tmp_path)
+    monkeypatch.setenv('HLS_WINDOW_FRAMES','5');monkeypatch.setenv('HLS_OVERLAP_FRAMES','2')
+    calls=[]
+    def model(args,**kw):
+        frames=Path(args[args.index('--video')+1]);masks=Path(args[args.index('--mask')+1]);out=Path(args[args.index('--output')+1])/'frames/frames';out.mkdir(parents=True)
+        call=[]
+        for p in sorted(frames.glob('*.png')):
+            im=cv2.imread(str(p));m=cv2.imread(str(masks/p.name),0);call.append(float(im[m>0].mean()))
+            im[m>0]+=20+len(calls)*3;cv2.imwrite(str(out/p.name),im)
+        calls.append(call)
+    monkeypatch.setattr(roi_layers,'run',model)
+    result=roi_inpaint.execute(tmp_path,files,d,cfg=roi_inpaint.ROISettings(sequential_layers=True))
+    assert calls==[[20,21,22,23,24],[23,24,25]]
+    assert result['任务'][1]['重叠最大差异']==3
+    assert np.all(cv2.imread(str(tmp_path/'composite/000003.png'))[mask>0]==44)
+
+
+def test_large_context_does_not_increase_mask_or_bypass_area_limit(tmp_path,monkeypatch):
+    files,d,mask=fixture(tmp_path);setup(monkeypatch,tmp_path)
+    for p in files:cv2.imwrite(str(tmp_path/'layer-00/masks'/p.name),np.full(mask.shape,255,np.uint8))
+    monkeypatch.setattr(roi_layers,'run',lambda *a,**kw:pytest.fail('面积超限必须在推理前拒绝'))
+    with pytest.raises(PipelineError,match='20%'):
+        roi_inpaint.execute(tmp_path,files,d,cfg=roi_inpaint.ROISettings(sequential_layers=True,context_ratio=1.))
+
+
+def test_layer_model_missing_frames_keeps_failure_checkpoint(tmp_path,monkeypatch):
+    files,d,_=fixture(tmp_path);setup(monkeypatch,tmp_path)
+    def missing(args,**kw):(Path(args[args.index('--output')+1])/'frames/frames').mkdir(parents=True)
+    monkeypatch.setattr(roi_layers,'run',missing)
+    with pytest.raises(PipelineError) as exc:roi_inpaint.execute(tmp_path,files,d,cfg=roi_inpaint.ROISettings(sequential_layers=True))
+    assert exc.value.code=='ROI_INCOMPLETE'
+    assert json.loads((tmp_path/'roi-report.json').read_text())['任务'][0]['错误码']=='ROI_INCOMPLETE'
+    assert (tmp_path/'roi-0001/frames').exists() and not (tmp_path/'composite').exists()
