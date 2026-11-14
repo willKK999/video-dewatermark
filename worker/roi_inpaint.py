@@ -97,6 +97,7 @@ def execute(work,files,detected,log=lambda message:None,cfg=None):
         nonlocal counter,real_pixels,model_pixels
         active=[i for i in range(start,end) if np.any(owned[i])]
         if not active:return
+        if not any(np.any(owned[i]&~cv2.imread(str(coverage/files[i].name),0)) for i in active):return
         start,end=min(active),max(active)+1
         footprint=np.zeros(shape,np.uint8)
         for i in active:footprint|=owned[i]

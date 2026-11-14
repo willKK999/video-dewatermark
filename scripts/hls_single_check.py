@@ -65,7 +65,11 @@ def verify(work,video,files,detected,prior,labels,core,fps,output,enhance=False,
     if len(decoded)!=core:raise PipelineError('OUTPUT_INCOMPLETE','编码后帧数不一致')
     rows=detect_all(encoded,work/'encoded-yolo.json',enhance,tiles,flips)
     source_rows=read(work/'all-yolo.json')
-    proto=learn_text_prototypes(files,source_rows,prior,labels,ModelTrackSettings(),fps,detected['scenes'])
+    cache=work/'templates/source-prototypes.npz'
+    if cache.exists():
+        from worker.model_tracks import load_prototypes
+        proto=load_prototypes(cache)
+    else:proto=learn_text_prototypes(files,source_rows,prior,labels,ModelTrackSettings(),fps,detected['scenes'])
     brand_candidates=[];v0_candidates=[];unconfirmed=[]
     # 先保存全部YOLO候选；品牌判别与源片使用同一内容绑定模板，字幕不直接算水印。
     for i,p in enumerate(decoded):

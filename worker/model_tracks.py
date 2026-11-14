@@ -149,7 +149,7 @@ def learn_text_prototypes(files,rows,prior,labels,settings,fps=None,scenes=None)
             if ('text' not in labels.get(raw['class_id'],'') or raw['confidence']<settings.anchor_confidence
                     or intersection_fraction(raw['box'],rbox)<.95):continue
             z=highpass(patch(im,raw['box']))
-            result.append(dict(canonical,id=len(result),anchor=raw['box'],feature=z,examples=[z],require_whole=True))
+            result.append(dict(canonical,id=len(result),anchor=raw['box'],feature=z,examples=[z],require_whole=False))
         # 已确认完整图形中的圆形彩色图标可独立成为模型图标框的几何模板。
         n,component,stats,_=cv2.connectedComponentsWithStats(canonical['mask'])
         for identity in range(1,n):
@@ -275,6 +275,10 @@ def associate(rows,scenes,fps,cfg):
                     if t['id'] in used or i-t['last']>max(1,round(fps*cfg.maximum_gap_seconds)):continue
                     if t['kind']!=p['kind']:continue
                     if p['kind']=='prototype' and t.get('family')!=p.get('family',p['prototype']):continue
+                    if p['kind']=='logo':
+                        old_model=t['hints'][-1].get('model_box',t['hints'][-1]['box']);new_model=p.get('model_box',p['box'])
+                        oa=(old_model[2]-old_model[0])/max(1,old_model[3]-old_model[1]);na=(new_model[2]-new_model[0])/max(1,new_model[3]-new_model[1])
+                        if max(oa,na)/max(.01,min(oa,na))>1.8:continue
                     old=t['hints'][-1]['box'];box=p['box']
                     overlap=min(intersection_fraction(old,box),intersection_fraction(box,old))
                     distance=math.hypot((old[0]+old[2]-box[0]-box[2])/2,(old[1]+old[3]-box[1]-box[3])/2)
@@ -291,6 +295,34 @@ def associate(rows,scenes,fps,cfg):
     return tracks
 
 
+def reliable_graphic(track,cfg):
+    if track['kind']=='prototype':return True
+    observed=[p for p in track['hints'] if not p.get('interpolated')]
+    peak=max((p['confidence'] for p in observed),default=0)
+    return (len(observed)>=2 and peak>=cfg.seed_confidence) or peak>=.95
+
+
+def save_prototypes(path,prototypes):
+    arrays={};metadata=[]
+    for i,p in enumerate(prototypes):
+        item={k:v for k,v in p.items() if not isinstance(v,np.ndarray) and k!='examples'}
+        item['array_keys']=[k for k,v in p.items() if isinstance(v,np.ndarray)]
+        item['example_count']=len(p['examples']);metadata.append(item)
+        for k in item['array_keys']:arrays[f'{i}-{k}']=p[k]
+        for j,value in enumerate(p['examples']):arrays[f'{i}-example-{j}']=value
+    np.savez_compressed(path,metadata=json.dumps(metadata),**arrays)
+
+
+def load_prototypes(path):
+    with np.load(path,allow_pickle=False) as data:
+        result=[]
+        for i,item in enumerate(json.loads(str(data['metadata']))):
+            for k in item.pop('array_keys'):item[k]=data[f'{i}-{k}'].copy()
+            item['examples']=[data[f'{i}-example-{j}'].copy() for j in range(item.pop('example_count'))]
+            result.append(item)
+    return result
+
+
 def build(files,scenes,rows,prior,labels,root,fps=30,settings=None,check=lambda:None):
     cfg=settings or ModelTrackSettings()
     prototypes=learn_text_prototypes(files,rows,prior,labels,cfg,fps,scenes)
@@ -298,11 +330,12 @@ def build(files,scenes,rows,prior,labels,root,fps=30,settings=None,check=lambda:
     for i,file in enumerate(files):
         check();candidates.append(candidates_for_frame(cv2.imread(str(file)),rows[i],prototypes,labels,cfg))
     tracks=associate(candidates,scenes,fps,cfg)
-    unconfirmed=[t for t in tracks if t['kind']!='prototype']
-    tracks=[t for t in tracks if t['kind']=='prototype']
+    unconfirmed=[t for t in tracks if not reliable_graphic(t,cfg)]
+    tracks=[t for t in tracks if reliable_graphic(t,cfg)]
     if not tracks:raise PipelineError('DETECTION_UNCERTAIN','逐帧YOLO未得到可验证的品牌轨迹')
     prompts=root/'prompts';prompts.mkdir(exist_ok=True)
     templates=root/'templates';templates.mkdir(exist_ok=True)
+    save_prototypes(templates/'source-prototypes.npz',prototypes)
     image=cv2.imread(str(files[0]));shape=image.shape[:2]
     for t in tracks:
         hints=t['hints'];seed=max(hints,key=lambda p:p['confidence'])
@@ -316,10 +349,18 @@ def build(files,scenes,rows,prior,labels,root,fps=30,settings=None,check=lambda:
             noise=float(np.median(np.abs(feature)))
             signal=(np.abs(feature)>max(.5,noise*5)).astype(np.uint8)*255
             signal=cv2.morphologyEx(signal,cv2.MORPH_CLOSE,np.ones((3,3),np.uint8))
-            base=fill_support(signal,cfg.support_radius)
+            from .matte import ink_support
+            base=ink_support(feature,signal,np.full(signal.shape,255,np.uint8),cfg.support_radius)
         if np.count_nonzero(base)<16:raise PipelineError('MASK_UNCERTAIN','自动品牌轮廓支持不足')
-        alpha=cv2.resize(proto['alpha'],size,interpolation=cv2.INTER_LINEAR)
-        np.savez_compressed(templates/f'{t["id"]}.npz',feature=feature,mask=base,alpha=alpha)
+        if t['kind']=='prototype':
+            alpha=cv2.resize(proto['alpha'],size,interpolation=cv2.INTER_LINEAR);mask_alpha=alpha
+        else:
+            images=[patch(cv2.imread(str(files[hints[k]['frame']])),hints[k]['box'],size) for k in selected]
+            alpha=learn_opacity(images,base,cfg.minimum_template_frames);mask_alpha=alpha
+            if len(images)<cfg.minimum_template_frames:
+                saturation=cv2.cvtColor(np.median(np.stack(images),axis=0).astype(np.uint8),cv2.COLOR_BGR2HSV)[:,:,1]
+                if np.median(saturation[base>0])<64:mask_alpha=np.full(base.shape,.3,np.float32)
+        np.savez_compressed(templates/f'{t["id"]}.npz',feature=feature,mask=base,alpha=alpha,mask_alpha=mask_alpha)
         t['template']=str(templates/f'{t["id"]}.npz')
         # 提示来自同一输入的自动模型与模板，供SAM分割细化；无人工坐标或帧号。
         selected_prompts={p['frame'] for p in sampled_hints(hints,hints[0]['frame'],hints[-1]['frame']+1)}
@@ -366,7 +407,7 @@ def validate(root,files,detections,check=lambda:None,progress=None):
     byframe={};maximum={};areas={};object_masks=root/'validated-objects';object_masks.mkdir(exist_ok=True)
     for track in detections['tracks']:
         (object_masks/str(track['id'])).mkdir(exist_ok=True)
-        data=np.load(track['template'],allow_pickle=False);base=data['mask'];alpha=data.get('alpha',np.ones(base.shape,np.float32))
+        data=np.load(track['template'],allow_pickle=False);base=data['mask'];alpha=data.get('mask_alpha',data.get('alpha',np.ones(base.shape,np.float32)))
         for p in track['hints']:byframe.setdefault(p['frame'],[]).append((track,p,base,alpha))
     manifests=[]
     for i,file in enumerate(files):
