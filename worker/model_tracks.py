@@ -98,7 +98,7 @@ def learn_opacity(images,mask,minimum_frames=15):
     return alpha
 
 
-def learn_text_prototypes(files,rows,prior,labels,settings,fps=None):
+def learn_text_prototypes(files,rows,prior,labels,settings,fps=None,scenes=None):
     median,signal,regions,_,_=load_prior(prior)
     image=cv2.imread(str(files[0]));h,w=image.shape[:2];mh,mw=median.shape
     result=[]
@@ -114,32 +114,68 @@ def learn_text_prototypes(files,rows,prior,labels,settings,fps=None):
         seed=chosen[0]
         im=cv2.imread(str(files[seed['frame']]))
         feature=highpass(patch(im,seed['box']))
-        mask=cv2.resize(fill_support(region['mask']), (w,h),interpolation=cv2.INTER_NEAREST)
         a,b,c,d=map(round,rbox)
         # 对本输入中稳定的模型印证图形补齐填色；不使用其他影片的颜色或固定框。
         from .branding import learn_palette,palette_support
         spread=sorted(candidates,key=lambda p:p['frame'])
         chosen_indices=np.unique(np.linspace(0,len(spread)-1,min(settings.template_samples,len(spread)),dtype=int))
         images=[patch(cv2.imread(str(files[spread[k]['frame']])),rbox,(c-a,d-b)) for k in chosen_indices]
+        full=np.median(np.stack([highpass(x) for x in images]),axis=0)
+        from .matte import ink_support
+        signal=(np.abs(full)>max(.5,float(np.median(np.abs(full)))*5)).astype(np.uint8)*255
+        ink=ink_support(full,signal,np.full(signal.shape,255,np.uint8),settings.support_radius)
+        mask=np.zeros((h,w),np.uint8);mask[b:d,a:c]=ink
         if len(images)>=3:
             try:
-                palette=learn_palette(images,mask[b:d,a:c])
                 colors=np.stack(images).astype(np.float32)
                 middle=np.median(colors,axis=0)
                 stable=np.median(np.abs(colors-middle),axis=0).mean(axis=2)<10
-                colored=palette_support(middle.astype(np.uint8),palette)
-                mask[b:d,a:c] |= fill_support(np.where(stable,colored,0).astype(np.uint8),settings.support_radius)
+                saturation=cv2.cvtColor(middle.astype(np.uint8),cv2.COLOR_BGR2HSV)[:,:,1]
+                colored=np.where(stable&(saturation>64),255,0).astype(np.uint8)
+                mask[b:d,a:c] |= ink_support(full,colored,np.full(signal.shape,255,np.uint8),settings.support_radius)
             except ValueError:
                 pass  # 无可靠颜色证据时保留已有模型/时域支持，不能编造填色。
-        result.append(dict(id=len(result),anchor=seed['box'],box=rbox,
+        result.append(dict(id=len(result),family=len(result),anchor=seed['box'],box=rbox,
                            feature=feature,mask=mask[b:d,a:c],samples=len(chosen),
-                           whole_feature=np.median(np.stack([highpass(x) for x in images]),axis=0),
+                           whole_feature=full,alpha=learn_opacity(images,mask[b:d,a:c]),
                            examples=[highpass(patch(cv2.imread(str(files[p['frame']])),p['box'])) for p in chosen[::max(1,len(chosen)//5)]]))
+        canonical=result[-1]
+        # 替代文字锚点继承完整图形几何，避免高分局部框抢占后截掉图标。
+        for raw in rows[seed['frame']]['boxes']:
+            if len(result)>=settings.maximum_prototypes:break
+            if ('text' not in labels.get(raw['class_id'],'') or raw['confidence']<settings.anchor_confidence
+                    or intersection_fraction(raw['box'],rbox)<.95):continue
+            z=highpass(patch(im,raw['box']))
+            result.append(dict(canonical,id=len(result),anchor=raw['box'],feature=z,examples=[z],require_whole=True))
+        # 已确认完整图形中的圆形彩色图标可独立成为模型图标框的几何模板。
+        n,component,stats,_=cv2.connectedComponentsWithStats(canonical['mask'])
+        for identity in range(1,n):
+            x,y,cw,ch,area=stats[identity]
+            if len(result)>=settings.maximum_prototypes:break
+            if area<canonical['mask'].size*.05 or not .65<cw/max(1,ch)<1.4:continue
+            isolated=(component[y:y+ch,x:x+cw]==identity).astype(np.uint8)*255
+            colors=np.median(np.stack(images),axis=0)[y:y+ch,x:x+cw].astype(np.uint8)
+            if np.median(cv2.cvtColor(colors,cv2.COLOR_BGR2HSV)[:,:,1][isolated>0])<64:continue
+            f=full[y:y+ch,x:x+cw]
+            result.append(dict(id=len(result),family=len(result),anchor=[a+x,b+y,a+x+cw,b+y+ch],box=[a+x,b+y,a+x+cw,b+y+ch],
+                feature=f,whole_feature=f,mask=isolated,alpha=canonical['alpha'][y:y+ch,x:x+cw],
+                examples=[f],samples=len(images),model_logo_only=True,require_whole=True))
+            result[-1]['component_only']=True
+    flipped_families={}
+    for proto in list(result):
+        if len(result)>=settings.maximum_prototypes:break
+        family=proto['family'];flipped_families.setdefault(family,len(result))
+        a,_,c,_=proto['box'];x,y,r,s=proto['anchor']
+        result.append(dict(proto,id=len(result),family=flipped_families[family],
+             anchor=[a+c-r,y,a+c-x,s],feature=cv2.flip(proto['feature'],1),
+             mask=cv2.flip(proto['mask'],1),alpha=cv2.flip(proto['alpha'],1),
+             whole_feature=cv2.flip(proto['whole_feature'],1),examples=[cv2.flip(z,1) for z in proto['examples']],
+             require_whole=True))
     from .hls_settings import HLSSettings
-    return learn_logo_prototypes(files,rows,labels,result,settings,fps or HLSSettings.from_env().model_fps)
+    return learn_logo_prototypes(files,rows,labels,result,settings,fps or HLSSettings.from_env().model_fps,scenes)
 
 
-def learn_logo_prototypes(files,rows,labels,prototypes,cfg,fps):
+def learn_logo_prototypes(files,rows,labels,prototypes,cfg,fps,scenes=None):
     """从多帧YOLO图形观测学习移动叠加层，文字本身不能创建品牌模板。"""
     observed=[candidates_for_frame(cv2.imread(str(file)),rows[i],prototypes,labels,cfg)
               for i,file in enumerate(files)]
@@ -153,6 +189,7 @@ def learn_logo_prototypes(files,rows,labels,prototypes,cfg,fps):
         hints=[p for p in t['hints'] if not p.get('interpolated') and max(aspect(p['model_box']),aspect(seed['model_box']))/
                min(aspect(p['model_box']),aspect(seed['model_box']))<1.3]
         if len(hints)<cfg.minimum_template_frames:continue
+        if scenes and len({j for p in hints for j,(a,b) in enumerate(scenes) if a<=p['frame']<b})<2:continue
         chosen=[hints[k] for k in np.unique(np.linspace(0,len(hints)-1,min(cfg.template_samples,len(hints)),dtype=int))]
         anchor=seed['model_box'];box=seed['box'];w,h=map(lambda x:max(2,round(x)),[box[2]-box[0],box[3]-box[1]])
         aw,ah=map(lambda x:max(2,round(x)),[anchor[2]-anchor[0],anchor[3]-anchor[1]])
@@ -169,9 +206,11 @@ def learn_logo_prototypes(files,rows,labels,prototypes,cfg,fps):
         from .matte import ink_support
         mask=ink_support(full,signal,np.full(signal.shape,255,np.uint8),cfg.support_radius)
         if np.count_nonzero(mask)<16:continue
-        proto=dict(id=len(prototypes),anchor=anchor,box=box,feature=feature,mask=mask,
+        proto=dict(id=len(prototypes),family=len(prototypes),anchor=anchor,box=box,feature=feature,mask=mask,
                    whole_feature=full,examples=examples[::max(1,len(examples)//5)],
                    samples=len(chosen),evidence='多帧YOLO图形印证的本输入时域模板')
+        images=[patch(cv2.imread(str(files[p['frame']])),p['box'],(w,h)) for p in chosen]
+        proto['alpha']=learn_opacity(images,mask,cfg.minimum_template_frames)
         prototypes.append(proto)
         # 同一图形中的模型文字部件可作为替代锚点；仍需完整图形模板复核。
         seed_image=cv2.imread(str(files[seed['frame']]))
@@ -195,6 +234,7 @@ def candidates_for_frame(image,row,prototypes,labels,cfg):
         if 'text' in label or 'logo' in label:
             feature=highpass(patch(image,raw['box']))
             scored=[(prototype_score(image,raw,p),p) for p in prototypes
+                    if not p.get('model_logo_only') or 'logo' in label
                     if max((raw['box'][2]-raw['box'][0])/(raw['box'][3]-raw['box'][1]),
                            (p['anchor'][2]-p['anchor'][0])/(p['anchor'][3]-p['anchor'][1])) /
                        max(.01,min((raw['box'][2]-raw['box'][0])/(raw['box'][3]-raw['box'][1]),
@@ -203,7 +243,7 @@ def candidates_for_frame(image,row,prototypes,labels,cfg):
             if proto is not None and score>=cfg.template_correlation:
                 raw_box=projected_box(proto,raw['box'])
                 box=clip_box(raw_box,image.shape[:2])
-                blue.append(dict(box=box,template_box=raw_box,confidence=raw['confidence'],kind='prototype',prototype=proto['id'],model_box=raw['box'],template_score=score))
+                blue.append(dict(box=box,template_box=raw_box,confidence=raw['confidence'],kind='prototype',prototype=proto['id'],family=proto.get('family',proto['id']),component_only=proto.get('component_only',False),model_box=raw['box'],template_score=score))
                 continue
             if 'text' in label:continue
         if 'logo' in label:
@@ -213,7 +253,7 @@ def candidates_for_frame(image,row,prototypes,labels,cfg):
                           c+height*cfg.logo_horizontal_padding,d+height*cfg.logo_vertical_padding],image.shape[:2])
             logos.append(dict(box=box,confidence=raw['confidence'],kind='logo',prototype=-1,model_box=raw['box']))
     selected=[]
-    for p in sorted(blue,key=lambda p:p['confidence'],reverse=True)+sorted(logos,key=lambda p:p['confidence'],reverse=True):
+    for p in sorted(blue,key=lambda p:(p.get('component_only',False),-p['confidence']))+sorted(logos,key=lambda p:p['confidence'],reverse=True):
         if any(min(intersection_fraction(p['box'],q['box']),intersection_fraction(q['box'],p['box']))>cfg.overlap_fraction
                or (intersection_fraction(p['box'],q['box'])>.9 and q['kind']=='prototype') for q in selected):continue
         selected.append(p)
@@ -231,6 +271,7 @@ def associate(rows,scenes,fps,cfg):
                 for t in active:
                     if t['id'] in used or i-t['last']>max(1,round(fps*cfg.maximum_gap_seconds)):continue
                     if t['kind']!=p['kind']:continue
+                    if p['kind']=='prototype' and t.get('family')!=p.get('family',p['prototype']):continue
                     old=t['hints'][-1]['box'];box=p['box']
                     overlap=min(intersection_fraction(old,box),intersection_fraction(box,old))
                     distance=math.hypot((old[0]+old[2]-box[0]-box[2])/2,(old[1]+old[3]-box[1]-box[3])/2)
@@ -238,7 +279,7 @@ def associate(rows,scenes,fps,cfg):
                     if overlap>.1 or distance<size*.5:eligible.append((overlap-distance/max(1,size),t))
                 if eligible:t=max(eligible,key=lambda x:x[0])[1]
                 else:
-                    t=dict(id=next_id,kind=p['kind'],prototype=p['prototype'],hints=[],last=i)
+                    t=dict(id=next_id,kind=p['kind'],prototype=p['prototype'],family=p.get('family',p['prototype']),hints=[],last=i)
                     next_id+=1;active.append(t)
                 t['hints'].append(dict(p,frame=i,track_id=t['id']));t['last']=i;used.add(t['id'])
         for t in active:
@@ -249,11 +290,13 @@ def associate(rows,scenes,fps,cfg):
 
 def build(files,scenes,rows,prior,labels,root,fps=30,settings=None,check=lambda:None):
     cfg=settings or ModelTrackSettings()
-    prototypes=learn_text_prototypes(files,rows,prior,labels,cfg,fps)
+    prototypes=learn_text_prototypes(files,rows,prior,labels,cfg,fps,scenes)
     candidates=[]
     for i,file in enumerate(files):
         check();candidates.append(candidates_for_frame(cv2.imread(str(file)),rows[i],prototypes,labels,cfg))
     tracks=associate(candidates,scenes,fps,cfg)
+    unconfirmed=[t for t in tracks if t['kind']!='prototype']
+    tracks=[t for t in tracks if t['kind']=='prototype']
     if not tracks:raise PipelineError('DETECTION_UNCERTAIN','逐帧YOLO未得到可验证的品牌轨迹')
     prompts=root/'prompts';prompts.mkdir(exist_ok=True)
     templates=root/'templates';templates.mkdir(exist_ok=True)
@@ -272,8 +315,7 @@ def build(files,scenes,rows,prior,labels,root,fps=30,settings=None,check=lambda:
             signal=cv2.morphologyEx(signal,cv2.MORPH_CLOSE,np.ones((3,3),np.uint8))
             base=fill_support(signal,cfg.support_radius)
         if np.count_nonzero(base)<16:raise PipelineError('MASK_UNCERTAIN','自动品牌轮廓支持不足')
-        images=[patch(cv2.imread(str(files[hints[k]['frame']])),hints[k]['box'],size) for k in selected]
-        alpha=learn_opacity(images,base,cfg.minimum_template_frames)
+        alpha=cv2.resize(proto['alpha'],size,interpolation=cv2.INTER_LINEAR)
         np.savez_compressed(templates/f'{t["id"]}.npz',feature=feature,mask=base,alpha=alpha)
         t['template']=str(templates/f'{t["id"]}.npz')
         # 提示来自同一输入的自动模型与模板，供SAM分割细化；无人工坐标或帧号。
@@ -284,6 +326,7 @@ def build(files,scenes,rows,prior,labels,root,fps=30,settings=None,check=lambda:
             path=prompts/f'{t["id"]}-{p["frame"]}.png';cv2.imwrite(str(path),mask)
             p['mask_prompt']=str(path.relative_to(root))
     result=dict(schema='yolo-model-tracks-1',multitrack=True,hls=True,scenes=scenes,tracks=tracks,
+                unconfirmed_model_tracks=unconfirmed,
                 hints=sorted([p for t in tracks for p in t['hints']],key=lambda p:(p['frame'],p['track_id'])),
                 settings=asdict(cfg),raw_model_boxes=sum(len(r['boxes']) for r in rows),
                 evidence='目标由逐帧YOLO可靠观测建立，短缺口仅在可靠前后观测间有界插值；文本需本输入模型/共识模板印证；不以全画面模板峰新增轨迹')

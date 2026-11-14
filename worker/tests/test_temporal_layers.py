@@ -66,7 +66,7 @@ def test_overlapping_detection_views_cover_all_pixels_without_changing_source():
     original=image.copy();seen=np.zeros(image.shape[:2],np.uint8)
     views=detection_views(image,enhance=True,tiles=True)
     assert len(views)==6
-    for crop,x,y in views[2:]:seen[y:y+crop.shape[0],x:x+crop.shape[1]]=1
+    for crop,x,y,flipped in views[2:]:seen[y:y+crop.shape[0],x:x+crop.shape[1]]=1
     assert seen.all() and np.array_equal(image,original)
 
 
@@ -77,3 +77,56 @@ def test_stable_colored_opaque_brand_cannot_be_misclassified_as_weak_white_overl
         image=np.full((50,70,3),30+i*6,np.uint8);image[mask>0]=[240,170,10];images.append(image)
     alpha=learn_opacity(images,mask)
     assert np.all(alpha[mask>0]>.45)
+
+
+def test_unknown_single_scene_graphic_is_not_promoted_to_overlay_template(tmp_path):
+    import cv2
+    from worker.model_tracks import learn_logo_prototypes,ModelTrackSettings
+    files=[];rows=[]
+    for i in range(20):
+        im=np.full((120,220,3),50+i,np.uint8)
+        cv2.putText(im,'AB',(60+i,65),cv2.FONT_HERSHEY_SIMPLEX,.7,(160,160,160),2)
+        p=tmp_path/f'{i:06d}.png';cv2.imwrite(str(p),im);files.append(p)
+        rows.append(dict(frame=i,boxes=[dict(box=[55+i,44,92+i,70],confidence=.9,class_id=1)]))
+    args=(files,rows,{1:'float_logo'},[],ModelTrackSettings(),30)
+    assert learn_logo_prototypes(*args,scenes=[[0,20]])==[]
+    assert learn_logo_prototypes(*args,scenes=[[0,10],[10,20]])
+
+
+def test_different_graphics_never_swap_tracks_but_anchor_variants_share_identity():
+    from worker.model_tracks import associate,ModelTrackSettings
+    base=dict(box=[20,20,50,50],confidence=.9,kind='prototype')
+    rows=[[dict(base,prototype=0,family=7)],[dict(base,prototype=1,family=8)],
+          [dict(base,prototype=2,family=7)]]
+    tracks=associate(rows,[[0,3]],30,ModelTrackSettings())
+    assert len(tracks)==2
+    a=next(t for t in tracks if t['family']==7)
+    assert {p['prototype'] for p in a['hints'] if not p.get('interpolated')}=={0,2}
+
+
+def test_alternate_text_anchor_keeps_confirmed_complete_graphic_geometry(tmp_path,monkeypatch):
+    import cv2
+    from worker import model_tracks as model
+    files=[];rows=[]
+    for i in range(20):
+        im=np.full((120,220,3),40+i,np.uint8)
+        cv2.circle(im,(38,43),20,(230,150,5),-1)
+        cv2.putText(im,'AB',(75,42),cv2.FONT_HERSHEY_SIMPLEX,.8,(240,240,240),2)
+        cv2.putText(im,'abc',(76,68),cv2.FONT_HERSHEY_SIMPLEX,.5,(240,240,240),1)
+        p=tmp_path/f'{i:06d}.png';cv2.imwrite(str(p),im);files.append(p)
+        rows.append(dict(frame=i,boxes=[dict(box=[73,20,115,46],confidence=.99,class_id=2),
+                                        dict(box=[74,55,110,72],confidence=.9,class_id=2)]))
+    im=cv2.imread(str(files[0]));hp=highpass(im);mask=np.zeros(hp.shape,np.uint8);mask[10:85,10:145]=255
+    monkeypatch.setattr(model,'load_prior',lambda p:(hp,np.abs(hp),[dict(id=0,box=[10,10,145,85],mask=mask,confidence=.95)],{},{}))
+    prototypes=model.learn_text_prototypes(files,rows,None,{2:'float_text'},model.ModelTrackSettings(),30,[[0,10],[10,20]])
+    result=model.candidates_for_frame(im,rows[0],prototypes,{2:'float_text'},model.ModelTrackSettings())
+    assert result and result[0]['box']==[10,10,145,85]
+    assert result[0]['box'][0]<38<result[0]['box'][2]
+
+
+def test_flipped_detector_coordinates_map_back_without_mirroring_source():
+    from scripts.hls_candidates import detection_views,mapped_box
+    image=np.zeros((80,120,3),np.uint8);image[10:20,3:9]=255
+    views=detection_views(image,flips=True)
+    assert mapped_box([111,10,117,20],views[-1])==[3,10,9,20]
+    assert np.all(image[10:20,3:9]==255)

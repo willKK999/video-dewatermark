@@ -44,9 +44,9 @@ def prepare(source,work,expected,duration,context):
     return metadata,video,fps,core,files
 
 
-def detect_all(frames,output,enhance=False,tiles=False):
+def detect_all(frames,output,enhance=False,tiles=False,flips=False):
     run([os.environ['DETECT_PYTHON'],'-m','scripts.hls_candidates','--frames',frames,'--output',output,
-         *(['--enhance'] if enhance else []),*(['--tiles'] if tiles else [])],timeout=1800)
+         *(['--enhance'] if enhance else []),*(['--tiles'] if tiles else []),*(['--flips'] if flips else [])],timeout=1800)
     return read(output)
 
 
@@ -58,20 +58,22 @@ def tracked_brand_candidates(image,row,prototypes,labels,allowed):
         intersection_fraction(p['model_box'],box)>.5 for box in allowed)]
 
 
-def verify(work,video,files,detected,prior,labels,core,fps,output,enhance=False,tiles=False):
+def verify(work,video,files,detected,prior,labels,core,fps,output,enhance=False,tiles=False,flips=False):
     start=time.monotonic();encoded=work/'encoded';encoded.mkdir()
     run(['ffmpeg','-v','error','-y','-threads','2','-i',video,'-map','0:v:0','-fps_mode','passthrough','-start_number','0','-threads','2',encoded/'%06d.png'])
     decoded=sorted(encoded.glob('*.png'))
     if len(decoded)!=core:raise PipelineError('OUTPUT_INCOMPLETE','编码后帧数不一致')
-    rows=detect_all(encoded,work/'encoded-yolo.json',enhance,tiles)
+    rows=detect_all(encoded,work/'encoded-yolo.json',enhance,tiles,flips)
     source_rows=read(work/'all-yolo.json')
-    proto=learn_text_prototypes(files,source_rows,prior,labels,ModelTrackSettings(),fps)
-    brand_candidates=[];v0_candidates=[]
+    proto=learn_text_prototypes(files,source_rows,prior,labels,ModelTrackSettings(),fps,detected['scenes'])
+    brand_candidates=[];v0_candidates=[];unconfirmed=[]
     # 先保存全部YOLO候选；品牌判别与源片使用同一内容绑定模板，字幕不直接算水印。
     for i,p in enumerate(decoded):
         image=cv2.imread(str(p));source=cv2.imread(str(files[i]))
         allowed=[h['box'] for h in detected['hints'] if h['frame']==i]
         items=tracked_brand_candidates(image,rows[i],proto,labels,allowed)
+        all_items=candidates_for_frame(image,rows[i],proto,labels,ModelTrackSettings())
+        unconfirmed.extend(dict(frame=i,**p) for p in all_items if p['kind']=='logo' and p not in items)
         original=tracked_brand_candidates(source,source_rows[i],proto,labels,allowed)
         brand_candidates.extend(dict(frame=i,**p) for p in items)
         v0_candidates.extend(dict(frame=i,**p) for p in original)
@@ -114,9 +116,10 @@ def verify(work,video,files,detected,prior,labels,core,fps,output,enhance=False,
         old=x,y,mask
     quality=dict(视频摘要=vision.sha256(video),逐帧YOLO品牌候选=brand_candidates,
                  原片同口径品牌候选数=len(v0_candidates),编码后品牌候选数=len(brand_candidates),
+                 未确认图形候选=unconfirmed,未确认图形候选数=len(unconfirmed),
                  全部模板部件=template_records,模板候选=template_candidates,
                  闪烁候选=flashes,时域全部样本=times,清晰度=clarity_summary(clarity),
-                 残留候选数=len(brand_candidates)+len(template_candidates),
+                 残留候选数=len(brand_candidates)+len(template_candidates)+len(unconfirmed),
                  原始YOLO输出=str(work/'encoded-yolo.json'),
                  耗时秒=time.monotonic()-start,通过=False,目检完成=False)
     write(output/'quality.json',quality)
@@ -151,7 +154,7 @@ def execute_one(args):
             if read(binding).get('frames_binding_sha256')!=signature or read(binding).get('detected_sha256')!=vision.sha256(raw):raise PipelineError('SOURCE_CHANGED','检测缓存缺少输入帧绑定')
             rows=read(raw)
         else:
-            rows=step('YOLO逐帧检测',lambda:detect_all(work/'frames',raw,enhance=args.enhance_detection,tiles=args.tiled_detection))
+            rows=step('YOLO逐帧检测',lambda:detect_all(work/'frames',raw,enhance=args.enhance_detection,tiles=args.tiled_detection,flips=args.flipped_detection))
             write(binding,dict(frames_binding_sha256=signature,detected_sha256=vision.sha256(raw)))
         labels={int(k):str(v).lower() for k,v in read(raw.with_suffix('.timing.json'))['类别'].items()}
         prepared=read(work/'model-prepared.json')
@@ -214,7 +217,7 @@ def execute_one(args):
             if audio_hash(args.source,core/fps)!=audio_hash(video):raise PipelineError('OUTPUT_INVALID','原音频压缩内容不一致')
             return video
         video=step('编码与音轨复制',encode)
-        quality=step('编码后核验',lambda:verify(work,video,files,detected,args.prior,labels,core,fps,output,args.enhance_detection,args.tiled_detection))
+        quality=step('编码后核验',lambda:verify(work,video,files,detected,args.prior,labels,core,fps,output,args.enhance_detection,args.tiled_detection,args.flipped_detection))
         report=dict(源摘要=args.sha256,迭代=args.iteration,通过=False,模型完成=True,阶段耗时秒=timings,
                     总耗时秒=time.monotonic()-started,原帧回退数=0,主体帧数=core,处理输入帧数=len(files),
                     视频=str(video),视频摘要=vision.sha256(video),核验=quality,
@@ -243,6 +246,7 @@ def main():
     p.add_argument('--enhance-detection',action='store_true')
     p.add_argument('--preserve-detail',action='store_true')
     p.add_argument('--tiled-detection',action='store_true')
+    p.add_argument('--flipped-detection',action='store_true')
     args=p.parse_args()
     if args.duration<=0 or args.context<0 or args.duration+args.context>30:p.error('主体与上下文总输入须在30秒内')
     cv2.setNumThreads(2);execute_one(args)
