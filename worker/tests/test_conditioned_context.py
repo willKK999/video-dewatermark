@@ -6,17 +6,22 @@ from worker import vision
 from worker.process import PipelineError
 
 
-def execute(tmp_path,monkeypatch,conditioned,ignore_context=False):
+def execute(tmp_path,monkeypatch,conditioned,ignore_context=False,use_union=False):
     monkeypatch.setenv('HLS_WINDOW_FRAMES','4');monkeypatch.setenv('HLS_OVERLAP_FRAMES','2')
     monkeypatch.setenv('INPAINT_PYTHON','python');monkeypatch.setenv('PROPAINTER_ROOT',str(tmp_path))
     for name in ['frames','masks']:(tmp_path/name).mkdir()
     mask=np.zeros((64,64),np.uint8);mask[20:44,20:44]=255
     files=[]
+    if use_union:(tmp_path/'union').mkdir()
     for i in range(6):
         path=tmp_path/'frames'/f'{i:06d}.png';cv2.imwrite(str(path),np.full((64,64,3),10,np.uint8));files.append(path)
         cv2.imwrite(str(tmp_path/'masks'/path.name),mask)
+        if use_union:
+            union=mask.copy();union[2,2]=255;cv2.imwrite(str(tmp_path/'union'/path.name),union)
     class References:
-        def __init__(self,*a):self.stats={};self.timings={}
+        def __init__(self,images,masks):
+            self.stats={};self.timings={}
+            if use_union:assert all(m[2,2]==255 for m in masks)
         def restore(self,original,mask,repaired):return repaired
     monkeypatch.setattr(vision,'CleanReferences',References)
     calls=[]
@@ -30,8 +35,13 @@ def execute(tmp_path,monkeypatch,conditioned,ignore_context=False):
             else:im[m>0]=240 if len(calls)>1 else 160
             cv2.imwrite(str(out/p.name),im)
     monkeypatch.setattr(vision,'run',fake_run)
-    vision.inpaint(tmp_path,files,[(0,6)],'propainter',True,condition_overlap=conditioned)
+    vision.inpaint(tmp_path,files,[(0,6)],'propainter',True,condition_overlap=conditioned,
+                   reference_masks=tmp_path/'union' if use_union else None)
     return calls
+
+
+def test_clean_references_exclude_all_watermarks_not_just_active_layer(tmp_path,monkeypatch):
+    execute(tmp_path,monkeypatch,True,use_union=True)
 
 
 def test_context_uses_same_frame_previous_output_and_zero_mask(tmp_path,monkeypatch):

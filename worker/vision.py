@@ -475,6 +475,7 @@ def inpaint(
     low_memory=False,
     check=lambda: None,
     condition_overlap=False,
+    reference_masks=None,
 ):
     dest = root / "composite"
     dest.mkdir()
@@ -512,6 +513,7 @@ def inpaint(
         overlap_frames=overlap,
         mask_fraction=mask_fraction,
         conditioned_overlap=condition_overlap,
+        all_watermark_references=reference_masks is not None,
         low_memory=low_memory,
     )
 
@@ -533,7 +535,7 @@ def inpaint(
             )
             references = CleanReferences(
                 [read(files[j]) for j in refs],
-                [read(root / "masks" / files[j].name, True) for j in refs],
+                [read((Path(reference_masks) if reference_masks else root / "masks") / files[j].name, True) for j in refs],
             )
             for index, (start, end) in enumerate(
                 windows(scene_start, scene_end, size, overlap)

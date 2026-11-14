@@ -44,8 +44,9 @@ def prepare(source,work,expected,duration,context):
     return metadata,video,fps,core,files
 
 
-def detect_all(frames,output):
-    run([os.environ['DETECT_PYTHON'],'-m','scripts.hls_candidates','--frames',frames,'--output',output],timeout=1800)
+def detect_all(frames,output,enhance=False,tiles=False):
+    run([os.environ['DETECT_PYTHON'],'-m','scripts.hls_candidates','--frames',frames,'--output',output,
+         *(['--enhance'] if enhance else []),*(['--tiles'] if tiles else [])],timeout=1800)
     return read(output)
 
 
@@ -57,14 +58,14 @@ def tracked_brand_candidates(image,row,prototypes,labels,allowed):
         intersection_fraction(p['model_box'],box)>.5 for box in allowed)]
 
 
-def verify(work,video,files,detected,prior,labels,core,fps,output):
+def verify(work,video,files,detected,prior,labels,core,fps,output,enhance=False,tiles=False):
     start=time.monotonic();encoded=work/'encoded';encoded.mkdir()
     run(['ffmpeg','-v','error','-y','-threads','2','-i',video,'-map','0:v:0','-fps_mode','passthrough','-start_number','0','-threads','2',encoded/'%06d.png'])
     decoded=sorted(encoded.glob('*.png'))
     if len(decoded)!=core:raise PipelineError('OUTPUT_INCOMPLETE','编码后帧数不一致')
-    rows=detect_all(encoded,work/'encoded-yolo.json')
+    rows=detect_all(encoded,work/'encoded-yolo.json',enhance,tiles)
     source_rows=read(work/'all-yolo.json')
-    proto=learn_text_prototypes(files,source_rows,prior,labels,ModelTrackSettings())
+    proto=learn_text_prototypes(files,source_rows,prior,labels,ModelTrackSettings(),fps)
     brand_candidates=[];v0_candidates=[]
     # 先保存全部YOLO候选；品牌判别与源片使用同一内容绑定模板，字幕不直接算水印。
     for i,p in enumerate(decoded):
@@ -150,7 +151,7 @@ def execute_one(args):
             if read(binding).get('frames_binding_sha256')!=signature or read(binding).get('detected_sha256')!=vision.sha256(raw):raise PipelineError('SOURCE_CHANGED','检测缓存缺少输入帧绑定')
             rows=read(raw)
         else:
-            rows=step('YOLO逐帧检测',lambda:detect_all(work/'frames',raw))
+            rows=step('YOLO逐帧检测',lambda:detect_all(work/'frames',raw,enhance=args.enhance_detection,tiles=args.tiled_detection))
             write(binding,dict(frames_binding_sha256=signature,detected_sha256=vision.sha256(raw)))
         labels={int(k):str(v).lower() for k,v in read(raw.with_suffix('.timing.json'))['类别'].items()}
         prepared=read(work/'model-prepared.json')
@@ -190,16 +191,21 @@ def execute_one(args):
         for k,layer in enumerate(summaries['layers']):
             layer_root=Path(layer['directory']).parent
             (layer_root/'frames').symlink_to(current,target_is_directory=True)
-            step(f'inpaint-{k+1}',lambda:vision.inpaint(layer_root,sorted((layer_root/'frames').glob('*.png')),detected['scenes'],'propainter',True,condition_overlap=args.condition_overlap))
+            step(f'inpaint-{k+1}',lambda:vision.inpaint(layer_root,sorted((layer_root/'frames').glob('*.png')),detected['scenes'],'propainter',True,condition_overlap=args.condition_overlap,reference_masks=work/'masks'))
             current=layer_root/'composite'
             if len(list(current.glob('*.png')))!=len(files):raise PipelineError('OUTPUT_INCOMPLETE','补画帧不完整，禁止原帧回退')
         if not summaries['layers']:raise PipelineError('MASK_UNCERTAIN','没有可用的已验证掩膜图层')
         (work/'composite').symlink_to(current,target_is_directory=True)
         verification=VerifiedLayers(work/'layers.json',work/'detections.json')
         for i,file in enumerate(files):verification.validate(i,cv2.imread(str(work/'masks'/file.name),0))
+        detail=None
+        if args.preserve_detail:
+            from worker.model_detail import render
+            current,detail=step('联合纹理投影',lambda:render(work,files,detected,fps))
+        else:current=work/'composite'
         def encode():
             silent=work/'core-video.mp4'
-            run(['ffmpeg','-v','error','-y','-framerate',str(fps),'-i',work/'composite/%06d.png','-frames:v',str(core),'-c:v','libx264','-preset','fast','-crf',str(HLSSettings.from_env().video_crf),'-threads','2','-pix_fmt','yuv420p',silent])
+            run(['ffmpeg','-v','error','-y','-framerate',str(fps),'-i',current/'%06d.png','-frames:v',str(core),'-c:v','libx264','-preset','fast','-crf',str(HLSSettings.from_env().video_crf),'-threads','2','-pix_fmt','yuv420p',silent])
             audio=work/'core-audio.m4a'
             run(['ffmpeg','-v','error','-y','-i',args.source,'-map','0:a:0','-t',str(core/fps),'-c:a','copy',audio])
             offset=float(source_video.get('start_time',0))-float(metadata['format'].get('start_time',0))
@@ -208,12 +214,12 @@ def execute_one(args):
             if audio_hash(args.source,core/fps)!=audio_hash(video):raise PipelineError('OUTPUT_INVALID','原音频压缩内容不一致')
             return video
         video=step('编码与音轨复制',encode)
-        quality=step('编码后核验',lambda:verify(work,video,files,detected,args.prior,labels,core,fps,output))
+        quality=step('编码后核验',lambda:verify(work,video,files,detected,args.prior,labels,core,fps,output,args.enhance_detection,args.tiled_detection))
         report=dict(源摘要=args.sha256,迭代=args.iteration,通过=False,模型完成=True,阶段耗时秒=timings,
                     总耗时秒=time.monotonic()-started,原帧回退数=0,主体帧数=core,处理输入帧数=len(files),
                     视频=str(video),视频摘要=vision.sha256(video),核验=quality,
                     轨迹数=len(detected['tracks']),预算=budget,
-                    实际补画图层=len(summaries['layers']),复用分割=args.reuse_validated_masks,模型参数=dict(窗口=HLSSettings.from_env().window_frames,重叠=HLSSettings.from_env().overlap_frames,降分辨率=False,重叠上下文=args.condition_overlap),
+                    实际补画图层=len(summaries['layers']),复用分割=args.reuse_validated_masks,联合纹理投影=detail,模型参数=dict(窗口=HLSSettings.from_env().window_frames,重叠=HLSSettings.from_env().overlap_frames,降分辨率=False,重叠上下文=args.condition_overlap),
                     输出规格=media.probe(video),目检完成=False,说明='模型结果仅作验证；候选与目检未通过不得宣称验收通过')
         write(output/'report.json',report);log(f'第1块 本轮完成 原帧回退=0 残留候选={quality["残留候选数"]} 闪烁候选={len(quality["闪烁候选"])} 清晰度最低={quality["清晰度"]["最小保留比"]}')
     except Exception as exc:
@@ -234,6 +240,9 @@ def main():
     p.add_argument('--prepare-only',action='store_true')
     p.add_argument('--reuse-validated-masks',action='store_true')
     p.add_argument('--condition-overlap',action='store_true')
+    p.add_argument('--enhance-detection',action='store_true')
+    p.add_argument('--preserve-detail',action='store_true')
+    p.add_argument('--tiled-detection',action='store_true')
     args=p.parse_args()
     if args.duration<=0 or args.context<0 or args.duration+args.context>30:p.error('主体与上下文总输入须在30秒内')
     cv2.setNumThreads(2);execute_one(args)
