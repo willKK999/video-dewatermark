@@ -169,6 +169,11 @@ def learn_text_prototypes(files,rows,prior,labels,settings,fps=None,scenes=None)
                 feature=f,whole_feature=f,mask=isolated,alpha=canonical['alpha'][y:y+ch,x:x+cw],
                 examples=[f],samples=len(images),model_logo_only=True,require_whole=True))
             result[-1]['component_only']=True
+    if getattr(settings,'complete_component_support',False):
+        from .detection_recall import seed_is_reliable
+        result=[p for p in result if seed_is_reliable(p,settings)]
+        # 保存及访问统一使用连续编号；family继续表示源品牌身份。
+        for i,p in enumerate(result):p['id']=i
     flipped_families={}
     for proto in list(result):
         if len(result)>=settings.maximum_prototypes:break
@@ -226,6 +231,9 @@ def learn_logo_prototypes(files,rows,labels,prototypes,cfg,fps,scenes=None):
                 images=[patch(cv2.imread(str(files[p['frame']])),projected_box(proto,p['model_box']),
                               (proto['mask'].shape[1],proto['mask'].shape[0])) for p in chosen]
                 mask=proto['mask']
+        if getattr(cfg,'complete_component_support',False):
+            from .detection_recall import seed_is_reliable
+            if not seed_is_reliable(proto,cfg):continue
         proto['alpha']=learn_opacity(images,mask,cfg.minimum_template_frames)
         prototypes.append(proto)
         box=proto['box']
@@ -264,6 +272,9 @@ def candidates_for_frame(image,row,prototypes,labels,cfg):
                 continue
             if 'text' in label:continue
         if 'logo' in label:
+            if getattr(cfg,'complete_component_support',False):
+                from .detection_recall import graphic_is_confirmed
+                if not graphic_is_confirmed(raw,cfg):continue
             if 'corner' in label and raw['confidence']<cfg.seed_confidence:continue
             a,b,c,d=raw['box'];height=d-b
             box=clip_box([a-height*cfg.logo_horizontal_padding,b-height*cfg.logo_vertical_padding,

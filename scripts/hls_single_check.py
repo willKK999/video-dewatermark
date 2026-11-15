@@ -218,6 +218,10 @@ def execute_one(args):
                 return summary['逐帧']
             return vision.masks(work,files,detected,'propainter',budget=budget,progress=log,mask_source=args.mask_source)
         manifest=step('mask',masks)
+        if args.prepare_masks_only:
+            write(output/'masks-prepared.json',dict(仅准备掩膜=True,阶段耗时秒=timings,总耗时秒=time.monotonic()-started,轨迹数=len(detected['tracks']),掩膜策略=args.mask_source))
+            log('检测和分割准备完成；尚未开始本轮补画')
+            return
         if args.coverage_reference:
             from worker.coverage_reference import verify_coverage
             step('基线覆盖逐像素复核',lambda:verify_coverage(work,args.coverage_reference))
@@ -283,6 +287,7 @@ def main():
     p.add_argument('--context',type=float,default=HLSSettings.from_env().context_seconds)
     p.add_argument('--iteration',type=int,required=True)
     p.add_argument('--prepare-only',action='store_true')
+    p.add_argument('--prepare-masks-only',action='store_true')
     p.add_argument('--reuse-validated-masks',action='store_true')
     p.add_argument('--condition-overlap',action='store_true')
     p.add_argument('--enhance-detection',action='store_true')

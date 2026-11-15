@@ -49,3 +49,30 @@ def test_recall_tracks_restart_at_cut_and_keep_twenty_percent_guard():
     assert len(tracks)==2
     assert [t['hints'][0]['frame'] for t in tracks]==[0,6]
     with pytest.raises(PipelineError):temporal_bins({1:{0:.201}})
+
+
+def test_background_panel_seed_is_rejected_without_content_coordinates():
+    from worker.detection_recall import seed_is_reliable
+    cfg=RecallSettings()
+    assert not seed_is_reliable(dict(mask=np.full((32,90),255,np.uint8)),cfg)
+    mark=np.zeros((32,90),np.uint8);cv2.circle(mark,(18,16),10,255,-1)
+    assert seed_is_reliable(dict(mask=mark),cfg)
+
+
+def test_augmented_single_view_logo_cannot_seed_a_graphic():
+    from worker.detection_recall import graphic_is_confirmed
+    cfg=RecallSettings()
+    assert not graphic_is_confirmed(dict(detection_view=1,original_view_confirmed=False,confirming_views=[1]),cfg)
+    assert graphic_is_confirmed(dict(detection_view=2,original_view_confirmed=False,confirming_views=[2,3]),cfg)
+    assert graphic_is_confirmed(dict(detection_view=0),cfg)
+
+
+def test_merged_detector_preserves_independent_view_evidence():
+    from scripts.hls_candidates import merge_view_boxes
+    a=dict(box=[10,20,60,45],confidence=.9,class_id=1,detection_view=2)
+    b=dict(a,confidence=.85,detection_view=3)
+    c=dict(a,confidence=.4,detection_view=0)
+    result=merge_view_boxes([a,b,c])
+    assert len(result)==1
+    assert result[0]['confirming_views']==[2,3] and result[0]['original_view_confirmed']
+    assert not merge_view_boxes([a])[0]['original_view_confirmed']

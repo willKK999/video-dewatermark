@@ -38,6 +38,17 @@ def mapped_box(box,view):
     return [box[0]+dx,box[1]+dy,box[2]+dx,box[3]+dy]
 
 
+
+def merge_view_boxes(boxes, iou=.7, confirmation_confidence=.65):
+    """去重时保留独立视图印证，增强产生的单视图幻检不能冒充共识。"""
+    selected=[]
+    for b in sorted(boxes,key=lambda b:-b['confidence']):
+        if any(b['class_id']==q['class_id'] and box_iou(b['box'],q['box'])>iou for q in selected):continue
+        peers=[p for p in boxes if p['class_id']==b['class_id'] and box_iou(b['box'],p['box'])>.5]
+        selected.append(dict(b,confirming_views=sorted({p['detection_view'] for p in peers if p['confidence']>=confirmation_confidence}),
+                             original_view_confirmed=any(p['detection_view']==0 and p['confidence']>=.35 for p in peers)))
+    return selected
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--frames", type=Path, required=True)
@@ -65,9 +76,7 @@ def main():
                 box=b.xyxy[0].cpu().tolist()
                 boxes.append(dict(box=mapped_box(box,views[k]),
                     confidence=float(b.conf[0]),class_id=int(b.cls[0]),detection_view=k))
-        selected=[]
-        for b in sorted(boxes,key=lambda b:-b['confidence']):
-            if not any(b['class_id']==q['class_id'] and box_iou(b['box'],q['box'])>.7 for q in selected):selected.append(b)
+        selected=merge_view_boxes(boxes)
         rows.append(
             dict(
                 frame=index,

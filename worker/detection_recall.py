@@ -17,6 +17,8 @@ class RecallSettings(ModelTrackSettings):
     recall_correlation: float = .82
     recall_min_observations: int = 2
     recall_search_ratio: float = .5
+    maximum_seed_support_fraction: float = .85
+    minimum_graphic_views: int = 2
 
     def __post_init__(self):
         if self.recall_stride<1 or self.recall_min_observations<2 or not 0<self.recall_search_ratio<=1:
@@ -24,6 +26,16 @@ class RecallSettings(ModelTrackSettings):
         if not 0<self.recall_correlation<=1 or any(s<=0 for s in self.recall_scales):
             raise ValueError('模板补漏尺度或相关阈值无效')
 
+
+
+def seed_is_reliable(proto,cfg):
+    """近乎填满搜索框的纹理模板缺少独立前景，不得扩散成全片品牌。"""
+    return np.count_nonzero(proto['mask'])/proto['mask'].size<=cfg.maximum_seed_support_fraction
+
+
+def graphic_is_confirmed(raw,cfg):
+    # 原图直接观测或多个高置信度视图；不让单个增强视图建立新图形。
+    return raw.get('original_view_confirmed',raw.get('detection_view',0)==0) or len(raw.get('confirming_views',[]))>=cfg.minimum_graphic_views
 
 def connected_support(features, anchor, cfg):
     """只补模型锚点邻近、跨背景同号稳定的连通区域，闭合图标内部。"""
