@@ -74,4 +74,57 @@ def test_layer_model_missing_frames_keeps_failure_checkpoint(tmp_path,monkeypatc
     with pytest.raises(PipelineError) as exc:roi_inpaint.execute(tmp_path,files,d,cfg=roi_inpaint.ROISettings(sequential_layers=True))
     assert exc.value.code=='ROI_INCOMPLETE'
     assert json.loads((tmp_path/'roi-report.json').read_text())['任务'][0]['错误码']=='ROI_INCOMPLETE'
-    assert (tmp_path/'roi-0001/frames').exists() and not (tmp_path/'composite').exists()
+    assert (tmp_path/'roi-0001-attempt-00/frames').exists() and not (tmp_path/'composite').exists()
+
+
+@pytest.mark.parametrize('recover',[True,False])
+def test_seam_retry_is_bounded_and_failed_attempt_never_commits(tmp_path,monkeypatch,recover):
+    files,d,mask=fixture(tmp_path);setup(monkeypatch,tmp_path)
+    monkeypatch.setenv('HLS_WINDOW_FRAMES','5');monkeypatch.setenv('HLS_OVERLAP_FRAMES','2')
+    calls=[];snapshots=[];logs=[]
+    def model(args,**kw):
+        frames=Path(args[args.index('--video')+1]);out=Path(args[args.index('--output')+1])/'frames/frames';out.mkdir(parents=True)
+        if calls:
+            state=[cv2.imread(str(tmp_path/'roi-layer-00'/p.name)).copy() for p in files]
+            if snapshots:
+                assert all(np.array_equal(a,b) for a,b in zip(state,snapshots[0]))
+            snapshots.append(state)
+        call=len(calls);calls.append(args)
+        for p in sorted(frames.glob('*.png')):
+            image=cv2.imread(str(p));image[cv2.imread(str(Path(args[args.index('--mask')+1])/p.name),0)>0]+=20 if call==0 or (recover and call==2) else 80
+            cv2.imwrite(str(out/p.name),image)
+    monkeypatch.setattr(roi_layers,'run',model)
+    if recover:
+        result=roi_inpaint.execute(tmp_path,files,d,log=logs.append,cfg=roi_inpaint.ROISettings(sequential_layers=True))
+        assert result['任务'][1]['通过'] and len(calls)==3
+    else:
+        with pytest.raises(PipelineError) as exc:
+            roi_inpaint.execute(tmp_path,files,d,log=logs.append,cfg=roi_inpaint.ROISettings(sequential_layers=True))
+        assert exc.value.code=='SEAM_UNCERTAIN' and len(calls)==5
+        assert not (tmp_path/'composite').exists()
+    report=json.loads((tmp_path/'roi-report.json').read_text());trials=report['任务'][1]['尝试']
+    assert trials[0]['重叠最大差异']==60 and not trials[0]['通过']
+    assert trials[-1]['通过']==recover
+    assert all('耗时秒' in t and 'subvideo_length' in t for t in trials)
+    assert any('接缝差异=60.0' in line and '通过=False' in line for line in logs)
+
+
+def test_seam_variants_stay_inside_scene_and_limit_retries():
+    from worker.hls_settings import HLSSettings
+    cfg=roi_inpaint.ROISettings()
+    variants=roi_layers.seam_variants(40,76,20,80,HLSSettings(),cfg)
+    assert variants==[(40,76,36),(32,76,36),(24,80,36),(32,80,18)]
+    with pytest.raises(ValueError):
+        roi_layers.seam_variants(40,76,20,80,HLSSettings(),roi_inpaint.ROISettings(seam_retries=4))
+
+
+def test_gpu_oom_only_retries_once_and_keeps_checkpoint(tmp_path,monkeypatch):
+    files,d,_=fixture(tmp_path);setup(monkeypatch,tmp_path);calls=[]
+    def oom(*args,**kwargs):
+        calls.append(kwargs['timeout']);raise PipelineError('GPU_OOM','合成显存不足')
+    monkeypatch.setattr(roi_layers,'run',oom)
+    with pytest.raises(PipelineError) as exc:
+        roi_inpaint.execute(tmp_path,files,d,cfg=roi_inpaint.ROISettings(sequential_layers=True))
+    assert exc.value.code=='GPU_OOM' and len(calls)==2
+    report=json.loads((tmp_path/'roi-report.json').read_text())
+    assert len(report['任务'][0]['尝试'])==2 and not report['任务'][0]['通过']

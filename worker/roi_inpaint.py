@@ -25,6 +25,7 @@ class ROISettings:
     maximum_retries:int=2
     fp16:bool=True
     sequential_layers:bool=False
+    seam_retries:int=3
 
     @classmethod
     def from_env(cls):
