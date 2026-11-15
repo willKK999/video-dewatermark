@@ -178,6 +178,9 @@ def build(files,scenes,rows,prior,labels,root,fps=30,settings=None,check=lambda:
         feature=np.median(np.stack(features),axis=0)
         if t['kind']=='prototype':
             proto=prototypes[t['prototype']];base=cv2.resize(proto['mask'],size,interpolation=cv2.INTER_NEAREST)
+        elif t['kind']=='confirmed_text':
+            from .model_text_confirmation import confirmed_text_support
+            base=confirmed_text_support(prototypes[t['prototype']],size)
         else:
             noise=float(np.median(np.abs(feature)))
             signal=(np.abs(feature)>max(.5,noise*5)).astype(np.uint8)*255

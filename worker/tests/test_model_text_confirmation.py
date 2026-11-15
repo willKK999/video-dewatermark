@@ -13,7 +13,7 @@ def restore(rows, scenes=None, existing=None, confirmed=True):
     if confirmed:
         anchor=observed()
         rows=[[anchor]]+rows
-        candidates=[[dict(box=anchor['box'],model_box=anchor['box'],kind='prototype')]]+candidates
+        candidates=[[dict(box=anchor['box'],model_box=anchor['box'],kind='prototype',prototype=0)]]+candidates
         scenes=[[0,1]]+[[a+1,b+1] for a,b in scenes]
     restore_confirmed_text(candidates, [dict(boxes=r) for r in rows], scenes,
                            {1:'corner_text',2:'float_text',3:'corner_logo'}, ModelTrackSettings())
@@ -61,3 +61,15 @@ def test_v8_detection_uses_frozen_single_view_detector(tmp_path,monkeypatch):
     entry.detect_all(tmp_path,tmp_path/'missing.json',mask_source='v8')
     assert calls[0][1:3]==['-m','scripts.hls_candidates_v7']
     assert not {'--enhance','--tiles','--flips'} & set(calls[0])
+
+
+def test_confirmed_text_support_only_crops_original_anchor_without_adjacent_icon():
+    import numpy as np
+    from worker.model_text_confirmation import confirmed_text_support
+    mask=np.zeros((40,80),np.uint8)
+    mask[:20,:20]=255  # 相邻图标
+    mask[25:30,30:60]=255  # 模型已确认文字笔画
+    proto=dict(mask=mask,box=[100,200,180,240],anchor=[120,220,170,235])
+    result=confirmed_text_support(proto,(50,15))
+    expected=np.zeros((15,50),np.uint8);expected[5:10,10:40]=255
+    assert np.array_equal(result,expected)

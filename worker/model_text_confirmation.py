@@ -21,9 +21,10 @@ def restore_confirmed_text(candidates, rows, scenes, labels, cfg):
         ) >= cfg.fallback_overlap
 
     # 只从本输入原模板路径已确认的同类实例取锚点；不把连续字幕当新品牌。
-    confirmed = [raw for i, row in enumerate(rows) for raw in row['boxes']
-                 if raw['confidence'] >= cfg.seed_confidence and
-                 any(p['kind'] == 'prototype' and p['model_box'] == raw['box'] for p in candidates[i])]
+    confirmed = [dict(raw, confirmed_prototype=p['prototype'])
+                 for i, row in enumerate(rows) for raw in row['boxes'] for p in candidates[i]
+                 if raw['confidence'] >= cfg.seed_confidence and p['kind'] == 'prototype'
+                 and p['model_box'] == raw['box']]
 
     for start, end in scenes:
         active = []
@@ -55,6 +56,21 @@ def restore_confirmed_text(candidates, rows, scenes, labels, cfg):
                 # 保持旧模板及图形路径优先；只恢复原流程没有覆盖的直接观测。
                 if any(intersection_fraction(raw['box'], p['box']) > cfg.overlap_fraction for p in candidates[i]):
                     continue
+                anchor=max((a for a in confirmed if compatible(a, raw)), key=lambda a:
+                    min(intersection_fraction(a['box'],raw['box']),intersection_fraction(raw['box'],a['box'])))
                 candidates[i].append(dict(box=list(raw['box']), model_box=list(raw['box']),
-                    confidence=raw['confidence'], kind='confirmed_text', prototype=-1,
+                    confidence=raw['confidence'], kind='confirmed_text', prototype=anchor['confirmed_prototype'],
                     evidence='同镜头连续高置信度原图YOLO观测且与本输入已确认同类实例几何一致', observed_frames=len(run)))
+
+
+def confirmed_text_support(proto, size):
+    """只截取已确认原型内的模型文字锚点，不把相邻完整图标扩进新框。"""
+    import cv2
+    import numpy as np
+    mask=proto['mask']; box=proto['box']; anchor=proto['anchor']
+    sx=mask.shape[1]/max(1,box[2]-box[0]);sy=mask.shape[0]/max(1,box[3]-box[1])
+    a,b,c,d=[round((v-box[j%2])*(sx if j%2==0 else sy)) for j,v in enumerate(anchor)]
+    a,b,c,d=max(0,a),max(0,b),min(mask.shape[1],c),min(mask.shape[0],d)
+    if c<=a or d<=b:
+        return np.zeros((size[1],size[0]),np.uint8)
+    return cv2.resize(mask[b:d,a:c],size,interpolation=cv2.INTER_NEAREST)
