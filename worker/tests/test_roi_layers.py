@@ -128,3 +128,22 @@ def test_gpu_oom_only_retries_once_and_keeps_checkpoint(tmp_path,monkeypatch):
     assert exc.value.code=='GPU_OOM' and len(calls)==2
     report=json.loads((tmp_path/'roi-report.json').read_text())
     assert len(report['任务'][0]['尝试'])==2 and not report['任务'][0]['通过']
+
+
+def test_clean_reference_rejects_other_watermark_layers(tmp_path,monkeypatch):
+    files,d,mask=fixture(tmp_path);setup(monkeypatch,tmp_path)
+    joint=mask.copy();joint[:4,:4]=255
+    for p in files:cv2.imwrite(str(tmp_path/'masks'/p.name),joint)
+    captured=[]
+    class CheckReferences:
+        def __init__(self,images,masks):captured.extend(masks)
+        def restore(self,original,mask,repair):return repair
+    monkeypatch.setattr(roi_layers,'CleanReferences',CheckReferences)
+    def model(args,**kw):
+        frames=Path(args[args.index('--video')+1]);out=Path(args[args.index('--output')+1])/'frames/frames';out.mkdir(parents=True)
+        for p in frames.glob('*.png'):cv2.imwrite(str(out/p.name),cv2.imread(str(p)))
+    monkeypatch.setattr(roi_layers,'run',model)
+    # 本测试只观察参考禁区；全局覆盖会因为故意没有施工的另一层而拒绝。
+    with pytest.raises(PipelineError) as exc:roi_inpaint.execute(tmp_path,files,d,cfg=roi_inpaint.ROISettings(sequential_layers=True,minimum_context=96))
+    assert exc.value.code=='ROI_INCOMPLETE'
+    assert captured and all(m[:4,:4].all() for m in captured)

@@ -145,6 +145,8 @@ def execute_one(args):
         from worker.model_tracks_v7 import build as build_tracks
         if args.enhance_detection or args.tiled_detection or args.flipped_detection or args.coverage_reference:
             raise PipelineError("CONFIG_INVALID","v7掩膜策略禁止混用后续版本检测增强或覆盖合并")
+    if args.mask_source == "recall":
+        from worker.detection_recall import build as build_tracks
     work.mkdir(parents=True,exist_ok=True);output.mkdir(parents=True,exist_ok=True)
     phase='准备';timings={};events=[]
     def log(message):
@@ -289,7 +291,7 @@ def main():
     p.add_argument('--flipped-detection',action='store_true')
     p.add_argument('--inpaint-mode',choices=['roi','legacy-full-frame'],default='roi')
     p.add_argument('--coverage-reference',type=Path)
-    p.add_argument('--mask-source',choices=['current','v7'],default='current')
+    p.add_argument('--mask-source',choices=['current','v7','recall'],default='current')
     p.add_argument('--mask-reference',type=Path)
     p.add_argument('--roi-layered',action='store_true')
     p.add_argument('--roi-context-ratio',type=float,default=.25)

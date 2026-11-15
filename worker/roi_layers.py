@@ -85,7 +85,7 @@ def execute(work,files,detected,log,cfg):
                         predicted=sorted((task/'out/frames/frames').glob('*.png'))
                         if len(predicted)!=(2 if singleton else right-left):raise PipelineError('ROI_INCOMPLETE','逐层ROI输出帧数缺失，禁止原帧回退')
                         references=CleanReferences([roi.crop(cv2.imread(str(current[j])),box) for j in refs],
-                                                   [roi.crop(masks[j],box,True) for j in refs])
+                                                   [roi.crop(cv2.imread(str(work/'masks'/files[j].name),0),box,True) for j in refs])
                         maximum=0.;staged=task/'staged';staged.mkdir()
                         # 先完整核验，再提交；失败尝试不得修改覆盖记录或已通过窗口。
                         for j in range(left,right):

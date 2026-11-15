@@ -218,8 +218,17 @@ def learn_logo_prototypes(files,rows,labels,prototypes,cfg,fps,scenes=None):
                    whole_feature=full,examples=examples[::max(1,len(examples)//5)],
                    samples=len(chosen),evidence='多帧YOLO图形印证的本输入时域模板')
         images=[patch(cv2.imread(str(files[p['frame']])),p['box'],(w,h)) for p in chosen]
+        if getattr(cfg,'complete_component_support',False):
+            from .detection_recall import complete_prototype
+            complete=complete_prototype(files,chosen,seed,cfg)
+            if complete:
+                proto.update(complete)
+                images=[patch(cv2.imread(str(files[p['frame']])),projected_box(proto,p['model_box']),
+                              (proto['mask'].shape[1],proto['mask'].shape[0])) for p in chosen]
+                mask=proto['mask']
         proto['alpha']=learn_opacity(images,mask,cfg.minimum_template_frames)
         prototypes.append(proto)
+        box=proto['box']
         # 同一图形中的模型文字部件可作为替代锚点；仍需完整图形模板复核。
         seed_image=cv2.imread(str(files[seed['frame']]))
         for raw in rows[seed['frame']]['boxes']:
@@ -333,8 +342,18 @@ def build(files,scenes,rows,prior,labels,root,fps=30,settings=None,check=lambda:
     prototypes=learn_text_prototypes(files,rows,prior,labels,cfg,fps,scenes)
     candidates=[]
     for i,file in enumerate(files):
-        check();candidates.append(candidates_for_frame(cv2.imread(str(file)),rows[i],prototypes,labels,cfg))
+        check();image=cv2.imread(str(file))
+        points=candidates_for_frame(image,rows[i],prototypes,labels,cfg)
+        if getattr(cfg,'complete_component_support',False) and i%cfg.recall_stride==0:
+            from .detection_recall import template_recall
+            for p in template_recall(image,prototypes,cfg):
+                if not any(intersection_fraction(p['box'],q['box'])>.6 for q in points):points.append(p)
+        candidates.append(points)
     tracks=associate(candidates,scenes,fps,cfg)
+    if getattr(cfg,'complete_component_support',False):
+        # 全模板新增轨迹至少两次直接观测；镜头边界由associate独立建轨。
+        tracks=[t for t in tracks if not all(p.get('template_recall') or p.get('interpolated') for p in t['hints'])
+                or sum(not p.get('interpolated') for p in t['hints'])>=cfg.recall_min_observations]
     unconfirmed=[t for t in tracks if not reliable_graphic(t,cfg)]
     tracks=[t for t in tracks if reliable_graphic(t,cfg)]
     if not tracks:raise PipelineError('DETECTION_UNCERTAIN','逐帧YOLO未得到可验证的品牌轨迹')
