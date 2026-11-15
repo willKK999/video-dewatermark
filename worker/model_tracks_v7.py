@@ -22,6 +22,11 @@ class ModelTrackSettings:
     logo_vertical_padding: float = .2
     template_samples: int = 24
     support_radius: int = 3
+    temporal_text_fallback: bool = False
+    fallback_confidence: float = .8
+    fallback_observations: int = 3
+    fallback_overlap: float = .6
+    fallback_scale_ratio: float = 1.5
 
 
 def intersection_fraction(a,b):
@@ -157,6 +162,9 @@ def build(files,scenes,rows,prior,labels,root,fps=30,settings=None,check=lambda:
     candidates=[]
     for i,file in enumerate(files):
         check();candidates.append(candidates_for_frame(cv2.imread(str(file)),rows[i],prototypes,labels,cfg))
+    if cfg.temporal_text_fallback:
+        from .model_text_confirmation import restore_confirmed_text
+        restore_confirmed_text(candidates,rows,scenes,labels,cfg)
     tracks=associate(candidates,scenes,fps,cfg)
     if not tracks:raise PipelineError('DETECTION_UNCERTAIN','逐帧YOLO未得到可验证的品牌轨迹')
     prompts=root/'prompts';prompts.mkdir(exist_ok=True)
@@ -188,7 +196,7 @@ def build(files,scenes,rows,prior,labels,root,fps=30,settings=None,check=lambda:
     result=dict(schema='yolo-model-tracks-1',multitrack=True,hls=True,scenes=scenes,tracks=tracks,
                 hints=sorted([p for t in tracks for p in t['hints']],key=lambda p:(p['frame'],p['track_id'])),
                 settings=asdict(cfg),raw_model_boxes=sum(len(r['boxes']) for r in rows),
-                evidence='目标由逐帧YOLO可靠观测建立，短缺口仅在可靠前后观测间有界插值；文本需本输入模型/共识模板印证；不以全画面模板峰新增轨迹')
+                evidence='目标由逐帧YOLO可靠观测建立，短缺口仅在可靠前后观测间有界插值；文本需本输入模型/共识模板印证，显式文字兜底需同镜头连续高置信度且已确认实例几何一致；不以全画面模板峰新增轨迹')
     (root/'detections.json').write_text(json.dumps(json_native(result)))
     return result
 

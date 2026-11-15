@@ -298,7 +298,7 @@ def masks(root, files, detections, engine, check=lambda: None, budget=None, prog
 def validate_masks(root, files, detections, check=lambda: None, progress=None, mask_source="current"):
     """对已完成的 SAM 输出执行同一套完整覆盖及面积校验，供失败阶段续跑。"""
     if detections.get("schema") == "yolo-model-tracks-1":
-        if mask_source in {"v7", "recall"}:
+        if mask_source in {"v7", "v8", "recall"}:
             from .model_tracks_v7 import validate
             return validate(root, files, detections, check)
         from .model_tracks import validate

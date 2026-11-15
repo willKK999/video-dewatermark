@@ -26,10 +26,11 @@ def sample(root, mask):
     return file,d,base
 
 
-def test_v7_mask_keeps_original_support_and_seven_pixel_sam_intersection(tmp_path):
+@pytest.mark.parametrize("mask_source", ["v7", "v8"])
+def test_v7_mask_keeps_original_support_and_seven_pixel_sam_intersection(tmp_path, mask_source):
     sam=np.full((40,50),255,np.uint8)
     file,d,base=sample(tmp_path,sam)
-    vision.validate_masks(tmp_path,[file],d,mask_source='v7')
+    vision.validate_masks(tmp_path,[file],d,mask_source=mask_source)
     support=v7.place(base,[10,10,20,20],sam.shape)
     expected=support | (sam & cv2.dilate(support,np.ones((7,7),np.uint8)))
     assert np.array_equal(cv2.imread(str(tmp_path/'masks'/file.name),0),expected)

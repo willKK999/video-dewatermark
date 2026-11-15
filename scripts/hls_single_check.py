@@ -53,7 +53,7 @@ def prepare(source,work,expected,duration,context):
 
 
 def detect_all(frames,output,enhance=False,tiles=False,flips=False,mask_source="current"):
-    run([os.environ['DETECT_PYTHON'],'-m',('scripts.hls_candidates_v7' if mask_source=='v7' else 'scripts.hls_candidates'),'--frames',frames,'--output',output,
+    run([os.environ['DETECT_PYTHON'],'-m',('scripts.hls_candidates_v7' if mask_source in {'v7','v8'} else 'scripts.hls_candidates'),'--frames',frames,'--output',output,
          *(['--enhance'] if enhance else []),*(['--tiles'] if tiles else []),*(['--flips'] if flips else [])],timeout=1800)
     return read(output)
 
@@ -141,8 +141,12 @@ def verify(work,video,files,detected,prior,labels,core,fps,output,enhance=False,
 def execute_one(args):
     started=time.monotonic();work=args.work.resolve();output=args.output.resolve()
     build_tracks=build
-    if args.mask_source == "v7":
+    if args.mask_source in {"v7", "v8"}:
         from worker.model_tracks_v7 import build as build_tracks
+        if args.mask_source == "v8":
+            from functools import partial
+            from worker.model_tracks_v7 import ModelTrackSettings as FrozenSettings
+            build_tracks=partial(build_tracks,settings=FrozenSettings(temporal_text_fallback=True))
         if args.enhance_detection or args.tiled_detection or args.flipped_detection or args.coverage_reference:
             raise PipelineError("CONFIG_INVALID","v7掩膜策略禁止混用后续版本检测增强或覆盖合并")
     if args.mask_source == "recall":
@@ -296,7 +300,7 @@ def main():
     p.add_argument('--flipped-detection',action='store_true')
     p.add_argument('--inpaint-mode',choices=['roi','legacy-full-frame'],default='roi')
     p.add_argument('--coverage-reference',type=Path)
-    p.add_argument('--mask-source',choices=['current','v7','recall'],default='current')
+    p.add_argument('--mask-source',choices=['current','v7','v8','recall'],default='current')
     p.add_argument('--mask-reference',type=Path)
     p.add_argument('--roi-layered',action='store_true')
     p.add_argument('--roi-context-ratio',type=float,default=.25)
