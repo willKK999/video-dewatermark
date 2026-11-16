@@ -28,6 +28,11 @@ class Settings:
     minimum_track_seconds: float = .4
     minimum_observations: int = 3
     maximum_gap_seconds: float = .6
+    association_iou: float = .4
+    dominant_text_fraction: float = .75
+    static_text_seconds: float = 2.
+    static_position_jitter: float = .3
+    moving_position_jitter: float = 1e6
     text_padding: int = 2
     subtitle_padding: int = 4
     subtitle_overlap_fraction: float = .05
@@ -35,6 +40,10 @@ class Settings:
     flow_scale: float = .5
     flow_window: int = 21
     flow_levels: int = 3
+    flow_pyr_scale: float = .5
+    flow_iterations: int = 3
+    flow_poly_n: int = 5
+    flow_poly_sigma: float = 1.2
     ring_radius: int = 24
     flow_min_pixels: int = 12
     background_min_motion: float = .8
@@ -77,7 +86,10 @@ def rectangle(box, shape, padding=0):
 def text_tracks(rows, scenes, cfg):
     base = ExperimentalSettings(stride=cfg.stride, maximum_gap_seconds=cfg.maximum_gap_seconds,
                                 minimum_duration_seconds=cfg.minimum_track_seconds,
-                                minimum_observations=cfg.minimum_observations)
+                                minimum_observations=cfg.minimum_observations, association_iou=cfg.association_iou,
+                                ocr_dominant_text_fraction=cfg.dominant_text_fraction,
+                                ocr_minimum_duration_seconds=cfg.static_text_seconds,
+                                ocr_position_jitter=cfg.static_position_jitter)
     accepted, rejected = associate_candidates(rows, scenes, cfg.fps, base)
     # 已通过v9严格稳定门控的文字为种子；长轨迹允许自身平滑移动。
     seeds = {normalize_text(p['text']) for t in accepted for p in t['observations']}
@@ -94,7 +106,8 @@ def text_tracks(rows, scenes, cfg):
     # 用同一关联器再次生成稠密框；只移除位置抖动/两秒门槛，保留逐轨文本稳定和最低生命周期。
     moving = ExperimentalSettings(stride=cfg.stride, maximum_gap_seconds=cfg.maximum_gap_seconds,
         minimum_duration_seconds=cfg.minimum_track_seconds, minimum_observations=cfg.minimum_observations,
-        ocr_minimum_duration_seconds=cfg.minimum_track_seconds, ocr_position_jitter=1e6)
+        ocr_minimum_duration_seconds=cfg.minimum_track_seconds, ocr_position_jitter=cfg.moving_position_jitter,
+        association_iou=cfg.association_iou,ocr_dominant_text_fraction=cfg.dominant_text_fraction)
     brand_rows={k:[p for p in v if known(p.get('text',''))] for k,v in rows.items()}
     tracks, short = associate_candidates(brand_rows, scenes, cfg.fps, moving)
     # 非稳定词汇按实际OCR观测存活；仅填相邻采样间隔，不跨句或向镜头外延伸。
@@ -251,7 +264,7 @@ def merge(args,cfg):
     for a,b in scenes:
         for i in range(a,b-cfg.stride,cfg.stride):
             j=i+cfg.stride
-            flow=cv2.calcOpticalFlowFarneback(image(i),image(j),None,.5,cfg.flow_levels,cfg.flow_window,3,5,1.2,0)
+            flow=cv2.calcOpticalFlowFarneback(image(i),image(j),None,cfg.flow_pyr_scale,cfg.flow_levels,cfg.flow_window,cfg.flow_iterations,cfg.flow_poly_n,cfg.flow_poly_sigma,0)
             for k,t in tracks.items():
                 if i not in t['frames'] or j not in t['frames']: continue
                 x=cv2.imread(str(args.sam/'raw-object-masks'/k/files[i].name),0)

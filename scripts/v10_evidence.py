@@ -73,7 +73,18 @@ def main():
             [label+' 原帧','原始SAM对象','过滤后同对象','扣除部分']).save(ev/f'已知问题-{label}.jpg',quality=97)
         checks.append(dict(label=label,object=key,frame=i,original=int(np.count_nonzero(raw)),retained=int(np.count_nonzero(kept)),
                            removed=int(np.count_nonzero(raw&~kept))))
-    (dest/'evidence-statistics.json').write_text(json.dumps(dict(sources=sources,sampling=sampling,known=checks,seconds=time.monotonic()-started),ensure_ascii=False,indent=2))
+    motion=json.loads((root/'motion-audit.json').read_text())
+    trackdata=json.loads((args.sam/'metrics.json').read_text())['tracks']
+    motion_checks=[]
+    for key,decision in motion.items():
+        if not decision['rejected']: continue
+        indices=trackdata[key]['frames']
+        i=max(indices,key=lambda j:np.count_nonzero(mask(args.sam/'raw-object-masks'/key,j)))
+        im=image(i);raw=mask(args.sam/'raw-object-masks'/key,i)
+        panel([im,overlay(im,raw),overlay(im,mask(root/'masks',i))],
+              [f'{key} {i/30:.2f}秒','被运动规则拒绝的原对象','v10最终联合']).save(ev/f'运动拒绝-{key}.jpg',quality=96)
+        motion_checks.append(dict(object=key,frame=i,consistency=decision['consistency']))
+    (dest/'evidence-statistics.json').write_text(json.dumps(dict(sources=sources,sampling=sampling,known=checks,motion_checks=motion_checks,seconds=time.monotonic()-started),ensure_ascii=False,indent=2))
     print('证据生成完成',flush=True)
 
 
