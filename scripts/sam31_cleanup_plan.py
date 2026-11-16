@@ -10,7 +10,7 @@ VERSIONS=('v1','v2','v3','v4','v5','v6')
 def eligible(path):
     relative=path.relative_to(ROOT)
     dirs=relative.parts[1:-1]
-    return (relative.parts[0] in VERSIONS and path.suffix=='.png'
+    return (relative.parts[0] in VERSIONS and path.suffix=='.png' and path.stem.isdigit()
             and any(x in dirs for x in ('composite','encoded','detail'))
             and not any('mask' in x or x=='evidence' for x in dirs)
             and path.is_file() and not path.is_symlink())
