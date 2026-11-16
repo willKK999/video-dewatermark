@@ -9,7 +9,7 @@ from worker.roi_inpaint import ROISettings
 
 def test_distant_regions_are_not_merged_and_masks_unchanged():
     mask=np.zeros((400,600),np.uint8);mask[20:60,20:100]=255;mask[280:330,420:540]=255;copy=mask.copy()
-    jobs=plan(mask,36,ROISettings(context_ratio=.75,minimum_context=96),SpatialSettings())
+    jobs=plan(mask,36,ROISettings(context_ratio=.75,minimum_context=96),SpatialSettings(minimum_width=128,minimum_height=128))
     assert len(jobs)==2 and np.array_equal(copy,mask)
     assert np.array_equal(np.bitwise_or.reduce([j['ownership'] for j in jobs]),mask)
 
@@ -40,7 +40,7 @@ def test_spatial_tasks_commit_only_owned_pixels_and_cover_all(tmp_path,monkeypat
     for p in files:
         for folder in ['masks','layer-00/masks']:cv2.imwrite(str(tmp_path/folder/p.name),mask)
     # 此样例只验证原生写回域与最终覆盖，模型返回不同颜色。
-    (tmp_path/'spatial-roi.json').write_text(json.dumps(asdict(SpatialSettings(dilation_pixels=0,merge_gap_pixels=0))))
+    (tmp_path/'spatial-roi.json').write_text(json.dumps(asdict(SpatialSettings(dilation_pixels=0,merge_gap_pixels=0,minimum_width=64,minimum_height=64,fixed_context_pixels=16))))
     class Ref:
         def __init__(self,*args):pass
         def restore(self,original,mask,repair):return repair
@@ -58,3 +58,28 @@ def test_spatial_tasks_commit_only_owned_pixels_and_cover_all(tmp_path,monkeypat
         old=cv2.imread(str(p));new=cv2.imread(str(tmp_path/'composite'/p.name))
         assert np.array_equal(old[mask==0],new[mask==0])
         assert np.all(new[mask>0]==old[mask>0]+30)
+
+
+def test_minimum_context_size_shifts_inward_at_boundary():
+    mask=np.zeros((1280,720),np.uint8);mask[2:30,3:50]=255
+    jobs=plan(mask,124,ROISettings(context_ratio=.75,minimum_context=96),SpatialSettings())
+    assert len(jobs)==1 and jobs[0]['box']==[0,0,512,512]
+    mask[:]=0;mask[-30:,-50:]=255
+    jobs=plan(mask,124,ROISettings(context_ratio=.75,minimum_context=96),SpatialSettings())
+    a,b,c,d=jobs[0]['box'];assert c==720 and d==1280 and c-a>=512 and d-b>=512
+
+
+def test_expanded_overlap_merges_without_near_core_gap():
+    mask=np.zeros((1280,720),np.uint8);mask[100:120,100:120]=255;mask[360:380,360:380]=255
+    jobs=plan(mask,124,ROISettings(context_ratio=.75,minimum_context=96),SpatialSettings(merge_gap_pixels=0))
+    assert len(jobs)==1
+    assert padded_area(jobs[0]['box'])<=708480
+
+
+def test_wide_jobs_remain_large_but_area_limited():
+    mask=np.zeros((1280,720),np.uint8);mask[10:120,10:260]=255;mask[450:750,120:620]=255
+    jobs=plan(mask,124,ROISettings(context_ratio=.75,minimum_context=96),SpatialSettings())
+    for row in jobs:
+        a,b,c,d=row['box'];assert c-a>=512 and d-b>=512
+        assert padded_area(row['box'])<=708480
+    assert np.array_equal(np.bitwise_or.reduce([row['ownership'] for row in jobs]),mask)
