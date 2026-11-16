@@ -16,3 +16,5 @@ python -m worker.sam31_masks --frames /输入帧目录 --output /全新输出目
 官方代码固定版本：`eef6839bcfc3458dd52ea80535dc6bd62aea86b1`。
 参考：https://github.com/facebookresearch/sam3/blob/main/examples/sam3.1_video_predictor_example.ipynb 。
 cleanplate只参考其通用文字概念选择，不引入其ComfyUI和补画服务：https://github.com/qilaidev/cleanplate 。
+
+该固定官方版本的共用会话接口会传入 `offload_state_to_cpu=False`，但multiplex模型的 `init_state` 没有这个参数。适配器通过签名检测仅移除这个不支持且关闭的选项；若请求开启则明确拒绝，不假装提供CPU状态卸载。CPU视频帧卸载保持开启。文字在窗口首帧初始化，传播明确只向前，避免官方默认双向路径重复返回首帧。此兼容在运行前静态检查发现并补充行为测试。

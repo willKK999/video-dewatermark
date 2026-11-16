@@ -81,3 +81,16 @@ def test_large_object_is_rejected_without_splitting(tmp_path):
     assert data['layers'] == []
     assert all(r['sam_pixels']==0 for r in data['frames'])
     assert '20%' in data['tracks']['w000000-p0-o1']['rejection']
+
+
+def test_official_session_api_compatibility_rejects_unsupported_offload():
+    from types import SimpleNamespace
+    from worker.sam31_masks import adapt_session_api
+    class Model:
+        def init_state(self, resource_path, offload_video_to_cpu=False):
+            return resource_path, offload_video_to_cpu
+    predictor=SimpleNamespace(model=Model())
+    adapt_session_api(predictor)
+    assert predictor.model.init_state(resource_path='frames',offload_video_to_cpu=True,offload_state_to_cpu=False)==('frames',True)
+    with pytest.raises(ValueError,match='不支持'):
+        predictor.model.init_state(resource_path='frames',offload_state_to_cpu=True)

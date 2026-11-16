@@ -3,6 +3,7 @@ import argparse
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 import hashlib
+import inspect
 import json
 from pathlib import Path
 import tempfile
@@ -32,6 +33,24 @@ class Config:
             raise ValueError("持续帧数、窗口和对象数无效")
         if not 0 < self.max_layer_fraction <= 0.2:
             raise ValueError("不得放宽每层20%面积保护")
+
+
+def adapt_session_api(predictor):
+    """兼容官方共用会话层向multiplex传入尚不支持的关闭选项。"""
+    model = getattr(predictor, 'model', None)
+    if model is None:
+        return
+    original = model.init_state
+    params = inspect.signature(original).parameters
+    if 'offload_state_to_cpu' in params or any(p.kind == p.VAR_KEYWORD for p in params.values()):
+        return
+
+    def init_state(*args, offload_state_to_cpu=False, **kwargs):
+        if offload_state_to_cpu:
+            raise ValueError('此模型版本不支持将跟踪状态卸载到CPU')
+        return original(*args, **kwargs)
+
+    model.init_state = init_state
 
 
 def digest(path):
@@ -98,6 +117,7 @@ def run(frames_dir, output, checkpoint, config, baseline=None, predictor=None):
             checkpoint_path=str(checkpoint), use_fa3=False, compile=False, warm_up=False,
             max_num_objects=config.max_objects, default_output_prob_thresh=config.score_threshold,
             async_loading_frames=False)
+    adapt_session_api(predictor)
     load_seconds = time.perf_counter() - loaded
     timings, tracks, rows = [], {}, []
     raw = output / 'raw-object-masks'
@@ -119,7 +139,7 @@ def run(frames_dir, output, checkpoint, config, baseline=None, predictor=None):
                 try:
                     predictor.handle_request(dict(type='add_prompt', session_id=sid, frame_index=0,
                                                   text=prompt, output_prob_thresh=config.score_threshold))
-                    for response in predictor.handle_stream_request(dict(type='propagate_in_video', session_id=sid)):
+                    for response in predictor.handle_stream_request(dict(type='propagate_in_video', session_id=sid, propagation_direction='forward')):
                         idx = int(response['frame_index'])
                         if not 0 <= idx < end - start or idx in seen:
                             raise ValueError("模型返回重复或越界帧")
