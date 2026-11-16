@@ -2,7 +2,7 @@
   "dilation_pixels": 6,
   "merge_gap_pixels": 24,
   "maximum_crop_pixels": 708480,
-  "maximum_pixel_frames": 90685440,
+  "maximum_pixel_frames": 102021120,
   "minimum_width": 512,
   "minimum_height": 512,
   "fixed_context_pixels": 96

@@ -46,11 +46,12 @@ def execute(args):
     work=output/'run';work.mkdir()
     write(output/'worker-pid.json',dict(pid=os.getpid(),program=Path('/proc/self/comm').read_text().strip(),started_utc=time.strftime('%Y-%m-%d %H:%M:%S',time.gmtime())))
     frozen=Path(args.masks);baseline=read(args.baseline);cfg=frozen_profile(baseline)
-    times={};started=time.monotonic();budget=RecoveryBudget()
+    times={};started=time.monotonic();budget=None if args.continue_unpassed else RecoveryBudget()
     def log(message):
         line=time.strftime('%Y-%m-%d %H:%M:%S')+' '+message
         with (output/'progress.log').open('a') as f:f.write(line+'\n')
-        print(line,flush=True);budget.check(message)
+        print(line,flush=True)
+        if budget is not None:budget.check(message)
         # 已完成层之后，只保留后续计算仍需的当前层；不触碰输入、掩膜和媒体。
         m=re.search(r'逐层ROI 图层=(\d+) 完成',message)
         if m:
@@ -77,6 +78,7 @@ def execute(args):
                 from worker.spatial_roi import SpatialSettings
                 spatial=SpatialSettings(**read(args.spatial_config))
                 write(work/'spatial-roi.json',asdict(spatial))
+            if args.continue_unpassed:write(work/'inpaint-policy.json',dict(continue_unpassed=True,selection='minimum_seam_mae',seam_retries=cfg.seam_retries))
             files=sorted((work/'frames').glob('*.png'))
             if len(files)!=args.frames:raise ValueError('冻结输入帧数不符')
             verifier=VerifiedLayers(work/'layers.json',work/'detections.json');binding=[]
@@ -87,12 +89,12 @@ def execute(args):
                 if not np.array_equal(np.bitwise_or.reduce(layers),actual):raise ValueError('联合掩膜与冻结图层不严格相等')
                 binding.append(dict(frame=i,source=digest(p),mask=digest(work/'masks'/p.name)))
             write(output/'input-binding.json',dict(source_sha256=digest(args.source),frames=binding,layers_sha256=digest(work/'layers.json')))
-            write(output/'profile.json',dict(历史报告摘要=digest(args.baseline),ROI=asdict(cfg),窗口=settings.window_frames,重叠=settings.overlap_frames,接缝上限=settings.overlap_mae_limit,每层面积上限=settings.mask_fraction_limit,CRF=settings.video_crf,错误恢复预算=1))
+            write(output/'profile.json',dict(历史报告摘要=digest(args.baseline),ROI=asdict(cfg),窗口=settings.window_frames,重叠=settings.overlap_frames,接缝上限=settings.overlap_mae_limit,每层面积上限=settings.mask_fraction_limit,CRF=settings.video_crf,错误恢复预算=cfg.seam_retries if args.continue_unpassed else 1,未过块继续=args.continue_unpassed))
             return files
         files=step('冻结输入与掩膜核验',prepare)
         summary=step('逐层ROI补画',lambda:roi_inpaint.execute(work,files,read(work/'detections.json'),log,cfg))
         def encode():
-            silent=work/'core-video.mp4';audio=work/'core-audio.m4a';video=output/'第1块.mp4'
+            silent=work/'core-video.mp4';audio=work/'core-audio.m4a';video=output/('第1块-含未过块.mp4' if summary.get('未过块') else '第1块.mp4')
             metadata=media.probe(args.source);vs=next(s for s in metadata['streams'] if s['codec_type']=='video')
             from fractions import Fraction
             fps=float(Fraction(vs['avg_frame_rate']));duration=len(files)/fps
@@ -104,7 +106,7 @@ def execute(args):
             run(['ffmpeg','-v','error','-i',video,'-f','null','-'])
             return dict(文件=str(video),sha256=digest(video),规格=media.probe(video),音频压缩内容一致=True)
         result=step('编码与音频完整性',encode)
-        write(output/'render.json',dict(模型完成=True,通过=False,尚待验收=True,帧数=len(files),ROI=summary,视频=result,阶段耗时秒=times,总耗时秒=time.monotonic()-started))
+        write(output/'render.json',dict(模型完成=True,通过=False,尚待验收=True,含未过块=bool(summary.get('未过块')),帧数=len(files),ROI=summary,视频=result,阶段耗时秒=times,总耗时秒=time.monotonic()-started))
         log(f'{len(files)}帧补画编码完成，等待独立验收；未宣称通过')
     except Exception as exc:
         write(output/'failure.json',dict(模型完成=False,通过=False,错误码=getattr(exc,'code',type(exc).__name__),说明=str(exc)[:500],阶段耗时秒=times))
@@ -117,4 +119,5 @@ if __name__=='__main__':
     for name in ['source','masks','baseline','output']:p.add_argument('--'+name,required=True)
     p.add_argument('--frames',type=int,default=780)
     p.add_argument('--spatial-config')
+    p.add_argument('--continue-unpassed',action='store_true')
     execute(p.parse_args())

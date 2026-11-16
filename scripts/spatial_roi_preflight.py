@@ -25,11 +25,12 @@ def execute(args):
             events=[e['interval'] for e in animation['layers'].get(str(k),[]) if a<=e['interval'][0]<b]
             for left,right in planned_windows(a,b,settings.window_frames,settings.overlap_frames,events,acfg):
                 footprint=np.bitwise_or.reduce(masks[left:right])
-                rows=plan(footprint,right-left+settings.overlap_frames,cfg,spatial)
+                budget_frames=right-left+settings.overlap_frames*(3 if args.all_v6_retries else 1)
+                rows=plan(footprint,budget_frames,cfg,spatial)
                 for r in rows:
                     x,y,c,d=r['box']
                     if c-x<min(spatial.minimum_width,footprint.shape[1]) or d-y<min(spatial.minimum_height,footprint.shape[0]):raise ValueError('ROI未满足最小参考画面尺寸')
-                if rows:records.append(dict(layer=k,start=left,end=right,previous_whole_crop_pixels=padded_area(padded_box(bbox(footprint),footprint.shape,cfg)),parts=[dict(box=r['box'],pixels=padded_area(r['box']),budget_pixel_frames=padded_area(r['box'])*(right-left+settings.overlap_frames)) for r in rows]))
+                if rows:records.append(dict(layer=k,start=left,end=right,previous_whole_crop_pixels=padded_area(padded_box(bbox(footprint),footprint.shape,cfg)),parts=[dict(box=r['box'],pixels=padded_area(r['box']),budget_pixel_frames=padded_area(r['box'])*budget_frames) for r in rows]))
     write_json(args.output,dict(passed=True,frames=len(files),settings=asdict(spatial),windows=records,tasks=sum(len(r['parts']) for r in records),maximum_crop_pixels=max(p['pixels'] for r in records for p in r['parts']),maximum_pixel_frames=max(p['budget_pixel_frames'] for r in records for p in r['parts']),seconds=time.monotonic()-start,mask_manifest_sha256=digest(root/'layers.json')))
     print('空间ROI预检通过；冻结掩膜未重算；全部像素恰好分配一次',flush=True)
 
@@ -37,4 +38,5 @@ def execute(args):
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__)
     for name in ['masks','baseline','config','output']:p.add_argument('--'+name,type=Path,required=True)
+    p.add_argument('--all-v6-retries',action='store_true')
     execute(p.parse_args())
