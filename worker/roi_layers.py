@@ -24,9 +24,18 @@ def seam_variants(start,end,scene_start,scene_end,settings,cfg):
 
 
 def execute(work,files,detected,log,cfg):
+    if (work/'spatial-roi.json').exists():
+        from .roi_spatial_layers import execute as spatial_execute
+        return spatial_execute(work,files,detected,log,cfg)
     settings=HLSSettings.from_env();started=time.monotonic()
     shape=cv2.imread(str(files[0])).shape[:2];pixels=shape[0]*shape[1]
     layers=json.loads((work/'layers.json').read_text())['layers']
+    animation_path=work/'animation-events.json'
+    animation_plan=json.loads(animation_path.read_text()) if animation_path.exists() else None
+    if animation_plan:
+        from .watermark_groups import AnimationSettings,planned_windows
+        animation_cfg=AnimationSettings(**animation_plan['settings'])
+        if animation_cfg.maximum_window_frames>cfg.maximum_frames:raise ValueError('动画窗口不得超过既有ROI最大帧数')
     coverage=work/'roi-coverage';coverage.mkdir()
     for p in files:roi.atomic_png(coverage/p.name,np.zeros(shape,np.uint8))
     current=files;records=[];layer_records=[]
@@ -49,7 +58,11 @@ def execute(work,files,detected,log,cfg):
         completed=set();log(f'逐层ROI 图层={k+1}/{len(layers)} 开始')
         for scene_start,scene_end in detected['scenes']:
             refs=np.unique(np.linspace(scene_start,scene_end-1,min(24,scene_end-scene_start),dtype=int))
-            for start,end in windows(scene_start,scene_end,settings.window_frames,settings.overlap_frames):
+            schedule=list(windows(scene_start,scene_end,settings.window_frames,settings.overlap_frames))
+            if animation_plan:
+                events=[e['interval'] for e in animation_plan['layers'].get(str(k),[]) if scene_start<=e['interval'][0]<scene_end]
+                schedule=planned_windows(scene_start,scene_end,settings.window_frames,settings.overlap_frames,events,animation_cfg)
+            for start,end in schedule:
                 footprint=np.bitwise_or.reduce(masks[start:end]);rect=roi.bbox(footprint)
                 if rect is None:continue
                 box=roi.padded_box(rect,shape,cfg);a,b,c,d=box

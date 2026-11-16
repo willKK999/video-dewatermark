@@ -147,3 +147,20 @@ def test_clean_reference_rejects_other_watermark_layers(tmp_path,monkeypatch):
     with pytest.raises(PipelineError) as exc:roi_inpaint.execute(tmp_path,files,d,cfg=roi_inpaint.ROISettings(sequential_layers=True,minimum_context=96))
     assert exc.value.code=='ROI_INCOMPLETE'
     assert captured and all(m[:4,:4].all() for m in captured)
+
+
+def test_animation_plan_changes_outer_window_only(tmp_path,monkeypatch):
+    from dataclasses import asdict
+    from worker.watermark_groups import AnimationSettings
+    files,d,_=fixture(tmp_path);setup(monkeypatch,tmp_path)
+    monkeypatch.setenv('HLS_WINDOW_FRAMES','5');monkeypatch.setenv('HLS_OVERLAP_FRAMES','2')
+    (tmp_path/'animation-events.json').write_text(json.dumps(dict(settings=asdict(AnimationSettings()),layers={'0':[dict(interval=[0,6])]})))
+    calls=[]
+    def model(args,**kwargs):
+        frames=Path(args[args.index('--video')+1]);out=Path(args[args.index('--output')+1])/'frames/frames';out.mkdir(parents=True)
+        assert args[args.index('--subvideo_length')+1]=='5'
+        calls.append(len(list(frames.glob('*.png'))))
+        for p in frames.glob('*.png'):cv2.imwrite(str(out/p.name),cv2.imread(str(p)))
+    monkeypatch.setattr(roi_layers,'run',model)
+    result=roi_inpaint.execute(tmp_path,files,d,cfg=roi_inpaint.ROISettings(sequential_layers=True))
+    assert calls==[6] and result['覆盖核验通过']

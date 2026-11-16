@@ -1,0 +1,6 @@
+{
+  "dilation_pixels": 6,
+  "merge_gap_pixels": 24,
+  "maximum_crop_pixels": 708480,
+  "maximum_pixel_frames": 19229184
+}

@@ -1,7 +1,7 @@
 """只补画已冻结的逐帧图层；模型配置从历史报告读取，不重新检测或修改掩膜。"""
 import argparse
 from dataclasses import asdict
-import hashlib,json,re,shutil,time
+import hashlib,json,re,shutil,time,os
 from pathlib import Path
 import cv2
 import numpy as np
@@ -44,6 +44,7 @@ class RecoveryBudget:
 def execute(args):
     output=Path(args.output);output.mkdir(parents=True,exist_ok=True)
     work=output/'run';work.mkdir()
+    write(output/'worker-pid.json',dict(pid=os.getpid(),program=Path('/proc/self/comm').read_text().strip(),started_utc=time.strftime('%Y-%m-%d %H:%M:%S',time.gmtime())))
     frozen=Path(args.masks);baseline=read(args.baseline);cfg=frozen_profile(baseline)
     times={};started=time.monotonic();budget=RecoveryBudget()
     def log(message):
@@ -70,6 +71,12 @@ def execute(args):
             original=read(binding_file)
             for name in ['frames','masks']:(work/name).symlink_to((frozen/name).resolve(),target_is_directory=True)
             for name in ['detections.json','layers.json']:shutil.copy2(frozen/name,work/name)
+            if (frozen/'animation-events.json').exists():
+                shutil.copy2(frozen/'animation-events.json',work/'animation-events.json')
+            if args.spatial_config:
+                from worker.spatial_roi import SpatialSettings
+                spatial=SpatialSettings(**read(args.spatial_config))
+                write(work/'spatial-roi.json',asdict(spatial))
             files=sorted((work/'frames').glob('*.png'))
             if len(files)!=args.frames:raise ValueError('冻结输入帧数不符')
             verifier=VerifiedLayers(work/'layers.json',work/'detections.json');binding=[]
@@ -98,7 +105,7 @@ def execute(args):
             return dict(文件=str(video),sha256=digest(video),规格=media.probe(video),音频压缩内容一致=True)
         result=step('编码与音频完整性',encode)
         write(output/'render.json',dict(模型完成=True,通过=False,尚待验收=True,帧数=len(files),ROI=summary,视频=result,阶段耗时秒=times,总耗时秒=time.monotonic()-started))
-        log('780帧补画编码完成，等待独立验收；未宣称通过')
+        log(f'{len(files)}帧补画编码完成，等待独立验收；未宣称通过')
     except Exception as exc:
         write(output/'failure.json',dict(模型完成=False,通过=False,错误码=getattr(exc,'code',type(exc).__name__),说明=str(exc)[:500],阶段耗时秒=times))
         log('补画失败，停止；错误码='+getattr(exc,'code',type(exc).__name__))
@@ -109,4 +116,5 @@ if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__)
     for name in ['source','masks','baseline','output']:p.add_argument('--'+name,required=True)
     p.add_argument('--frames',type=int,default=780)
+    p.add_argument('--spatial-config')
     execute(p.parse_args())
