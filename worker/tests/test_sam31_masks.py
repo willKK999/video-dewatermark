@@ -94,3 +94,13 @@ def test_official_session_api_compatibility_rejects_unsupported_offload():
     assert predictor.model.init_state(resource_path='frames',offload_video_to_cpu=True,offload_state_to_cpu=False)==('frames',True)
     with pytest.raises(ValueError,match='不支持'):
         predictor.model.init_state(resource_path='frames',offload_state_to_cpu=True)
+
+
+def test_inference_batch_only_changes_resource_batch_sizes():
+    from types import SimpleNamespace
+    from worker.sam31_masks import configure_inference_batches
+    model=SimpleNamespace(batched_grounding_batch_size=16,postprocess_batch_size=16,max_num_objects=16,score_threshold_detection=.4)
+    configure_inference_batches(SimpleNamespace(model=model),Config(enabled=True,inference_batch_size=1))
+    assert model.batched_grounding_batch_size == model.postprocess_batch_size == 1
+    assert model.max_num_objects == 16 and model.score_threshold_detection == .4
+    with pytest.raises(ValueError):Config(inference_batch_size=0)

@@ -22,6 +22,7 @@ class Config:
     min_track_fraction: float = 0.15
     window_frames: int = 120
     max_objects: int = 16
+    inference_batch_size: int = 1
     max_layer_fraction: float = 0.2
 
     def __post_init__(self):
@@ -29,7 +30,7 @@ class Config:
             raise ValueError("文字提示不能为空")
         if not 0 <= self.score_threshold <= 1 or not 0 < self.min_track_fraction <= 1:
             raise ValueError("阈值必须为有效比例")
-        if self.min_track_frames < 1 or self.window_frames < self.min_track_frames or self.max_objects < 1:
+        if self.min_track_frames < 1 or self.window_frames < self.min_track_frames or self.max_objects < 1 or self.inference_batch_size < 1:
             raise ValueError("持续帧数、窗口和对象数无效")
         if not 0 < self.max_layer_fraction <= 0.2:
             raise ValueError("不得放宽每层20%面积保护")
@@ -51,6 +52,17 @@ def adapt_session_api(predictor):
         return original(*args, **kwargs)
 
     model.init_state = init_state
+
+
+def configure_inference_batches(predictor, config):
+    """只控制资源批量，不改变分辨率、对象容量或语义筛选阈值。"""
+    model = getattr(predictor, 'model', None)
+    if model is None:
+        return
+    for name in ('batched_grounding_batch_size', 'postprocess_batch_size'):
+        if not hasattr(model, name):
+            raise ValueError('当前SAM3.1版本不支持所需资源批量配置')
+        setattr(model, name, config.inference_batch_size)
 
 
 def digest(path):
@@ -118,6 +130,7 @@ def run(frames_dir, output, checkpoint, config, baseline=None, predictor=None):
             max_num_objects=config.max_objects, default_output_prob_thresh=config.score_threshold,
             async_loading_frames=False)
     adapt_session_api(predictor)
+    configure_inference_batches(predictor, config)
     load_seconds = time.perf_counter() - loaded
     timings, tracks, rows = [], {}, []
     raw = output / 'raw-object-masks'
