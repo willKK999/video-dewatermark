@@ -1,0 +1,10 @@
+{
+  "enabled": false,
+  "prompts": ["watermark", "logo", "semi-transparent logo", "website url text"],
+  "score_threshold": 0.5,
+  "min_track_frames": 3,
+  "min_track_fraction": 0.15,
+  "window_frames": 120,
+  "max_objects": 16,
+  "max_layer_fraction": 0.2
+}
