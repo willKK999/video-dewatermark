@@ -28,3 +28,10 @@ def test_summary_writer_preserves_numpy_counts_and_box_iou(tmp_path):
     assert json.loads(p.read_text())==dict(pixels=17,passed=True)
     assert overlap([0,0,10,10],[0,0,10,10])==1
     assert overlap([0,0,10,10],[10,10,20,20])==0
+
+
+def test_raw_video_shape_has_exactly_three_channels_from_grayscale_mask(tmp_path):
+    import cv2
+    from scripts.compare_blue_residue import raw_frame_shape
+    p=tmp_path/'mask.png';cv2.imwrite(str(p),np.zeros((12,20),np.uint8))
+    assert raw_frame_shape(p)==(12,20,3)

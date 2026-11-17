@@ -5,8 +5,14 @@ import cv2,numpy as np
 from scripts.diagnose_watermark_residue import color_blue,write
 
 
+def raw_frame_shape(mask_path):
+    mask=cv2.imread(str(mask_path),cv2.IMREAD_GRAYSCALE)
+    if mask is None:raise ValueError('统计掩膜不可读')
+    return (*mask.shape,3)
+
+
 def execute(args):
-    base=args.masks;out=args.output;out.mkdir(parents=True,exist_ok=True);e=out/'蓝色统计证据';e.mkdir(exist_ok=True);files=sorted((base/'masks').glob('*.png'));n=len(files);shape=cv2.imread(str(files[0])).shape+(3,);fps=args.fps;selected={round(float(t)*fps) for t in args.times.split(',')}|set(range(0,n,round(fps*2)))|set(range(round(3.4*fps),round(5*fps),3));processes=[];rows=[];started=time.monotonic()
+    base=args.masks;out=args.output;out.mkdir(parents=True,exist_ok=True);e=out/'蓝色统计证据';e.mkdir(exist_ok=True);files=sorted((base/'masks').glob('*.png'));n=len(files);shape=raw_frame_shape(files[0]);fps=args.fps;selected={round(float(t)*fps) for t in args.times.split(',')}|set(range(0,n,round(fps*2)))|set(range(round(3.4*fps),round(5*fps),3));processes=[];rows=[];started=time.monotonic()
     for quality_path in args.quality:
         quality=json.loads(quality_path.read_text())
         for row in quality.get('实际掩膜全长闪烁候选',[]):
