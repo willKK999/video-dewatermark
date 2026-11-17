@@ -78,7 +78,9 @@ def execute(args):
                 from worker.spatial_roi import SpatialSettings
                 spatial=SpatialSettings(**read(args.spatial_config))
                 write(work/'spatial-roi.json',asdict(spatial))
-            if args.continue_unpassed:write(work/'inpaint-policy.json',dict(continue_unpassed=True,selection='minimum_seam_mae',seam_retries=cfg.seam_retries))
+            if args.continue_unpassed:
+                if args.model_timeout_seconds is not None and not 0<args.model_timeout_seconds<=840:raise ValueError('模型无输出保护不得超过840秒')
+                write(work/'inpaint-policy.json',dict(continue_unpassed=True,selection='minimum_seam_mae',seam_retries=cfg.seam_retries,model_timeout_seconds=args.model_timeout_seconds))
             files=sorted((work/'frames').glob('*.png'))
             if len(files)!=args.frames:raise ValueError('冻结输入帧数不符')
             verifier=VerifiedLayers(work/'layers.json',work/'detections.json');binding=[]
@@ -120,4 +122,5 @@ if __name__=='__main__':
     p.add_argument('--frames',type=int,default=780)
     p.add_argument('--spatial-config')
     p.add_argument('--continue-unpassed',action='store_true')
+    p.add_argument('--model-timeout-seconds',type=int)
     execute(p.parse_args())

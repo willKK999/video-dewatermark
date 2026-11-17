@@ -29,7 +29,8 @@ def execute(work,files,detected,log,cfg):
     settings=HLSSettings.from_env();started=time.monotonic()
     spatial=SpatialSettings(**json.loads((work/'spatial-roi.json').read_text()))
     policy_path=work/'inpaint-policy.json'
-    continue_unpassed=json.loads(policy_path.read_text()).get('continue_unpassed',False) if policy_path.exists() else False
+    policy=json.loads(policy_path.read_text()) if policy_path.exists() else {}
+    continue_unpassed=policy.get('continue_unpassed',False)
     shape=cv2.imread(str(files[0])).shape[:2];pixels=shape[0]*shape[1]
     layers=json.loads((work/'layers.json').read_text())['layers']
     animation_path=work/'animation-events.json'
@@ -99,8 +100,14 @@ def execute(work,files,detected,log,cfg):
                             if cfg.fp16:args.append('--fp16')
                             # 按实际像素帧工作量扩展保护，不限制整块总预算。
                             timeout=max(900,900*(right-left)/settings.window_frames)
+                            if policy.get('model_timeout_seconds'):timeout=min(timeout,policy['model_timeout_seconds'])
                             trial['超时秒']=timeout
-                            run(args,cwd=os.environ['PROPAINTER_ROOT'],timeout=timeout,stage='逐层ROI-ProPainter')
+                            heartbeat=[time.monotonic()]
+                            def check_model():
+                                if policy.get('model_timeout_seconds') and time.monotonic()-heartbeat[0]>=30:
+                                    log(f'逐层ROI 任务={row["任务"]} 尝试={attempt} 模型进程仍存活，正在计算')
+                                    heartbeat[0]=time.monotonic()
+                            run(args,check=check_model,cwd=os.environ['PROPAINTER_ROOT'],timeout=timeout,stage='逐层ROI-ProPainter')
                             predicted=sorted((task/'out/frames/frames').glob('*.png'))
                             if len(predicted)!=(2 if singleton else right-left):raise PipelineError('ROI_INCOMPLETE','逐层ROI输出帧数缺失，禁止原帧回退')
                             references=CleanReferences([roi.crop(cv2.imread(str(current[j])),box) for j in refs],
