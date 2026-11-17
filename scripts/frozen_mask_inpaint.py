@@ -78,6 +78,10 @@ def execute(args):
                 from worker.spatial_roi import SpatialSettings
                 spatial=SpatialSettings(**read(args.spatial_config))
                 write(work/'spatial-roi.json',asdict(spatial))
+            if getattr(args,'trusted_context_config',None):
+                from worker.trusted_context import ContextSettings
+                trusted=ContextSettings(**read(args.trusted_context_config))
+                write(work/'trusted-context.json',asdict(trusted))
             if args.continue_unpassed:
                 if args.model_timeout_seconds is not None and not 0<args.model_timeout_seconds<=840:raise ValueError('模型无输出保护不得超过840秒')
                 write(work/'inpaint-policy.json',dict(continue_unpassed=True,selection='minimum_seam_mae',seam_retries=cfg.seam_retries,model_timeout_seconds=args.model_timeout_seconds))
@@ -100,12 +104,12 @@ def execute(args):
             metadata=media.probe(args.source);vs=next(s for s in metadata['streams'] if s['codec_type']=='video')
             from fractions import Fraction
             fps=float(Fraction(vs['avg_frame_rate']));duration=len(files)/fps
-            run(['ffmpeg','-v','error','-y','-framerate',str(fps),'-i',work/'composite/%06d.png','-frames:v',str(len(files)),'-c:v','libx264','-preset','fast','-crf',str(settings.video_crf),'-threads','2','-pix_fmt','yuv420p',silent])
-            run(['ffmpeg','-v','error','-y','-i',args.source,'-map','0:a:0','-t',str(duration),'-c:a','copy',audio])
+            run(['ffmpeg','-nostdin','-v','error','-y','-framerate',str(fps),'-i',work/'composite/%06d.png','-frames:v',str(len(files)),'-c:v','libx264','-preset','fast','-crf',str(settings.video_crf),'-threads','2','-pix_fmt','yuv420p',silent])
+            run(['ffmpeg','-nostdin','-v','error','-y','-i',args.source,'-map','0:a:0','-t',str(duration),'-c:a','copy',audio])
             offset=float(vs.get('start_time',0))-float(metadata['format'].get('start_time',0))
-            run(['ffmpeg','-v','error','-y','-itsoffset',str(offset),'-i',silent,'-i',audio,'-map','0:v:0','-map','1:a:0','-c','copy','-movflags','+faststart',video])
+            run(['ffmpeg','-nostdin','-v','error','-y','-itsoffset',str(offset),'-i',silent,'-i',audio,'-map','0:v:0','-map','1:a:0','-c','copy','-movflags','+faststart',video])
             if audio_hash(args.source,duration)!=audio_hash(video):raise ValueError('原音频压缩内容不一致')
-            run(['ffmpeg','-v','error','-i',video,'-f','null','-'])
+            run(['ffmpeg','-nostdin','-v','error','-i',video,'-f','null','-'],timeout=600)
             return dict(文件=str(video),sha256=digest(video),规格=media.probe(video),音频压缩内容一致=True)
         result=step('编码与音频完整性',encode)
         write(output/'render.json',dict(模型完成=True,通过=False,尚待验收=True,含未过块=bool(summary.get('未过块')),帧数=len(files),ROI=summary,视频=result,阶段耗时秒=times,总耗时秒=time.monotonic()-started))
@@ -123,4 +127,5 @@ if __name__=='__main__':
     p.add_argument('--spatial-config')
     p.add_argument('--continue-unpassed',action='store_true')
     p.add_argument('--model-timeout-seconds',type=int)
+    p.add_argument('--trusted-context-config')
     execute(p.parse_args())
