@@ -2,14 +2,14 @@
 import json
 from pathlib import Path
 import cv2,numpy as np,pytest
-from worker import roi_layers,roi_inpaint
+from worker import roi_spatial_layers as roi_layers,roi_inpaint
 from worker.process import PipelineError
 from worker.tests.test_roi_inpaint import fixture
 
 
 class References:
     def __init__(self,*args):pass
-    def restore(self,original,mask,repair):return repair
+    def restore(self,original,mask,repair,**kwargs):return repair
 
 
 def setup(monkeypatch,tmp_path):
@@ -30,7 +30,7 @@ def test_layer_overlap_is_repainted_from_previous_layer(tmp_path,monkeypatch):
         assert args[args.index('--ref_stride')+1]=='20' and '--fp16' in args
         for p in sorted(frame_dir.glob('*.png')):
             image=cv2.imread(str(p));m=cv2.imread(str(mask_dir/p.name),0)
-            inputs.append(float(image[m>0].mean()));image[m>0]+=40;cv2.imwrite(str(out/p.name),image)
+            inputs.append(float(image[m>0].max()));image[m>0]+=40;cv2.imwrite(str(out/p.name),image)
     monkeypatch.setattr(roi_layers,'run',model)
     result=roi_inpaint.execute(tmp_path,files,d,cfg=roi_inpaint.ROISettings(sequential_layers=True,context_ratio=.75,minimum_context=96))
     assert result['实际图层数']==2 and result['覆盖核验通过']
@@ -137,7 +137,7 @@ def test_clean_reference_rejects_other_watermark_layers(tmp_path,monkeypatch):
     captured=[]
     class CheckReferences:
         def __init__(self,images,masks):captured.extend(masks)
-        def restore(self,original,mask,repair):return repair
+        def restore(self,original,mask,repair,**kwargs):return repair
     monkeypatch.setattr(roi_layers,'CleanReferences',CheckReferences)
     def model(args,**kw):
         frames=Path(args[args.index('--video')+1]);out=Path(args[args.index('--output')+1])/'frames/frames';out.mkdir(parents=True)

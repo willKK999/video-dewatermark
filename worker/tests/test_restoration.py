@@ -77,45 +77,6 @@ def test_unrelated_scene_references_are_rejected():
     assert np.array_equal(refs.restore(clean, mask, repair), repair)
 
 
-def test_inpaint_passes_context_masks_and_resets_references_at_cuts(tmp_path, monkeypatch):
-    import worker.vision as vision
-    monkeypatch.setenv('INPAINT_PYTHON', 'python')
-    monkeypatch.setenv('PROPAINTER_ROOT', str(tmp_path))
-    (tmp_path/'masks').mkdir()
-    (tmp_path/'frames').mkdir()
-    mask = np.zeros((40, 50), np.uint8)
-    mask[15:25, 20:30] = 255
-    paths=[]
-    for i in range(5):
-        path=tmp_path/'frames'/f'{i:06d}.png'
-        cv2.imwrite(str(path), np.full((40,50,3), 30 if i < 3 else 90, np.uint8))
-        cv2.imwrite(str(tmp_path/'masks'/path.name), mask)
-        paths.append(path)
-    reference_scenes=[]
-    class References:
-        def __init__(self, images, masks):
-            self.stats = {}
-            reference_scenes.append([int(im[0,0,0]) for im in images])
-        def restore(self, original, mask, repaired):
-            return repaired
-    monkeypatch.setattr(vision, 'CleanReferences', References)
-    def run(args, *unused, **kwargs):
-        args=list(map(str,args))
-        frames=__import__('pathlib').Path(args[args.index('--video')+1])
-        masks=__import__('pathlib').Path(args[args.index('--mask')+1])
-        output=__import__('pathlib').Path(args[args.index('--output')+1])/'frames'/'frames'
-        output.mkdir(parents=True)
-        for path in frames.glob('*.png'):
-            assert np.array_equal(cv2.imread(str(masks/path.name),0), mask)
-            cv2.imwrite(str(output/path.name), np.full((40,50,3),150,np.uint8))
-    monkeypatch.setattr(vision,'run',run)
-    vision.inpaint(tmp_path,paths,[(0,3),(3,5)],'propainter')
-    assert reference_scenes == [[30,30,30],[90,90]]
-    for path in paths:
-        result=cv2.imread(str(tmp_path/'composite'/path.name))
-        original=cv2.imread(str(path))
-        assert np.all(result[18:22,23:27] == 150)
-        assert np.array_equal(result[context_mask(mask)==0],original[context_mask(mask)==0])
 
 
 def test_partial_visible_ring_retains_verified_clean_pixels():
@@ -188,49 +149,3 @@ def test_sparse_feather_matches_dense_arithmetic_exactly():
     expected = np.rint(original*(1-alpha[..., None])+repaired*alpha[..., None]).astype(np.uint8)
     expected[mask == 0] = original[mask == 0]
     assert np.array_equal(soft_composite(original, repaired, mask), expected)
-
-
-def test_next_model_window_overlaps_ordered_compositing(tmp_path, monkeypatch):
-    import threading
-    import worker.vision as vision
-    monkeypatch.setenv('INPAINT_PYTHON', 'python')
-    monkeypatch.setenv('PROPAINTER_ROOT', str(tmp_path))
-    (tmp_path/'frames').mkdir()
-    (tmp_path/'masks').mkdir()
-    mask = np.zeros((40, 50), np.uint8)
-    mask[15:25, 20:30] = 255
-    paths = []
-    for i in range(65):
-        path = tmp_path/'frames'/f'{i:06d}.png'
-        cv2.imwrite(str(path), np.full((40, 50, 3), 80, np.uint8))
-        cv2.imwrite(str(tmp_path/'masks'/path.name), mask)
-        paths.append(path)
-    next_model = threading.Event()
-    writes = []
-
-    class References:
-        def __init__(self, *args):
-            self.stats = {}
-        def restore(self, original, mask, repaired):
-            assert next_model.wait(timeout=5)
-            writes.append(len(writes))
-            return repaired
-
-    calls = []
-    def run(args, *unused, **kwargs):
-        args = list(map(str, args))
-        frames = __import__('pathlib').Path(args[args.index('--video')+1])
-        output = __import__('pathlib').Path(args[args.index('--output')+1])/'frames'/'frames'
-        output.mkdir(parents=True)
-        calls.append(frames)
-        if len(calls) == 2:
-            next_model.set()
-        for path in frames.glob('*.png'):
-            cv2.imwrite(str(output/path.name), np.full((40, 50, 3), 150, np.uint8))
-
-    monkeypatch.setattr(vision, 'CleanReferences', References)
-    monkeypatch.setattr(vision, 'run', run)
-    vision.inpaint(tmp_path, paths, [(0, 65)], 'propainter')
-    assert len(calls) == 2 and len(writes) == 77
-    assert len(list((tmp_path/'composite').glob('*.png'))) == 65
-    assert not list(tmp_path.glob('window-*'))

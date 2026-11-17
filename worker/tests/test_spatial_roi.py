@@ -43,7 +43,7 @@ def test_spatial_tasks_commit_only_owned_pixels_and_cover_all(tmp_path,monkeypat
     (tmp_path/'spatial-roi.json').write_text(json.dumps(asdict(SpatialSettings(dilation_pixels=0,merge_gap_pixels=0,minimum_width=64,minimum_height=64,fixed_context_pixels=16))))
     class Ref:
         def __init__(self,*args):pass
-        def restore(self,original,mask,repair):return repair
+        def restore(self,original,mask,repair,**kwargs):return repair
     monkeypatch.setattr(roi_spatial_layers,'CleanReferences',Ref)
     monkeypatch.setattr(roi_spatial_layers,'soft_composite',lambda original,repair,mask:repair)
     def model(args,**kwargs):

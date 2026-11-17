@@ -109,6 +109,7 @@ def execute(work,files,detected,log=lambda message:None,cfg=None):
     if cfg.sequential_layers:
         from .roi_layers import execute as execute_layers
         return execute_layers(work,files,detected,log,cfg)
+    raise PipelineError('UNTRUSTED_CONTEXT','旧对象ROI入口已禁用，必须使用可信空间逐层ROI')
     started=time.monotonic();shape=cv2.imread(str(files[0])).shape[:2]
     source_pixels=shape[0]*shape[1];dest=work/'composite';dest.mkdir();coverage=work/'roi-coverage';coverage.mkdir()
     for file in files:

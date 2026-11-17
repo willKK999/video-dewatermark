@@ -27,6 +27,7 @@ def execute(work,files,detected,log,cfg):
     if (work/'spatial-roi.json').exists():
         from .roi_spatial_layers import execute as spatial_execute
         return spatial_execute(work,files,detected,log,cfg)
+    raise PipelineError('UNTRUSTED_CONTEXT','旧逐层ROI入口已禁用，必须提供空间ROI及可信上下文配置')
     settings=HLSSettings.from_env();started=time.monotonic()
     shape=cv2.imread(str(files[0])).shape[:2];pixels=shape[0]*shape[1]
     layers=json.loads((work/'layers.json').read_text())['layers']

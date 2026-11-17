@@ -19,7 +19,7 @@ def setup(tmp_path,monkeypatch,layers=2):
     monkeypatch.setenv('INPAINT_PYTHON','python');monkeypatch.setenv('PROPAINTER_ROOT',str(tmp_path))
     class Ref:
         def __init__(self,*args):pass
-        def restore(self,original,mask,repair):return repair
+        def restore(self,original,mask,repair,**kwargs):return repair
     monkeypatch.setattr(roi_spatial_layers,'CleanReferences',Ref);monkeypatch.setattr(roi_spatial_layers,'soft_composite',lambda original,repair,mask:repair)
     return files,d,mask
 

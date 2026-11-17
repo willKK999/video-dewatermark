@@ -11,7 +11,7 @@ class SpatialSettings:
     dilation_pixels:int=6
     merge_gap_pixels:int=24
     maximum_crop_pixels:int=708480
-    maximum_pixel_frames:int=90685440
+    maximum_pixel_frames:int=102021120
     minimum_width:int=512
     minimum_height:int=512
     fixed_context_pixels:int=96

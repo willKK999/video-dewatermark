@@ -62,7 +62,7 @@ class CleanReferences:
         self.masks = masks
         self.grays = [cv2.cvtColor(im, cv2.COLOR_BGR2GRAY) for im in images]
 
-    def _track(self, gray, refgray, points):
+    def _track(self, gray, refgray, points, reftrusted=None):
         tracked, status, _ = cv2.calcOpticalFlowPyrLK(gray, refgray, points, None)
         if tracked is None:
             return None
@@ -70,6 +70,13 @@ class CleanReferences:
         if back is None:
             return None
         good = (status.ravel() > 0) & (reverse.ravel() > 0) & (np.linalg.norm(back-points, axis=2).ravel() < 1)
+        if reftrusted is not None:
+            xy=np.rint(tracked.reshape(-1,2)).astype(int)
+            h,w=reftrusted.shape
+            inside=(xy[:,0]>=0)&(xy[:,0]<w)&(xy[:,1]>=0)&(xy[:,1]<h)
+            allowed=np.zeros(len(xy),bool)
+            allowed[inside]=reftrusted[xy[inside,1],xy[inside,0]]>0
+            good &= allowed
         if good.sum() < 16:
             return None
         transform, inliers = cv2.estimateAffinePartial2D(points[good], tracked[good], method=cv2.RANSAC, ransacReprojThreshold=1.5)
@@ -77,25 +84,26 @@ class CleanReferences:
             return None
         return transform
 
-    def restore(self, image, mask, repaired):
+    def restore(self, image, mask, repaired, confirmed=None):
         self.stats["processed_frames"] += 1
         self.stats["masked_pixels"] += int(np.count_nonzero(mask))
         if not mask.any() or len(self.images) < 3:
             return repaired
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        valid = 255-context_mask(mask, 5)
+        confirmed = mask if confirmed is None else confirmed
+        valid = 255-context_mask(confirmed, 5)
         points = cv2.goodFeaturesToTrack(gray, 250, .01, 6, mask=valid)
         if points is None or len(points) < 16:
             return repaired
         h, w = mask.shape
-        ring = (context_mask(mask, 8) > 0) & (context_mask(mask, 3) == 0)
+        ring = (context_mask(mask, 8) > 0) & (context_mask(confirmed, 3) == 0)
         if ring.sum() < 32:
             return repaired
         donors = []
         support = mask > 0
         for reference, reftrusted, refgray in zip(self.images, self.trusted, self.grays):
             started = time.perf_counter()
-            transform = self._track(gray, refgray, points)
+            transform = self._track(gray, refgray, points, reftrusted)
             self.timings['tracking_seconds'] += time.perf_counter()-started
             if transform is None:
                 continue

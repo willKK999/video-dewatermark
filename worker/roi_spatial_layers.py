@@ -31,14 +31,18 @@ def execute(work,files,detected,log,cfg):
     policy_path=work/'inpaint-policy.json'
     policy=json.loads(policy_path.read_text()) if policy_path.exists() else {}
     continue_unpassed=policy.get('continue_unpassed',False)
+    from .edge_residue import EdgeSettings,measure,composite
+    edge_path=work/'edge-policy.json'
+    edge_cfg=EdgeSettings(**json.loads(edge_path.read_text())) if edge_path.exists() else EdgeSettings()
     shape=cv2.imread(str(files[0])).shape[:2];pixels=shape[0]*shape[1]
     trusted_path=work/'trusted-context.json';trusted=None;input_audits=[]
+    if not trusted_path.exists():raise PipelineError('UNTRUSTED_CONTEXT','缺少可信上下文配置，禁止退回当前层')
     if trusted_path.exists():
-        from .trusted_context import ContextSettings,verify_input,exclusion_mask
+        from .trusted_context import ContextSettings,verify_from_confirmed,exclusion_mask,read_confirmed,overlap_weight
         trusted=ContextSettings(**json.loads(trusted_path.read_text()))
     def save_input_audit():
         if trusted is None:return
-        (work.parent/'层输入自检.json').write_text(json.dumps(json_native(dict(
+        (work/'层输入自检.json').write_text(json.dumps(json_native(dict(
             口径='所有冻结确认水印并集与实际写入模型掩膜逐像素核对，覆盖重试和上下文帧；不是未检测水印的真值召回率',
             模型排除区='全部确认水印并集',回写域='当前层与当前ROI施工域交集',
             源水印未排除像素=sum(f.get('源水印未排除像素',0) for a in input_audits for f in a['帧']),
@@ -69,7 +73,9 @@ def execute(work,files,detected,log,cfg):
             if np.count_nonzero(m)/pixels>settings.mask_fraction_limit:
                 raise PipelineError('MASK_UNCERTAIN','逐层ROI单遍超过20%保护',details=dict(layer=k,frame=i))
         # 每层独立输出；本层任何窗口都只读取上一层，不能把当前层施工反馈进模型。
-        for p,source in zip(files,current):os.link(source,dest/p.name)
+        for p,source in zip(files,current):
+            try:os.link(source,dest/p.name)
+            except OSError:shutil.copy2(source,dest/p.name)
         layer_done={};log(f'逐层ROI 图层={k+1}/{len(layers)} 开始')
         for scene_start,scene_end in detected['scenes']:
             refs=np.unique(np.linspace(scene_start,scene_end-1,min(24,scene_end-scene_start),dtype=int))
@@ -79,7 +85,8 @@ def execute(work,files,detected,log,cfg):
                 schedule=planned_windows(scene_start,scene_end,settings.window_frames,settings.overlap_frames,events,animation_cfg)
             for start,end in schedule:
                 footprint=np.bitwise_or.reduce(masks[start:end])
-                jobs=plan(footprint,end-start+settings.overlap_frames*(3 if continue_unpassed else 1),cfg,spatial)
+                budget=max(r-l for l,r,_ in seam_variants(start,end,scene_start,scene_end,settings,cfg))
+                jobs=plan(footprint,budget,cfg,spatial)
                 for fragment in jobs:
                     ownership=fragment['ownership'];box=fragment['box'];a,b,c,d=box
                     completed={j for j in range(scene_start,scene_end) if j in layer_done and np.any(layer_done[j]&ownership)}
@@ -104,12 +111,12 @@ def execute(work,files,detected,log,cfg):
                             if padded_area(box)*(right-left)>spatial.maximum_pixel_frames:raise PipelineError('GPU_BUDGET_EXCEEDED','空间裁块超过配置像素帧预算')
                             for j in range(left,right):
                                 roi.atomic_png(task/'frames'/f'{j-left:06d}.png',roi.crop(cv2.imread(str(current[j])),box))
-                                exclusion=exclusion_mask(cv2.imread(str(work/'masks'/files[j].name),0),trusted) if trusted else masks[j]
+                                exclusion=exclusion_mask(read_confirmed(work/'masks'/files[j].name),trusted)
                                 if trusted and np.count_nonzero(exclusion)/pixels>trusted.mask_fraction_limit:
                                     raise PipelineError('MASK_UNCERTAIN','全确认水印排除区超过20%，必须重规划')
                                 model_mask=roi.crop(exclusion,box,True);mask_path=task/'masks'/f'{j-left:06d}.png';roi.atomic_png(mask_path,model_mask)
                                 if trusted:
-                                    try:checked=verify_input(model_mask,cv2.imread(str(mask_path),0),roi.crop(masks[j]&ownership,box,True),pixels,trusted)
+                                    try:checked=verify_from_confirmed(work/'masks'/files[j].name,box,cv2.imread(str(mask_path),0),roi.crop(masks[j]&ownership,box,True),pixels,trusted)
                                     except PipelineError as exc:
                                         audit['帧'].append(dict(frame=j,**exc.details));audit['错误码']=exc.code;save_input_audit();raise
                                     import hashlib
@@ -124,12 +131,11 @@ def execute(work,files,detected,log,cfg):
                                   '--mask_dilation','0','--subvideo_length',str(length),'--neighbor_length','6','--ref_stride','20']
                             if cfg.fp16:args.append('--fp16')
                             # 按实际像素帧工作量扩展保护，不限制整块总预算。
-                            timeout=max(900,900*(right-left)/settings.window_frames)
-                            if policy.get('model_timeout_seconds'):timeout=min(timeout,policy['model_timeout_seconds'])
+                            timeout=min(840,policy.get('model_timeout_seconds') or 840)
                             trial['超时秒']=timeout
                             heartbeat=[time.monotonic()]
                             def check_model():
-                                if policy.get('model_timeout_seconds') and time.monotonic()-heartbeat[0]>=30:
+                                if time.monotonic()-heartbeat[0]>=30:
                                     log(f'逐层ROI 任务={row["任务"]} 尝试={attempt} 模型进程仍存活，正在计算')
                                     heartbeat[0]=time.monotonic()
                             run(args,check=check_model,cwd=os.environ['PROPAINTER_ROOT'],timeout=timeout,stage='逐层ROI-ProPainter')
@@ -137,7 +143,7 @@ def execute(work,files,detected,log,cfg):
                             if len(predicted)!=(2 if singleton else right-left):raise PipelineError('ROI_INCOMPLETE','逐层ROI输出帧数缺失，禁止原帧回退')
                             references=CleanReferences([roi.crop(cv2.imread(str(current[j])),box) for j in refs],
                                                        [roi.crop(cv2.imread(str(work/'masks'/files[j].name),0),box,True) for j in refs])
-                            maximum=0.;staged=task/'staged';staged.mkdir();frame_scores=[]
+                            maximum=0.;staged=task/'staged';staged.mkdir();frame_scores=[];residue_scores=[]
                             sample_frames=set();stage_frames=set()
                             if trusted:
                                 active_frames=[j for j in range(start,end) if np.any(masks[j]&ownership)]
@@ -150,8 +156,9 @@ def execute(work,files,detected,log,cfg):
                                 original=roi.crop(cv2.imread(str(current[j])),box);mask=roi.crop(masks[j],box,True)
                                 repair=cv2.imread(str(predicted[j-left]))
                                 if repair is None or repair.shape!=original.shape:raise PipelineError('OUTPUT_INVALID','逐层ROI模型改变几何')
-                                restored=references.restore(original,mask,repair)
-                                painted=soft_composite(original,restored,mask)[:d-b,:c-a]
+                                confirmed=roi.crop(read_confirmed(work/'masks'/files[j].name),box,True)
+                                restored=references.restore(original,mask,repair,confirmed=confirmed)
+                                painted=composite(original,restored,mask)[:d-b,:c-a]
                                 if j in sample_frames:
                                     sample=work/'model-samples'/f'task-{row["任务"]:04d}'/f'attempt-{attempt:02d}';sample.mkdir(parents=True,exist_ok=True)
                                     roi.atomic_png(sample/f'{j:06d}-raw-model.png',repair)
@@ -174,16 +181,24 @@ def execute(work,files,detected,log,cfg):
                                         frame_scores.append(dict(frame=j,mae=float(difference[shared].mean()) if shared.any() else 0.,pixels=int(np.count_nonzero(shared))))
                                     if j in completed:
                                         overlap=sum(t in completed for t in range(start,end))
-                                        weight=(j-start+1)/(overlap+1)
+                                        weight=overlap_weight(j,start,end,completed)
                                         mixed=cv2.addWeighted(painted,weight,old,1-weight,0)
                                         painted[active&shared]=mixed[active&shared]
                                     old[active]=painted[active];roi.atomic_png(staged/files[j].name,image)
+                                    if active.any():
+                                        band_path=work/'edge-band'/files[j].name
+                                        band=read_confirmed(band_path)[b:d,a:c] if band_path.exists() else np.zeros(active.shape,np.uint8)
+                                        score=measure(original[:d-b,:c-a],old,active.astype(np.uint8)*255,band & ownership[b:d,a:c],edge_cfg)
+                                        residue_scores.append(dict(frame=j,**score))
+                            trial['主色残留']=residue_scores
                             trial['重叠最大差异']=maximum
                             if continue_unpassed:
                                 trial['施工帧差异']=frame_scores;trial['差图尺度']=256
                                 trial['代表施工帧']=max(frame_scores,key=lambda p:p['mae'])['frame']
                             if maximum>settings.overlap_mae_limit:
                                 raise PipelineError('SEAM_UNCERTAIN','逐层ROI重叠差异超过原有保护',details=dict(差异=maximum,上限=settings.overlap_mae_limit))
+                            if any(not p['通过'] for p in residue_scores):
+                                raise PipelineError('RESIDUE_UNCERTAIN','水印主色候选超过零残留门槛',details=dict(帧=residue_scores))
                             for j in range(start,end):
                                 (staged/files[j].name).replace(dest/files[j].name)
                                 done=cv2.imread(str(coverage/files[j].name),0);roi.atomic_png(coverage/files[j].name,done|(masks[j]&ownership))
@@ -191,10 +206,11 @@ def execute(work,files,detected,log,cfg):
                             trial['通过']=True;row.update(通过=True,重叠最大差异=maximum)
                         except Exception as exc:
                             trial['错误码']=getattr(exc,'code',type(exc).__name__)
+                            if trial['错误码'] in {'UNTRUSTED_CONTEXT','CONTEXT_MASK_INVALID','MASK_UNCERTAIN','MASK_INVALID'}:raise
                             if continue_unpassed and trial['重叠最大差异'] is not None:
                                 trial['完整暂存']=compact(task,baseline,dest,files,masks,ownership,start,end)
                                 trial['暂存路径']=str(task/'staged-delta');trial['基线路径']=str(baseline)
-                            retry=trial['错误码']=='SEAM_UNCERTAIN'
+                            retry=trial['错误码'] in {'SEAM_UNCERTAIN','RESIDUE_UNCERTAIN'}
                             if trial['错误码']=='GPU_OOM' and not oom_used:
                                 oom_used=True;retry=True
                                 if attempt+1<len(variants):

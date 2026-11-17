@@ -28,7 +28,7 @@ def exclusion_mask(confirmed,cfg):
 
 
 def verify_input(expected,actual,construction,frame_pixels,cfg):
-    if expected.shape!=actual.shape or actual.shape!=construction.shape or not set(np.unique(actual))<={0,255}:
+    if actual is None or expected is None or construction is None or expected.shape!=actual.shape or actual.shape!=construction.shape or not set(np.unique(actual))<={0,255}:
         raise PipelineError('CONTEXT_MASK_INVALID','模型排除掩膜形状或取值不符')
     missing=int(np.count_nonzero((expected>0)&(actual==0)))
     outside=int(np.count_nonzero((construction>0)&(expected==0)))
@@ -50,3 +50,27 @@ def stable_union_layers(frames,limit=.2):
         if maximum>limit:raise PipelineError('MASK_UNCERTAIN','稳定联合层超过20%，不得迁移部件或拆层绕过可信区保护')
     if not count:raise PipelineError('MASK_INVALID','冻结确认水印输入为空，禁止生成空计划')
     return dict(layers=1,maximum_fraction=maximum,all_components_fixed_layer=0)
+
+
+def read_confirmed(path):
+    mask=cv2.imread(str(path),0)
+    if mask is None or mask.ndim!=2 or not set(np.unique(mask))<={0,255}:
+        raise PipelineError('MASK_INVALID','确认水印掩膜缺失或无效')
+    return mask
+
+
+def verify_from_confirmed(path,box,actual,construction,frame_pixels,cfg):
+    # 独立读取冻结真值并独立形态计算，不接受写入侧 model_mask/exclusion。
+    confirmed=read_confirmed(path)
+    r=cfg.boundary_exclusion_pixels
+    expected=cv2.dilate(confirmed,cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(2*r+1,2*r+1)))
+    if np.count_nonzero(expected)/expected.size>cfg.mask_fraction_limit:
+        raise PipelineError('MASK_UNCERTAIN','全确认水印排除区超过20%')
+    a,b,c,d=box;expected=expected[b:d,a:c]
+    expected=cv2.copyMakeBorder(expected,0,(-expected.shape[0])%8,0,(-expected.shape[1])%8,cv2.BORDER_REPLICATE)
+    return verify_input(expected,actual,construction,frame_pixels,cfg)
+
+
+def overlap_weight(frame,start,end,completed):
+    overlap=sorted(j for j in completed if start<=j<end)
+    return (overlap.index(frame)+1)/(len(overlap)+1) if frame in overlap else 1.

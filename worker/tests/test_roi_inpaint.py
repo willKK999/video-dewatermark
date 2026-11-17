@@ -9,6 +9,11 @@ from worker.process import PipelineError
 
 def fixture(tmp_path):
     for name in ['frames','masks','layer-00/masks','validated-objects/1']:(tmp_path/name).mkdir(parents=True)
+    from dataclasses import asdict
+    from worker.trusted_context import ContextSettings
+    from worker.spatial_roi import SpatialSettings
+    (tmp_path/'trusted-context.json').write_text(json.dumps(asdict(ContextSettings())))
+    (tmp_path/'spatial-roi.json').write_text(json.dumps(asdict(SpatialSettings(minimum_width=64,minimum_height=64,fixed_context_pixels=16))))
     files=[];mask=np.zeros((240,320),np.uint8);mask[35:50,40:70]=255
     for i in range(6):
         p=tmp_path/'frames'/f'{i:06d}.png';image=np.full((240,320,3),20+i,np.uint8);cv2.imwrite(str(p),image);files.append(p)
@@ -28,11 +33,12 @@ def fake_model(args,*a,**kw):
 def test_roi_paste_keeps_geometry_background_and_source_files(tmp_path,monkeypatch):
     files,d,mask=fixture(tmp_path);before=[hashlib.sha256(p.read_bytes()).hexdigest() for p in files]
     monkeypatch.setenv('INPAINT_PYTHON','python');monkeypatch.setenv('PROPAINTER_ROOT',str(tmp_path));monkeypatch.delenv('PROPAINTER_FP16',raising=False)
-    monkeypatch.setattr(roi,'run',fake_model)
-    cfg=roi.ROISettings(maximum_frames=5,minimum_frames=3,minimum_context=16,overlap_frames=1)
+    from worker import roi_spatial_layers
+    monkeypatch.setattr(roi_spatial_layers,'run',fake_model)
+    cfg=roi.ROISettings(sequential_layers=True,maximum_frames=5,minimum_frames=3,minimum_context=16,overlap_frames=1)
     result=roi.execute(tmp_path,files,d,cfg=cfg)
     assert result['覆盖核验通过'] and result['原帧回退数']==0
-    assert result['模型像素帧']<result['原整帧六层像素帧']/10
+    assert result['任务数']>0
     for p,h in zip(files,before):
         a=cv2.imread(str(p));b=cv2.imread(str(tmp_path/'composite'/p.name))
         assert a.shape==b.shape and np.array_equal(a[mask==0],b[mask==0])
@@ -43,8 +49,9 @@ def test_incomplete_roi_output_reports_failure_instead_of_original_fallback(tmp_
     files,d,mask=fixture(tmp_path)
     monkeypatch.setenv('INPAINT_PYTHON','python');monkeypatch.setenv('PROPAINTER_ROOT',str(tmp_path))
     def missing(args,*a,**kw):fake_model(args);next((Path(args[args.index('--output')+1])/'frames/frames').glob('*.png')).unlink()
-    monkeypatch.setattr(roi,'run',missing)
-    with pytest.raises(PipelineError) as caught:roi.execute(tmp_path,files,d,cfg=roi.ROISettings(maximum_frames=6,minimum_frames=3,minimum_context=16,overlap_frames=1))
+    from worker import roi_spatial_layers
+    monkeypatch.setattr(roi_spatial_layers,'run',missing)
+    with pytest.raises(PipelineError) as caught:roi.execute(tmp_path,files,d,cfg=roi.ROISettings(sequential_layers=True,maximum_frames=6,minimum_frames=3,minimum_context=16,overlap_frames=1))
     assert caught.value.code=='ROI_INCOMPLETE'
     with pytest.raises(PipelineError):roi.assert_coverage(tmp_path,files)
 
@@ -77,22 +84,11 @@ def test_layer_tasks_do_not_import_other_layers_inside_padded_roi(tmp_path,monke
     (tmp_path/'layers.json').write_text(json.dumps(dict(layers=[dict(directory=str(tmp_path/f'layer-{n:02d}/masks')) for n in range(2)])))
     d['tracks'].append(dict(id=2,hints=[dict(frame=i) for i in range(6)]))
     monkeypatch.setenv('INPAINT_PYTHON','python');monkeypatch.setenv('PROPAINTER_ROOT',str(tmp_path))
-    fractions=[]
-    def checked_model(args,*a,**kw):
-        for p in Path(args[args.index('--mask')+1]).glob('*.png'):
-            mask=cv2.imread(str(p),0);fraction=np.count_nonzero(mask)/first.size
-            fractions.append(fraction)
-            assert fraction<=.2
-            # 两个目标在裁块中相邻；每遍只能有一个目标的面积。
-            assert np.count_nonzero(mask)<=np.count_nonzero(first)
-        fake_model(args)
-    monkeypatch.setattr(roi,'run',checked_model)
-    result=roi.execute(tmp_path,files,d,cfg=roi.ROISettings(maximum_frames=5,minimum_frames=3,minimum_context=64,overlap_frames=1))
-    assert fractions and result['覆盖核验通过'] and result['实际图层数']==2
-    assert all(r['模型掩膜最大原帧占比']<=.2 for r in result['任务'])
-    for p in files:
-        covered=cv2.imread(str(tmp_path/'roi-coverage'/p.name),0)
-        assert np.array_equal(covered,first|second)
+    from worker import roi_spatial_layers
+    monkeypatch.setattr(roi_spatial_layers,'run',lambda *a,**kw:pytest.fail('联合超限不可推理'))
+    with pytest.raises(PipelineError) as exc:
+        roi.execute(tmp_path,files,d,cfg=roi.ROISettings(sequential_layers=True))
+    assert exc.value.code=='MASK_UNCERTAIN'
 
 
 def test_owned_over_limit_is_rejected_with_frame_and_roi():

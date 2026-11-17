@@ -42,7 +42,7 @@ def test_end_to_end_model_reads_all_masks_but_only_current_domain_is_written(tmp
     monkeypatch.setenv('INPAINT_PYTHON','python');monkeypatch.setenv('PROPAINTER_ROOT',str(tmp_path));calls=[]
     class Ref:
         def __init__(self,*a):pass
-        def restore(self,x,m,y):return y
+        def restore(self,x,m,y,**kwargs):return y
     monkeypatch.setattr(roi_spatial_layers,'CleanReferences',Ref);monkeypatch.setattr(roi_spatial_layers,'soft_composite',lambda x,y,m:y)
     def model(args,**kw):
         frames=Path(args[args.index('--video')+1]);masks=Path(args[args.index('--mask')+1]);out=Path(args[args.index('--output')+1])/'frames/frames';out.mkdir(parents=True);calls.append(1)
@@ -58,14 +58,14 @@ def test_end_to_end_model_reads_all_masks_but_only_current_domain_is_written(tmp
             if path.parent.name=='masks' and path.parent.parent.name.startswith('roi-'):value=np.zeros_like(value)
             atomic(path,value)
         monkeypatch.setattr(roi_inpaint,'atomic_png',corrupt)
-        with pytest.raises(PipelineError,match='禁止原帧回退'):
+        with pytest.raises(PipelineError,match='禁止推理'):
             roi_inpaint.execute(tmp_path,files,d,cfg=roi_inpaint.ROISettings(sequential_layers=True,minimum_context=400))
-        audit=json.loads((tmp_path.parent/'层输入自检.json').read_text())
+        audit=json.loads((tmp_path/'层输入自检.json').read_text())
         assert not calls and audit['源水印未排除像素']>0 and not audit['全部已检查尝试通过']
         return
     result=roi_inpaint.execute(tmp_path,files,d,cfg=roi_inpaint.ROISettings(sequential_layers=True,minimum_context=400))
     assert result['全部ROI通过'] and len(calls)==2
-    audit=json.loads((tmp_path.parent/'层输入自检.json').read_text());assert audit['源水印未排除像素']==0 and audit['全部已检查尝试通过']
+    audit=json.loads((tmp_path/'层输入自检.json').read_text());assert audit['源水印未排除像素']==0 and audit['全部已检查尝试通过']
     assert len(list((tmp_path/'model-samples').glob('**/*-raw-model.png')))==6
     for p in files:
         source=cv2.imread(str(p));final=cv2.imread(str(tmp_path/'composite'/p.name));assert np.all(final[first|second>0]==130);assert np.array_equal(source[(first|second)==0],final[(first|second)==0])

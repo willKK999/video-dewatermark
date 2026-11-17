@@ -71,6 +71,10 @@ def execute(args):
             binding_file=(frozen/'frames').resolve().parent/'frames-binding.json'
             original=read(binding_file)
             for name in ['frames','masks']:(work/name).symlink_to((frozen/name).resolve(),target_is_directory=True)
+            if (frozen/'edge-band').exists():(work/'edge-band').symlink_to((frozen/'edge-band').resolve(),target_is_directory=True)
+            edge_config=getattr(args,'edge_config','config/v17-edge-residue.json')
+            from worker.edge_residue import EdgeSettings
+            write(work/'edge-policy.json',asdict(EdgeSettings(**read(edge_config))))
             for name in ['detections.json','layers.json']:shutil.copy2(frozen/name,work/name)
             if (frozen/'animation-events.json').exists():
                 shutil.copy2(frozen/'animation-events.json',work/'animation-events.json')
@@ -82,11 +86,10 @@ def execute(args):
                 from worker.trusted_context import ContextSettings
                 trusted=ContextSettings(**read(args.trusted_context_config))
                 write(work/'trusted-context.json',asdict(trusted))
-            if args.continue_unpassed:
-                if args.model_timeout_seconds is not None and not 0<args.model_timeout_seconds<=840:raise ValueError('模型无输出保护不得超过840秒')
-                write(work/'inpaint-policy.json',dict(continue_unpassed=True,selection='minimum_seam_mae',seam_retries=cfg.seam_retries,model_timeout_seconds=args.model_timeout_seconds))
+            if args.model_timeout_seconds is not None and not 0<args.model_timeout_seconds<=840:raise ValueError('模型无输出保护不得超过840秒')
+            write(work/'inpaint-policy.json',dict(continue_unpassed=args.continue_unpassed,selection='minimum_seam_mae',seam_retries=cfg.seam_retries,model_timeout_seconds=args.model_timeout_seconds or 840))
             files=sorted((work/'frames').glob('*.png'))
-            if len(files)!=args.frames:raise ValueError('冻结输入帧数不符')
+            if args.frames is not None and len(files)!=args.frames:raise ValueError('冻结输入帧数不符')
             verifier=VerifiedLayers(work/'layers.json',work/'detections.json');binding=[]
             for i,p in enumerate(files):
                 if digest(p)!=original['sha256'][p.name]:raise ValueError('冻结解码帧摘要改变')
@@ -100,7 +103,7 @@ def execute(args):
         files=step('冻结输入与掩膜核验',prepare)
         summary=step('逐层ROI补画',lambda:roi_inpaint.execute(work,files,read(work/'detections.json'),log,cfg))
         def encode():
-            silent=work/'core-video.mp4';audio=work/'core-audio.m4a';video=output/('第1块-含未过块.mp4' if summary.get('未过块') else '第1块.mp4')
+            silent=work/'core-video.mp4';audio=work/'core-audio.m4a';video=output/(getattr(args,'video_name',None) or '补画结果.mp4')
             metadata=media.probe(args.source);vs=next(s for s in metadata['streams'] if s['codec_type']=='video')
             from fractions import Fraction
             fps=float(Fraction(vs['avg_frame_rate']));duration=len(files)/fps
@@ -123,9 +126,11 @@ def execute(args):
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__)
     for name in ['source','masks','baseline','output']:p.add_argument('--'+name,required=True)
-    p.add_argument('--frames',type=int,default=780)
-    p.add_argument('--spatial-config')
+    p.add_argument('--frames',type=int)
+    p.add_argument('--video-name',default='补画结果.mp4')
+    p.add_argument('--spatial-config',default='config/v13-spatial-roi.json')
     p.add_argument('--continue-unpassed',action='store_true')
     p.add_argument('--model-timeout-seconds',type=int)
-    p.add_argument('--trusted-context-config')
+    p.add_argument('--edge-config',default='config/v17-edge-residue.json')
+    p.add_argument('--trusted-context-config',default='config/v16-trusted-context.json')
     execute(p.parse_args())

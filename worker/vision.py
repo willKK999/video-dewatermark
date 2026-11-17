@@ -491,6 +491,8 @@ def inpaint(
     condition_overlap=False,
     reference_masks=None,
 ):
+    if engine != "telea-dev":
+        raise PipelineError('UNTRUSTED_CONTEXT','旧HLS补画入口已禁用，请使用可信空间逐层ROI')
     dest = root / "composite"
     dest.mkdir()
     if engine == "telea-dev":
