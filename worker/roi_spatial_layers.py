@@ -55,8 +55,14 @@ def execute(work,files,detected,log,cfg):
         from .watermark_groups import AnimationSettings,planned_windows
         animation_cfg=AnimationSettings(**animation_plan['settings'])
         if animation_cfg.maximum_window_frames>cfg.maximum_frames:raise ValueError('动画窗口不得超过既有ROI最大帧数')
-    coverage=work/'roi-coverage';coverage.mkdir()
-    for p in files:roi.atomic_png(coverage/p.name,np.zeros(shape,np.uint8))
+    resume=None
+    if policy.get('resume_from'):
+        from .roi_resume import prepare as resume_prepare,recheck as resume_recheck
+        resume=resume_prepare(work,policy['resume_from'],files,cfg,settings,spatial,layers,log)
+    coverage=work/'roi-coverage'
+    if resume is None:
+        coverage.mkdir()
+        for p in files:roi.atomic_png(coverage/p.name,np.zeros(shape,np.uint8))
     current=files;records=[];layer_records=[];unpassed=[];unfillable=[]
     def save():
         summary=dict(空间配置=asdict(spatial),配置=asdict(cfg),任务=records,未过块=unpassed,不可填块=unfillable,全部ROI通过=len(layer_records)==len(layers) and all(r['通过'] for r in records),图层=layer_records,实际图层数=len(layers),
@@ -65,7 +71,8 @@ def execute(work,files,detected,log,cfg):
         (work/'roi-report.json').write_text(json.dumps(json_native(summary),ensure_ascii=False,indent=2))
         return summary
     for k,layer in enumerate(layers):
-        begin=time.monotonic();dest=work/f'roi-layer-{k:02d}';dest.mkdir()
+        begin=time.monotonic();dest=work/f'roi-layer-{k:02d}'
+        if resume is None:dest.mkdir()
         masks=[cv2.imread(str(Path(layer['directory'])/p.name),0) for p in files]
         for i,m in enumerate(masks):
             if m is None or m.shape!=shape or not set(np.unique(m))<={0,255}:
@@ -73,10 +80,11 @@ def execute(work,files,detected,log,cfg):
             if np.count_nonzero(m)/pixels>settings.mask_fraction_limit:
                 raise PipelineError('MASK_UNCERTAIN','逐层ROI单遍超过20%保护',details=dict(layer=k,frame=i))
         # 每层独立输出；本层任何窗口都只读取上一层，不能把当前层施工反馈进模型。
-        for p,source in zip(files,current):
-            try:os.link(source,dest/p.name)
-            except OSError:shutil.copy2(source,dest/p.name)
-        layer_done={};log(f'逐层ROI 图层={k+1}/{len(layers)} 开始')
+        if resume is None:
+            for p,source in zip(files,current):
+                try:os.link(source,dest/p.name)
+                except OSError:shutil.copy2(source,dest/p.name)
+        layer_done=resume['done'] if resume else {};log(f'逐层ROI 图层={k+1}/{len(layers)} 开始')
         for scene_start,scene_end in detected['scenes']:
             refs=np.unique(np.linspace(scene_start,scene_end-1,min(24,scene_end-scene_start),dtype=int))
             schedule=list(windows(scene_start,scene_end,settings.window_frames,settings.overlap_frames))
@@ -93,6 +101,11 @@ def execute(work,files,detected,log,cfg):
                     row=dict(任务=len(records)+1,图层=k,开始帧=start,结束帧=end,ROI=box,fp16=cfg.fp16,
                              施工面积像素=int(np.count_nonzero(ownership)),裁块像素=padded_area(box),像素帧预算=spatial.maximum_pixel_frames,输入图层=k-1,窗口=settings.window_frames,重叠=settings.overlap_frames,通过=False,尝试=[])
                     records.append(row);tick=time.monotonic();save()
+                    if resume and row['任务']<=len(resume['rows']):
+                        resume_recheck(resume,row,ownership,work,files,refs,box,start,end,edge_cfg,settings,log)
+                        if not row['通过']:unpassed.append(row['任务'])
+                        save();log(f'逐层ROI 任务={row["任务"]} 检查点复用完成 通过={row["通过"]}；未运行补画模型')
+                        continue
                     baseline=work/f'roi-{len(records):04d}-baseline'
                     variants=seam_variants(start,end,scene_start,scene_end,settings,cfg)
                     oom_used=False
@@ -136,9 +149,11 @@ def execute(work,files,detected,log,cfg):
                             heartbeat=[time.monotonic()]
                             def check_model():
                                 if time.monotonic()-heartbeat[0]>=30:
-                                    log(f'逐层ROI 任务={row["任务"]} 尝试={attempt} 模型进程仍存活，正在计算')
+                                    phase='模型指标已写出，等待子进程退出' if (task/'metrics.json').exists() else '模型进程仍存活，正在计算'
+                                    log(f'逐层ROI 任务={row["任务"]} 尝试={attempt} {phase}')
                                     heartbeat[0]=time.monotonic()
                             run(args,check=check_model,cwd=os.environ['PROPAINTER_ROOT'],timeout=timeout,stage='逐层ROI-ProPainter')
+                            log(f'逐层ROI 任务={row["任务"]} 尝试={attempt} 模型已结束，开始CPU参考回填与残留复检')
                             predicted=sorted((task/'out/frames/frames').glob('*.png'))
                             if len(predicted)!=(2 if singleton else right-left):raise PipelineError('ROI_INCOMPLETE','逐层ROI输出帧数缺失，禁止原帧回退')
                             references=CleanReferences([roi.crop(cv2.imread(str(current[j])),box) for j in refs],
@@ -152,7 +167,11 @@ def execute(work,files,detected,log,cfg):
                                     stage_frames=set(sorted(sample_frames)[:trusted.retain_stage_sample_count])
                             if continue_unpassed:(task/'seam-difference').mkdir();(task/'seam-shared').mkdir()
                             # 先完整核验，再提交；失败尝试不得修改覆盖记录或已通过窗口。
+                            cpu_heartbeat=time.monotonic()
                             for j in range(left,right):
+                                if time.monotonic()-cpu_heartbeat>=30:
+                                    log(f'逐层ROI 任务={row["任务"]} 尝试={attempt} CPU合成与复检帧={j}/{right}')
+                                    cpu_heartbeat=time.monotonic()
                                 original=roi.crop(cv2.imread(str(current[j])),box);mask=roi.crop(masks[j],box,True)
                                 repair=cv2.imread(str(predicted[j-left]))
                                 if repair is None or repair.shape!=original.shape:raise PipelineError('OUTPUT_INVALID','逐层ROI模型改变几何')
@@ -189,7 +208,9 @@ def execute(work,files,detected,log,cfg):
                                         band_path=work/'edge-band'/files[j].name
                                         band=read_confirmed(band_path)[b:d,a:c] if band_path.exists() else np.zeros(active.shape,np.uint8)
                                         source_color=roi.crop(cv2.imread(str(files[j])),box)[:d-b,:c-a]
-                                        score=measure(source_color,old,active.astype(np.uint8)*255,band & ownership[b:d,a:c],edge_cfg)
+                                        evidence=getattr(references,'last_evidence',None)
+                                        if evidence is not None:evidence={key:value[:d-b,:c-a] for key,value in evidence.items()}
+                                        score=measure(source_color,old,active.astype(np.uint8)*255,band & ownership[b:d,a:c],edge_cfg,reference_evidence=evidence)
                                         residue_scores.append(dict(frame=j,**score))
                             trial['主色残留']=residue_scores
                             trial['重叠最大差异']=maximum
@@ -207,7 +228,7 @@ def execute(work,files,detected,log,cfg):
                             trial['通过']=True;row.update(通过=True,重叠最大差异=maximum)
                         except Exception as exc:
                             trial['错误码']=getattr(exc,'code',type(exc).__name__)
-                            if trial['错误码'] in {'UNTRUSTED_CONTEXT','CONTEXT_MASK_INVALID','MASK_UNCERTAIN','MASK_INVALID'}:raise
+                            if trial['错误码'] in {'UNTRUSTED_CONTEXT','CONTEXT_MASK_INVALID','MASK_UNCERTAIN','MASK_INVALID','RESIDUE_INPUT_INVALID'}:raise
                             if continue_unpassed and trial['重叠最大差异'] is not None:
                                 trial['完整暂存']=compact(task,baseline,dest,files,masks,ownership,start,end)
                                 trial['暂存路径']=str(task/'staged-delta');trial['基线路径']=str(baseline)

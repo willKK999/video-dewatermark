@@ -84,7 +84,14 @@ class CleanReferences:
             return None
         return transform
 
+    def reference_evidence(self,image,mask,confirmed=None):
+        self._evidence_only=True
+        try:self.restore(image,mask,image,confirmed=confirmed)
+        finally:self._evidence_only=False
+        return self.last_evidence
+
     def restore(self, image, mask, repaired, confirmed=None):
+        self.last_evidence=dict(background=np.zeros_like(image),confidence=np.zeros(mask.shape,np.uint8),counts=np.zeros(mask.shape,np.uint8))
         self.stats["processed_frames"] += 1
         self.stats["masked_pixels"] += int(np.count_nonzero(mask))
         if not mask.any() or len(self.images) < 3:
@@ -139,6 +146,10 @@ class CleanReferences:
         confidence[eligible] = agreement.astype(np.uint8)
         background = repaired.copy()
         background[eligible] = np.clip(np.rint(median), 0, 255).astype(np.uint8)
+        # 仅三份以上真实供体的一致中值可为背景举证；不采用模型值或孔洞插值作证。
+        evidence_counts=np.zeros(mask.shape,np.uint8);evidence_counts[support]=np.minimum(count,255).astype(np.uint8)
+        self.last_evidence=dict(background=background.copy(),confidence=confidence.copy(),counts=evidence_counts)
+        if getattr(self,'_evidence_only',False):return repaired
         background, confidence, filled = fill_small_holes(background, confidence, mask)
         self.stats["interpolated_pixels"] += filled
         # 仅在一致区域内部逐渐采用参考，避免局部回填产生新接缝。

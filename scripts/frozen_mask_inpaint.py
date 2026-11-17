@@ -87,7 +87,7 @@ def execute(args):
                 trusted=ContextSettings(**read(args.trusted_context_config))
                 write(work/'trusted-context.json',asdict(trusted))
             if args.model_timeout_seconds is not None and not 0<args.model_timeout_seconds<=840:raise ValueError('模型无输出保护不得超过840秒')
-            write(work/'inpaint-policy.json',dict(continue_unpassed=args.continue_unpassed,selection='minimum_seam_mae',seam_retries=cfg.seam_retries,model_timeout_seconds=args.model_timeout_seconds or 840))
+            write(work/'inpaint-policy.json',dict(continue_unpassed=args.continue_unpassed,selection='minimum_seam_mae',seam_retries=cfg.seam_retries,model_timeout_seconds=args.model_timeout_seconds or 840,resume_from=getattr(args,'resume_from',None)))
             files=sorted((work/'frames').glob('*.png'))
             if args.frames is not None and len(files)!=args.frames:raise ValueError('冻结输入帧数不符')
             verifier=VerifiedLayers(work/'layers.json',work/'detections.json');binding=[]
@@ -126,6 +126,7 @@ def execute(args):
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__)
     for name in ['source','masks','baseline','output']:p.add_argument('--'+name,required=True)
+    p.add_argument('--resume-from',help='旧运行run目录；复用经内容绑定校验的完整连续任务，全部重新复检')
     p.add_argument('--frames',type=int)
     p.add_argument('--video-name',default='补画结果.mp4')
     p.add_argument('--spatial-config',default='config/v13-spatial-roi.json')
