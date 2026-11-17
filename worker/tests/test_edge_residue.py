@@ -243,10 +243,17 @@ def test_measure_outer_ring_proves_background_color():
     blue=_hsv_bgr(100,200,200)
     mask=np.zeros((96,120),np.uint8);mask[30:50,40:60]=255
     band=np.zeros_like(mask)
-    ok=measure(blue,blue.copy(),mask,band,cfg)
-    assert ok['通过'] and ok['判定']=='通过' and ok['外环证实背景本色']==400 and ok['背景本色证实']==400 and ok['确认残留']==0
+    # 源图组内全蓝，背景仅上方 y<34 为蓝色天空、其余为灰：整环蓝密度<50%故蓝色仍为区别色，
+    # 而补画仅贴近上缘的候选区域在局部外环窗口内有>=50%蓝色可被外环证实。
+    source=np.full((96,120,3),40,np.uint8)
+    source[:34,:]=blue[:34,:]
+    source[mask>0]=blue[mask>0]
+    painted=np.full((96,120,3),40,np.uint8)
+    painted[30:32,42:58]=blue[30:32,42:58]
+    ok=measure(source,painted,mask,band,cfg)
+    assert ok['通过'] and ok['判定']=='通过' and ok['外环证实背景本色']==32 and ok['背景本色证实']==32 and ok['确认残留']==0
     guard=np.where(mask>0,0,255).astype(np.uint8)
-    blocked=measure(blue,blue.copy(),mask,band,cfg,protected=guard)
+    blocked=measure(source,painted,mask,band,cfg,protected=guard)
     assert not blocked['通过'] and blocked['判定']=='RESIDUE_UNCERTAIN' and blocked['外环证实背景本色']==0
 
 
@@ -368,11 +375,125 @@ def test_roi_resume_recheck_aligns_with_measure_confirmed_and_protected(tmp_path
 
 
 def test_temporal_refute_overrides_ring_proof():
-    # 外环同色但可信时域参考显示该处背景不是主色：不得用外环证实抵消，必须判确认残留。
-    x=np.full((96,120,3),(220,160,30),np.uint8);m=np.zeros(x.shape[:2],np.uint8);cv2.circle(m,(60,48),12,255,-1)
+    # 区别色候选所在局部外环同色但可信时域参考显示该处背景不是主色：不得用外环证实抵消，必须判确认残留。
+    blue=_hsv_bgr(100,200,200)
+    m=np.zeros((96,120),np.uint8);m[30:50,40:60]=255
     band=np.zeros_like(m)
-    evidence=dict(background=np.full_like(x,30),confidence=np.full(m.shape,255,np.uint8),counts=np.full(m.shape,3,np.uint8))
-    result=measure(x,x.copy(),m,band,EdgeSettings(),reference_evidence=evidence)
-    assert result['判定']=='RESIDUE_FOUND' and not result['通过'] and result['外环证实但时域反证']>0
-    # 无时域证据时，同样的外环同色可证实背景本色。
-    assert measure(x,x.copy(),m,band,EdgeSettings())['通过']
+    source=np.full((96,120,3),40,np.uint8)
+    source[:34,:]=blue[:34,:]
+    source[m>0]=blue[m>0]
+    painted=np.full((96,120,3),40,np.uint8)
+    painted[30:32,42:58]=blue[30:32,42:58]
+    evidence=dict(background=np.full_like(source,30),confidence=np.full(m.shape,255,np.uint8),counts=np.full(m.shape,3,np.uint8))
+    result=measure(source,painted,m,band,EdgeSettings(),reference_evidence=evidence)
+    assert result['判定']=='RESIDUE_FOUND' and not result['通过'] and result['外环证实但时域反证']==32
+    # 无时域证据时，同样的局部外环同色可证实背景本色。
+    ok=measure(source,painted,m,band,EdgeSettings())
+    assert ok['通过'] and ok['外环证实背景本色']==32
+
+
+def test_same_color_background_peak_produces_no_candidates_and_counts_separately():
+    cfg=EdgeSettings()
+    skin=_hsv_bgr(10,180,180)
+    blue=_hsv_bgr(100,200,200)
+    mask=np.zeros((96,120),np.uint8);mask[30:50,40:60]=255  # 400 px
+    band=np.zeros_like(mask)
+    # 1) 整组与外环同色（肤色/棕色）：不产生候选也不判残留，单列为同色不适用。
+    res=measure(skin,skin.copy(),mask,band,cfg)
+    assert res['通过'] and res['判定']=='通过'
+    assert res['颜色候选']==0 and res['区别色候选数']==0 and res['确认残留']==0 and res['待目检']==0
+    assert res['同色不适用组数']==1 and res['同色不适用施工像素']==400
+    g=res['组'][0]
+    assert g['状态']=='颜色复检不适用：水印源色与周围背景同色'
+    assert g['区别色列表']==[] and g['非区别色列表']==[10]
+    assert g['主色模板对比'][0]['是否区别色'] is False and '非区别色' in g['主色模板对比'][0]['原因']
+
+    # 2) 组内高密度背景棕色（~0.75）+ 外环高密度棕色（~0.75）+ 局部蓝色区别色水印（~0.25，外环0.0）：
+    #    棕色峰必须被跳过，仅蓝峰作为区别色参与候选判定。
+    mixed_src=skin.copy()
+    mixed_src[30:35,40:60]=blue[30:35,40:60]  # 100/400 = 0.25 >= 0.10 且 >= 32 px
+    painted_clean=skin.copy()  # 蓝色被补净成肤色，仅留背景棕色
+    clean_res=measure(mixed_src,painted_clean,mask,band,cfg)
+    assert clean_res['通过'] and clean_res['判定']=='通过'
+    assert clean_res['颜色候选']==0 and clean_res['区别色候选数']==0 and clean_res['同色不适用组数']==0
+    mg=clean_res['组'][0]
+    assert mg['区别色列表']==[100] and mg['非区别色列表']==[10]
+    by_hue={item['色相']:item for item in mg['主色模板对比']}
+    assert by_hue[10]['是否区别色'] is False and '非区别色' in by_hue[10]['原因']
+    assert by_hue[100]['是否区别色'] is True and by_hue[100]['原因']=='水印区别色'
+    # 若蓝色未补干净，仅蓝色像素进入区别色候选并判 RESIDUE_FOUND，棕色背景像素不计入。
+    dirty_res=measure(mixed_src,mixed_src.copy(),mask,band,cfg)
+    assert not dirty_res['通过'] and dirty_res['判定']=='RESIDUE_FOUND'
+    assert dirty_res['颜色候选']==100 and dirty_res['区别色候选数']==100 and dirty_res['确认残留']==100
+
+
+def test_distinguishing_color_residue_found_and_clean_pass():
+    cfg=EdgeSettings()
+    blue=_hsv_bgr(100,200,200)
+    mask=np.zeros((96,120),np.uint8);mask[30:50,40:60]=255
+    band=np.zeros_like(mask);band[29:30,40:60]=255
+    work=mask|band  # 420 px
+    source=np.full((96,120,3),40,np.uint8)
+    source[work>0]=blue[work>0]
+    dirty=measure(source,source.copy(),work,band,cfg)
+    assert not dirty['通过'] and dirty['判定']=='RESIDUE_FOUND'
+    assert dirty['颜色候选']==420 and dirty['区别色候选数']==420 and dirty['确认残留']==420
+    assert dirty['同色不适用组数']==0 and dirty['同色不适用施工像素']==0
+    assert dirty['组'][0]['区别色列表']==[100] and dirty['组'][0]['非区别色列表']==[]
+    clean=measure(source,np.full_like(source,40),work,band,cfg)
+    assert clean['通过'] and clean['判定']=='通过'
+    assert clean['颜色候选']==0 and clean['区别色候选数']==0 and clean['确认残留']==0
+
+
+def test_insufficient_outer_ring_for_non_distinguishing_peak_returns_uncertain():
+    cfg=EdgeSettings()
+    skin=_hsv_bgr(10,180,180)
+    mask=np.zeros((96,120),np.uint8);mask[30:50,40:60]=255  # 400 px
+    band=np.zeros_like(mask)
+    # 1) 外环完全被保护区遮住（外环像素=0）
+    guard_all=np.where(mask>0,0,255).astype(np.uint8)
+    empty_ring=measure(skin,skin.copy(),mask,band,cfg,protected=guard_all)
+    assert not empty_ring['通过'] and empty_ring['判定']=='RESIDUE_UNCERTAIN'
+    assert empty_ring['同色不适用组数']==0 and empty_ring['待目检']==400
+    assert empty_ring['组'][0]['状态']=='待目检：外环不足无法证明主色区别度'
+    assert empty_ring['组'][0]['主色模板对比'][0]['是否区别色'] is False
+
+    # 2) 外环大部分被遮挡，仅留少量同色外环像素（0 < 外环像素 < background_ring_minimum_pixels=32）：
+    #    不得判为“同色不适用（通过）”，必须判待目检（不通过）。
+    guard_partial=np.where(mask>0,0,255).astype(np.uint8)
+    guard_partial[23:27,45:49]=0  # 距 mask 距离在 [3, 7]，仅 16 px < 32
+    partial_ring=measure(skin,skin.copy(),mask,band,cfg,protected=guard_partial)
+    assert 0<partial_ring['组'][0]['外环像素']<cfg.background_ring_minimum_pixels
+    assert not partial_ring['通过'] and partial_ring['判定']=='RESIDUE_UNCERTAIN'
+    assert partial_ring['同色不适用组数']==0 and partial_ring['同色不适用施工像素']==0
+    assert partial_ring['待目检']==400
+    assert partial_ring['组'][0]['状态']=='待目检：外环不足无法证明主色区别度'
+
+
+def test_same_color_group_counted_independently_with_other_groups_and_summary():
+    from worker.roi_spatial_layers import residue_summary,residue_error
+    cfg=EdgeSettings()
+    skin=_hsv_bgr(10,180,180)
+    blue=_hsv_bgr(100,200,200)
+    m1=np.zeros((96,120),np.uint8);m1[15:35,15:35]=255  # 400 px 同色背景组
+    m2=np.zeros((96,120),np.uint8);m2[55:70,70:85]=255  # 225 px 区别色蓝水印组
+    mask=m1|m2;band=np.zeros_like(mask)
+    source=skin.copy();source[m2>0]=blue[m2>0]
+    painted_ok=skin.copy()  # 蓝水印清干净
+    ok=measure(source,painted_ok,mask,band,cfg)
+    assert ok['通过'] and ok['判定']=='通过' and ok['组数']==2
+    assert ok['同色不适用组数']==1 and ok['同色不适用施工像素']==400
+    assert ok['颜色候选']==0 and ok['区别色候选数']==0
+
+    painted_bad=source.copy()  # 蓝水印未清
+    bad=measure(source,painted_bad,mask,band,cfg)
+    assert not bad['通过'] and bad['判定']=='RESIDUE_FOUND' and bad['组数']==2
+    assert bad['同色不适用组数']==1 and bad['同色不适用施工像素']==400
+    assert bad['颜色候选']==225 and bad['区别色候选数']==225 and bad['确认残留']==225
+
+    summary_ok=residue_summary([dict(frame=0,**ok),dict(frame=1,**ok)])
+    assert summary_ok['判定']=='通过' and summary_ok['同色不适用组数']==2 and summary_ok['同色不适用施工像素']==800
+    assert summary_ok['区别色候选数']==0 and residue_error([dict(frame=0,**ok)]) is None
+    summary_mix=residue_summary([dict(frame=0,**ok),dict(frame=1,**bad)])
+    assert summary_mix['判定']=='RESIDUE_FOUND' and summary_mix['同色不适用组数']==2 and summary_mix['同色不适用施工像素']==800
+    assert summary_mix['区别色候选数']==225 and summary_mix['确认残留']==225

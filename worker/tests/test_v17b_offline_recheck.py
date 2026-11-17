@@ -25,7 +25,7 @@ def test_parse_tasks_handles_ranges_lists_and_rejects_invalid():
             parse_tasks(bad)
 
 
-def test_offline_recheck_synthetic_run_with_multiprocessing(tmp_path):
+def test_offline_recheck_synthetic_run_with_multiprocessing(tmp_path, capsys):
     run = tmp_path / 'run'
     for sub in ['frames', 'masks', 'edge-band', 'scene-protection', 'roi-0001-baseline', 'roi-0002-baseline']:
         (run / sub).mkdir(parents=True)
@@ -96,15 +96,26 @@ def test_offline_recheck_synthetic_run_with_multiprocessing(tmp_path):
 
     t1_a0, t1_a1 = loaded['任务'][0]['尝试']
     assert t1_a0['有效施工帧数'] == 3 and t1_a0['判定'] == 'RESIDUE_FOUND'
-    assert t1_a0['颜色候选'] == 1260 and t1_a0['遮罩内确认残留'] == 1200 and t1_a0['收边带确认残留'] == 60
+    assert t1_a0['颜色候选'] == 1260 and t1_a0['区别色候选数'] == 1260
+    assert t1_a0['遮罩内确认残留'] == 1200 and t1_a0['收边带确认残留'] == 60
     assert t1_a0['确认残留'] == 1260 and t1_a0['待目检'] == 0 and t1_a0['单帧最大未解释'] == 420
+    assert t1_a0['同色不适用组数'] == 0 and t1_a0['同色不适用施工像素'] == 0
     assert t1_a0['旧口径蓝色候选'] == 1260
 
     assert t1_a1['有效施工帧数'] == 3 and t1_a1['判定'] == '通过'
-    assert t1_a1['颜色候选'] == 0 and t1_a1['确认残留'] == 0 and t1_a1['旧口径蓝色候选'] == 0
+    assert t1_a1['颜色候选'] == 0 and t1_a1['区别色候选数'] == 0 and t1_a1['确认残留'] == 0 and t1_a1['旧口径蓝色候选'] == 0
 
     t2_a0 = loaded['任务'][1]['尝试'][0]
     assert t2_a0['有效施工帧数'] == 3 and t2_a0['判定'] == '通过'
-    assert t2_a0['颜色候选'] == 1260 and t2_a0['外环证实背景本色'] == 1260
+    assert t2_a0['颜色候选'] == 0 and t2_a0['区别色候选数'] == 0 and t2_a0['外环证实背景本色'] == 0
+    assert t2_a0['同色不适用组数'] == 3 and t2_a0['同色不适用施工像素'] == 1260
     assert t2_a0['确认残留'] == 0 and t2_a0['待目检'] == 0 and t2_a0['旧口径蓝色候选'] == 1260
+
     assert result['汇总']['旧口径蓝色候选'] == 2520
+    assert result['汇总']['区别色候选数'] == 1260
+    assert result['汇总']['同色不适用组数'] == 3
+    assert result['汇总']['同色不适用施工像素'] == 1260
+    stdout = capsys.readouterr().out
+    assert '区别色候选数=1260' in stdout
+    assert '同色不适用组数=3' in stdout
+    assert '同色不适用施工像素=1260' in stdout

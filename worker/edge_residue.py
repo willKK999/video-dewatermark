@@ -116,6 +116,33 @@ def matches(image,hue,cfg):
     return _matches_hsv(cv2.cvtColor(image,cv2.COLOR_BGR2HSV),hue,cfg)
 
 
+def _is_distinguishing_color(inside,outside,ring_pixels,cfg):
+    """按模板最小比例与外环对比度判断该色相峰是否为水印区别色。"""
+    if outside is None or ring_pixels<=0:return False
+    return inside>=cfg.template_minimum_fraction and inside>=cfg.template_contrast_ratio*max(outside,1/max(1,ring_pixels))
+
+
+def _evaluate_peak(hue,s_hsv,template_region,ring,ring_pixels,ring_available,cfg):
+    """计算单峰组内/外环密度并判定其是否满足水印区别色要求。"""
+    source_match=_matches_hsv(s_hsv,hue,cfg)
+    inside=float(source_match[template_region].mean()) if template_region.any() else 0.
+    outside=float(source_match[ring].mean()) if ring_pixels>0 else None
+    distinguishing=_is_distinguishing_color(inside,outside,ring_pixels,cfg)
+    if distinguishing:
+        reason='水印区别色'
+    elif outside is None:
+        reason='区别度不可判（外环为空）'
+    elif not ring_available:
+        reason='区别度不可判（外环像素不足）'
+    elif inside<cfg.template_minimum_fraction:
+        reason='非区别色（组内密度低于模板下限）'
+    else:
+        reason='非区别色（与背景同色）'
+    entry=dict(色相=hue,组内密度=round(inside,4),外环密度=None if outside is None else round(outside,4),
+               外环像素=ring_pixels,是否区别色=distinguishing,原因=reason)
+    return distinguishing,source_match,entry
+
+
 def refine_group(image,group,confirmed,protected,cfg):
     """只在本组形状的窄带寻找自身主色，禁跨越场景/字幕/高亮保护。"""
     if group.shape!=confirmed.shape or protected.shape!=confirmed.shape:raise PipelineError('MASK_INVALID','收边几何不一致')
@@ -124,9 +151,10 @@ def refine_group(image,group,confirmed,protected,cfg):
         colored=matches(image,hue,cfg);radius=cfg.template_reference_radius
         outer=(cv2.dilate(group,cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(2*radius+1,2*radius+1)))>0)&(group==0)&(protected==0)
         inner=(group>0)&(protected==0)
+        outer_n=int(outer.sum())
         inside=float(colored[inner].mean()) if inner.any() else 0.
-        outside=float(colored[outer].mean()) if outer.any() else 1.
-        if inside<cfg.template_minimum_fraction or inside<cfg.template_contrast_ratio*max(outside,1/max(1,int(outer.sum()))):hue=None
+        outside=float(colored[outer].mean()) if outer_n>0 else None
+        if not _is_distinguishing_color(inside,outside,outer_n,cfg):hue=None
     r=cfg.shape_radius
     shape=cv2.dilate(group,cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(2*r+1,2*r+1)))>0
     candidate=shape&(confirmed==0)&matches(image,hue,cfg)
@@ -153,12 +181,14 @@ def _box_count(values,size):
 
 
 RESIDUE_SCOPE=('判定口径：按确认水印组（施工掩膜与全部确认水印经shape_radius膨胀后的连通域）用冻结源图取最多template_peaks个色相峰（第一峰为主色，平顶取环形中心）；'
-               '颜色候选为补画结果在组内施工域（含收边带）中与组色相峰匹配的像素。背景本色证据二选一：'
+               '逐峰先做模板区别度检验：组内密度>=template_minimum_fraction且>=template_contrast_ratio*max(外环密度,1/max(1,外环像素))才为水印区别色，'
+               '非区别色跳过；若组内无区别色且外环像素>=background_ring_minimum_pixels则记为同色不适用，外环不足则判RESIDUE_UNCERTAIN（待目检）。'
+               '颜色候选为补画结果在组内施工域（含收边带）中与组区别色匹配的像素。背景本色证据二选一：'
                '时域=CleanReferences至少3份一致可信参考（confidence>0且counts>=3）的干净背景本身在hue_radius内匹配该色；'
                '外环=同帧源图中距全部确认水印/收边带至少background_ring_gap（>=shape_radius+1）像素、非保护区、在组外template_reference_radius内的'
                '邻域外环（半径background_ring_window，样本>=background_ring_minimum_pixels，且外半环样本>=一半）同色比例均>=background_proof_fraction。'
                '未解释候选若有时域反证或邻域外环同色比例<=background_refute_fraction则判RESIDUE_FOUND（确认残留），'
-               '否则（无足够可判背景证据，或组有>=10%彩色样本但不足建立主色模板）判RESIDUE_UNCERTAIN（待目检，绝不算通过）。'
+               '否则（无足够可判背景证据，或外环不足无法证明主色区别度，或组有>=10%彩色样本但不足建立主色模板）判RESIDUE_UNCERTAIN（待目检，绝不算通过）。'
                '允许残留门槛maximum_residue_pixels固定为0；遮罩内=施工掩膜去掉收边带，收边带单列。')
 
 
@@ -198,8 +228,9 @@ def measure(source,painted,mask,band,cfg,reference_evidence=None,confirmed=None,
     far=(distance>=gap)&~guard;far_outer=(distance>=middle)&~guard
     count,labels=cv2.connectedComponents(cv2.dilate(watermark.astype(np.uint8),_ellipse(cfg.shape_radius)),connectivity=8)
     candidates=np.zeros(shape,bool);temporal_proved=np.zeros(shape,bool);ring_proved=np.zeros(shape,bool);conflict=np.zeros(shape,bool)
-    unexplained=np.zeros(shape,bool);residue=np.zeros(shape,bool);untemplated=np.zeros(shape,bool);groups=[];reasons=[]
-    colorless=0;minimum_outer=cfg.background_ring_minimum_pixels//2
+    unexplained=np.zeros(shape,bool);residue=np.zeros(shape,bool);untemplated=np.zeros(shape,bool);ring_uncertain=np.zeros(shape,bool)
+    same_color_mask=np.zeros(shape,bool);groups=[];reasons=[]
+    colorless=0;same_color_groups=0;minimum_outer=cfg.background_ring_minimum_pixels//2
     for label in range(1,count):
         whole=labels==label
         if not np.any(whole&construction):continue
@@ -212,6 +243,7 @@ def measure(source,painted,mask,band,cfg,reference_evidence=None,confirmed=None,
         eligible=int((template_region&_colored(s_hsv,cfg)).sum());row['彩色样本']=eligible
         peaks=color_peaks(source[view],template_region,cfg,hsv=s_hsv);row['主色色相']=peaks
         if not peaks:
+            row.update(区别色列表=[],非区别色列表=[])
             if eligible>0 and eligible>=cfg.template_minimum_fraction*max(1,row['模板像素']):
                 row['状态']='待目检：组内有彩色样本但不足以建立主色模板';untemplated[view]|=work
                 reasons.append(f"组{row['组']}彩色样本{eligible}<{cfg.minimum_template_pixels}，无有效主色模板")
@@ -221,15 +253,19 @@ def measure(source,painted,mask,band,cfg,reference_evidence=None,confirmed=None,
         group_watermark=group&watermark[view]
         ring_distance=cv2.distanceTransform((~group_watermark).astype(np.uint8),cv2.DIST_L2,5)
         ring=(ring_distance<=R)&far[view];ring_outer=ring&far_outer[view]
+        ring_pixels=int(ring.sum());ring_available=ring_pixels>=cfg.background_ring_minimum_pixels
         size=2*L+1;ring_n=_box_count(ring,size);outer_n=_box_count(ring_outer,size)
         judgeable=ring_n>=cfg.background_ring_minimum_pixels
         g_cand=np.zeros(group.shape,bool);g_tp=np.zeros(group.shape,bool);g_rp=np.zeros(group.shape,bool);g_conflict=np.zeros(group.shape,bool)
-        g_unexplained=np.zeros(group.shape,bool);g_residue=np.zeros(group.shape,bool);contrast=[]
+        g_unexplained=np.zeros(group.shape,bool);g_residue=np.zeros(group.shape,bool)
+        contrast=[];distinguishing=[];non_distinguishing=[]
         for hue in peaks:
-            source_match=_matches_hsv(s_hsv,hue,cfg)
-            inside=float(source_match[template_region].mean()) if template_region.any() else 0.
-            outside=float(source_match[ring].mean()) if ring.any() else None
-            contrast.append(dict(色相=hue,组内密度=round(inside,4),外环密度=None if outside is None else round(outside,4),外环像素=int(ring.sum())))
+            is_distinguishing,source_match,entry=_evaluate_peak(hue,s_hsv,template_region,ring,ring_pixels,ring_available,cfg)
+            contrast.append(entry)
+            if not is_distinguishing:
+                non_distinguishing.append(hue)
+                continue
+            distinguishing.append(hue)
             cand=work&_matches_hsv(p_hsv,hue,cfg)
             if not cand.any():continue
             ring_c=_box_count(ring&source_match,size);outer_c=_box_count(ring_outer&source_match,size)
@@ -244,24 +280,35 @@ def measure(source,painted,mask,band,cfg,reference_evidence=None,confirmed=None,
             g_cand|=cand;g_tp|=cand&t_proof;g_rp|=cand&ring_proof;g_conflict|=cand&ring_proof&t_refute&~t_proof
             g_unexplained|=left;g_residue|=left&(t_refute|ring_refute)
         g_pending=g_unexplained&~g_residue
-        row.update(主色模板对比=contrast,外环像素=int(ring.sum()),颜色候选=int(g_cand.sum()),时域证实=int(g_tp.sum()),外环证实=int(g_rp.sum()),
+        row.update(主色模板对比=contrast,区别色列表=distinguishing,非区别色列表=non_distinguishing,
+                   外环像素=ring_pixels,颜色候选=int(g_cand.sum()),区别色候选数=int(g_cand.sum()),
+                   时域证实=int(g_tp.sum()),外环证实=int(g_rp.sum()),
                    外环证实但时域反证=int(g_conflict.sum()),确认残留=int(g_residue.sum()),待目检=int(g_pending.sum()))
-        row['状态']='确认残留' if g_residue.any() else '待目检：候选处既无时域也无外环可判证据' if g_pending.any() else '通过'
-        if g_pending.any():reasons.append(f"组{row['组']}有{int(g_pending.sum())}个主色候选无可判背景证据")
+        if distinguishing:
+            row['状态']='确认残留' if g_residue.any() else '待目检：候选处既无时域也无外环可判证据' if g_pending.any() else '通过'
+            if g_pending.any():reasons.append(f"组{row['组']}有{int(g_pending.sum())}个主色候选无可判背景证据")
+            candidates[view]|=g_cand;temporal_proved[view]|=g_tp;ring_proved[view]|=g_rp;conflict[view]|=g_conflict
+            unexplained[view]|=g_unexplained;residue[view]|=g_residue
+        elif ring_available:
+            row['状态']='颜色复检不适用：水印源色与周围背景同色'
+            same_color_groups+=1;same_color_mask[view]|=work
+        else:
+            row['状态']='待目检：外环不足无法证明主色区别度'
+            row['待目检']=int(work.sum());ring_uncertain[view]|=work
+            reasons.append(f"组{row['组']}外环像素{ring_pixels}<{cfg.background_ring_minimum_pixels}，无法证明主色区别度")
         groups.append(row)
-        candidates[view]|=g_cand;temporal_proved[view]|=g_tp;ring_proved[view]|=g_rp;conflict[view]|=g_conflict
-        unexplained[view]|=g_unexplained;residue[view]|=g_residue
-    pending=unexplained&~residue
+    pending=(unexplained&~residue)|ring_uncertain
     def split(values):return int(np.count_nonzero(values&interior)),int(np.count_nonzero(values&edge))
     ci,ce=split(candidates);ri,re=split(residue);pi,pe=split(pending);ui,ue=split(unexplained);ti,te=split(untemplated)
     unexplained_total=ui+ue
     if residue.any():verdict='RESIDUE_FOUND'
-    elif unexplained_total>cfg.maximum_residue_pixels or untemplated.any():verdict='RESIDUE_UNCERTAIN'
+    elif unexplained_total>cfg.maximum_residue_pixels or untemplated.any() or ring_uncertain.any():verdict='RESIDUE_UNCERTAIN'
     else:verdict='通过'
     return dict(判定=verdict,通过=verdict=='通过',待目检原因=reasons,组=groups,组数=len(groups),无彩色组数=colorless,
+                同色不适用组数=same_color_groups,同色不适用施工像素=int(np.count_nonzero(same_color_mask)),
                 无模板组数=sum(1 for g in groups if g['状态'].startswith('待目检：组内')),无模板遮罩内像素=ti,无模板收边带像素=te,
                 有效施工像素=int(np.count_nonzero(construction)),遮罩内像素=int(np.count_nonzero(interior)),边缘带像素=int(np.count_nonzero(edge)),统计形状=list(painted.shape),
-                遮罩内颜色候选=ci,收边带颜色候选=ce,颜色候选=ci+ce,
+                遮罩内颜色候选=ci,收边带颜色候选=ce,颜色候选=ci+ce,区别色候选数=ci+ce,
                 时域证实背景本色=int(np.count_nonzero(temporal_proved)),外环证实背景本色=int(np.count_nonzero(ring_proved)),
                 背景本色证实=int(np.count_nonzero(temporal_proved|ring_proved)),外环证实但时域反证=int(np.count_nonzero(conflict)),
                 遮罩内确认残留=ri,收边带确认残留=re,确认残留=ri+re,遮罩内待目检=pi,收边带待目检=pe,待目检=pi+pe,
