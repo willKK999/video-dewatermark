@@ -188,7 +188,8 @@ def execute(work,files,detected,log,cfg):
                                     if active.any():
                                         band_path=work/'edge-band'/files[j].name
                                         band=read_confirmed(band_path)[b:d,a:c] if band_path.exists() else np.zeros(active.shape,np.uint8)
-                                        score=measure(original[:d-b,:c-a],old,active.astype(np.uint8)*255,band & ownership[b:d,a:c],edge_cfg)
+                                        source_color=roi.crop(cv2.imread(str(files[j])),box)[:d-b,:c-a]
+                                        score=measure(source_color,old,active.astype(np.uint8)*255,band & ownership[b:d,a:c],edge_cfg)
                                         residue_scores.append(dict(frame=j,**score))
                             trial['主色残留']=residue_scores
                             trial['重叠最大差异']=maximum

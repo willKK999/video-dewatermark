@@ -161,3 +161,28 @@ def test_color_comparison_decodes_full_frames_and_rejects_empty_group_cache(tmp_
     assert len(result['frames'])==2 and result['summary']['reference']['blue_inside']==50
     for p in (base/'group-objects/g').glob('*.png'):p.unlink()
     with pytest.raises(ValueError,match='缺少确认组'):compare.execute(args)
+
+
+def test_later_layer_residue_template_comes_from_frozen_source_not_prior_repair(tmp_path,monkeypatch):
+    from worker import roi_inpaint,roi_spatial_layers
+    from worker.tests.test_roi_inpaint import fixture
+    files,d,mask=fixture(tmp_path)
+    for p in files:
+        x=cv2.imread(str(p));x[mask>0]=(220,160,30);cv2.imwrite(str(p),x)
+    manifest=json.loads((tmp_path/'layers.json').read_text());manifest['layers']*=2
+    (tmp_path/'layers.json').write_text(json.dumps(manifest));(tmp_path/'inpaint-policy.json').write_text(json.dumps(dict(continue_unpassed=True)))
+    monkeypatch.setenv('INPAINT_PYTHON','python');monkeypatch.setenv('PROPAINTER_ROOT',str(tmp_path));calls=[]
+    class References:
+        def __init__(self,*args):pass
+        def restore(self,x,m,y,**kwargs):return y
+    monkeypatch.setattr(roi_spatial_layers,'CleanReferences',References)
+    def model(args,**kw):
+        frames=Path(args[args.index('--video')+1]);md=Path(args[args.index('--mask')+1]);dest=Path(args[args.index('--output')+1])/'frames/frames';dest.mkdir(parents=True)
+        value=(50,50,50) if not calls else (220,160,30);calls.append(1)
+        for p in frames.glob('*.png'):
+            x=cv2.imread(str(p));m=cv2.imread(str(md/p.name),0);x[m>0]=value;cv2.imwrite(str(dest/p.name),x)
+    monkeypatch.setattr(roi_spatial_layers,'run',model)
+    result=roi_inpaint.execute(tmp_path,files,d,cfg=roi_inpaint.ROISettings(sequential_layers=True))
+    assert result['任务'][0]['通过'] and not result['任务'][1]['通过']
+    assert result['任务'][1]['尝试'][0]['错误码']=='RESIDUE_UNCERTAIN'
+    assert result['任务'][1]['尝试'][0]['主色残留'][0]['遮罩内残留']>0
