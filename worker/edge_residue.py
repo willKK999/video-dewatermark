@@ -192,12 +192,12 @@ RESIDUE_SCOPE=('判定口径：按确认水印组（施工掩膜与全部确认�
                '允许残留门槛maximum_residue_pixels固定为0；遮罩内=施工掩膜去掉收边带，收边带单列。')
 
 
-def measure(source,painted,mask,band,cfg,reference_evidence=None,confirmed=None,protected=None):
+def measure(source,painted,mask,band,cfg,reference_evidence=None,confirmed=None,protected=None,return_masks=False):
     """按确认水印组复检主色残留，三态：通过 / RESIDUE_FOUND（确认残留）/ RESIDUE_UNCERTAIN（待目检）。
 
     source：冻结源图裁块（BGR）；painted：写回后的补画裁块；mask：当前施工掩膜；band：收边带（须在施工掩膜内）；
     reference_evidence：CleanReferences 时域证据（background/confidence/counts）；confirmed：全部确认水印并集（含收边带）；
-    protected：场景/字幕保护区。后两者缺省时分别退化为施工掩膜与空集。
+    protected：场景/字幕保护区；return_masks：为 True 时额外返回 '_masks' 掩膜字典。后三者缺省分别退化为施工掩膜、空集与 False。
     """
     if source is None or painted is None or mask is None or band is None:
         raise PipelineError('RESIDUE_INPUT_INVALID','残留复检输入缺失')
@@ -304,7 +304,7 @@ def measure(source,painted,mask,band,cfg,reference_evidence=None,confirmed=None,
     if residue.any():verdict='RESIDUE_FOUND'
     elif unexplained_total>cfg.maximum_residue_pixels or untemplated.any() or ring_uncertain.any():verdict='RESIDUE_UNCERTAIN'
     else:verdict='通过'
-    return dict(判定=verdict,通过=verdict=='通过',待目检原因=reasons,组=groups,组数=len(groups),无彩色组数=colorless,
+    result=dict(判定=verdict,通过=verdict=='通过',待目检原因=reasons,组=groups,组数=len(groups),无彩色组数=colorless,
                 同色不适用组数=same_color_groups,同色不适用施工像素=int(np.count_nonzero(same_color_mask)),
                 无模板组数=sum(1 for g in groups if g['状态'].startswith('待目检：组内')),无模板遮罩内像素=ti,无模板收边带像素=te,
                 有效施工像素=int(np.count_nonzero(construction)),遮罩内像素=int(np.count_nonzero(interior)),边缘带像素=int(np.count_nonzero(edge)),统计形状=list(painted.shape),
@@ -314,3 +314,6 @@ def measure(source,painted,mask,band,cfg,reference_evidence=None,confirmed=None,
                 遮罩内确认残留=ri,收边带确认残留=re,确认残留=ri+re,遮罩内待目检=pi,收边带待目检=pe,待目检=pi+pe,
                 遮罩内残留=ui,收边带残留=ue,未解释候选=unexplained_total,时域证据可用=temporal is not None,
                 阈值=cfg.maximum_residue_pixels,阈值单位='像素/施工帧',口径=RESIDUE_SCOPE)
+    if return_masks:
+        result['_masks']=dict(确认残留=residue,待目检=pending,颜色候选=candidates)
+    return result

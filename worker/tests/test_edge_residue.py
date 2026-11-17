@@ -497,3 +497,67 @@ def test_same_color_group_counted_independently_with_other_groups_and_summary():
     summary_mix=residue_summary([dict(frame=0,**ok),dict(frame=1,**bad)])
     assert summary_mix['判定']=='RESIDUE_FOUND' and summary_mix['同色不适用组数']==2 and summary_mix['同色不适用施工像素']==800
     assert summary_mix['区别色候选数']==225 and summary_mix['确认残留']==225
+
+
+def test_measure_return_masks_matches_counts_and_default_omits_masks():
+    cfg=EdgeSettings()
+    h,w=160,220
+    blue=_hsv_bgr(100,200,200,(h,w))
+    skin=_hsv_bgr(10,180,180,(h,w))
+    source=np.full((h,w,3),40,np.uint8)
+    mask=np.zeros((h,w),np.uint8)
+    band=np.zeros((h,w),np.uint8)
+    guard=np.zeros((h,w),np.uint8)
+
+    # 组1：确认残留（含遮罩内与收边带）
+    mask[15:35,15:35]=255
+    band[14:15,15:35]=255
+    mask|=band
+    source[14:35,15:35]=blue[14:35,15:35]
+
+    # 组2：局部外环被保护区遮住导致候选处待目检（底侧留足>=32非保护外环证明区别色，候选邻域窗内外环<32）
+    mask[60:85,15:35]=255
+    source[60:85,15:35]=blue[60:85,15:35]
+    guard[50:96,5:45]=255
+    guard[60:85,15:35]=0
+    guard[88:93,15:25]=0  # 50 px 非保护外环，距 y<68 超过 background_ring_window=16
+
+    # 组3：外环不足且无区别色的 ring_uncertain 待目检组
+    mask[15:35,140:160]=255
+    source[15:35,140:160]=skin[15:35,140:160]
+    guard[5:45,130:170]=255
+    guard[15:35,140:160]=0
+
+    # 组4：局部外环证实为背景本色的彩色候选（通过，计入颜色候选，不计入确认残留或待目检）
+    mask[100:120,140:160]=255
+    source[90:104,130:170]=blue[90:104,130:170]
+    source[100:120,140:160]=blue[100:120,140:160]
+
+    painted=np.full((h,w,3),40,np.uint8)
+    painted[14:35,15:35]=blue[14:35,15:35]
+    painted[60:68,15:35]=blue[60:68,15:35]
+    painted[100:102,142:158]=blue[100:102,142:158]
+
+    default_res=measure(source,painted,mask,band,cfg,protected=guard)
+    false_res=measure(source,painted,mask,band,cfg,protected=guard,return_masks=False)
+    assert '_masks' not in default_res and '_masks' not in false_res
+
+    with_masks=measure(source,painted,mask,band,cfg,protected=guard,return_masks=True)
+    assert '_masks' in with_masks
+    masks=with_masks.pop('_masks')
+    assert with_masks==default_res and default_res==false_res
+    assert set(masks.keys())=={'确认残留','待目检','颜色候选'}
+
+    interior=(mask>0)&(band==0)
+    edge=band>0
+    for key in ['确认残留','待目检','颜色候选']:
+        arr=masks[key]
+        assert isinstance(arr,np.ndarray) and arr.dtype==np.bool_ and arr.shape==(h,w)
+        assert int(np.count_nonzero(arr))==with_masks[key]
+        assert int(np.count_nonzero(arr&interior))==with_masks[f'遮罩内{key}']
+        assert int(np.count_nonzero(arr&edge))==with_masks[f'收边带{key}']
+
+    assert with_masks['确认残留']==420 and with_masks['遮罩内确认残留']==400 and with_masks['收边带确认残留']==20
+    assert with_masks['待目检']==160+400
+    assert with_masks['颜色候选']==420+160+32
+
