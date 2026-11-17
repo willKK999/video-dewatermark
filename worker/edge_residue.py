@@ -28,6 +28,13 @@ class EdgeSettings:
     background_refute_fraction:float=.1
     maximum_residue_pixels:int=0
     composite_mode:str='confirmed_replace'
+    require_ring_for_refinement:bool=False
+    hole_completion_radius:int=18
+    hole_completion_min_area:int=12
+    hole_completion_min_neighbors:int=3
+    hole_completion_overlap_fraction:float=.5
+    residue_repair_rounds:int=0
+    residue_repair_dilate_radius:int=5
 
     def __post_init__(self):
         if not 0<=self.shape_radius<=3 or not 0<self.hue_radius<=15:raise ValueError('形状收边范围无效')
@@ -45,6 +52,11 @@ class EdgeSettings:
             raise ValueError('外环反证比例必须在0到25%之间且不超过证实比例的一半')
         if self.maximum_residue_pixels!=0:raise ValueError('残留门槛不得放宽')
         if self.composite_mode!='confirmed_replace':raise ValueError('禁止将源水印混回确认域')
+        if not 0<=self.hole_completion_radius<=32 or self.hole_completion_min_area<1 or self.hole_completion_min_neighbors<2:
+            raise ValueError('同色孔洞补全参数无效')
+        if not 0<self.hole_completion_overlap_fraction<=1:raise ValueError('同色孔洞邻帧重合比例无效')
+        if not 0<=self.residue_repair_rounds<=2 or not 1<=self.residue_repair_dilate_radius<=12:
+            raise ValueError('确认残留补修参数无效')
 
 
 def highlight_guard(image):
@@ -154,7 +166,7 @@ def refine_group(image,group,confirmed,protected,cfg):
         outer_n=int(outer.sum())
         inside=float(colored[inner].mean()) if inner.any() else 0.
         outside=float(colored[outer].mean()) if outer_n>0 else None
-        if not _is_distinguishing_color(inside,outside,outer_n,cfg):hue=None
+        if (cfg.require_ring_for_refinement and outer_n<cfg.background_ring_minimum_pixels) or not _is_distinguishing_color(inside,outside,outer_n,cfg):hue=None
     r=cfg.shape_radius
     shape=cv2.dilate(group,cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(2*r+1,2*r+1)))>0
     candidate=shape&(confirmed==0)&matches(image,hue,cfg)
@@ -167,6 +179,62 @@ def refine_group(image,group,confirmed,protected,cfg):
 def composite(original,repaired,mask):
     # 已确认水印的内侧边缘也不可复用原水印颜色。施工域外由调用方逐像素保持。
     result=original.copy();result[mask>0]=repaired[mask>0];return result
+
+
+def complete_group_color_holes(image,group,confirmed,protected,neighbor_groups,cfg):
+    """在确认水印组附近按区别色模板与邻帧组掩膜重合证据，通用补全单帧漏检的非保护色块孔洞。"""
+    if group.shape!=confirmed.shape or protected.shape!=confirmed.shape:raise PipelineError('MASK_INVALID','同色孔洞补全几何不一致')
+    if cfg.hole_completion_radius<=0 or not neighbor_groups:
+        return np.zeros_like(confirmed,dtype=np.uint8),dict(hues=[],候选像素=0,新增像素=0,保护交集像素=0)
+    group_b=group>0;prot_b=protected>0;inner=group_b&~prot_b
+    if not np.any(inner):
+        return np.zeros_like(confirmed,dtype=np.uint8),dict(hues=[],候选像素=0,新增像素=0,保护交集像素=0)
+    peaks=color_peaks(image,inner,cfg)
+    hsv=cv2.cvtColor(image,cv2.COLOR_BGR2HSV)
+    rad=cfg.template_reference_radius
+    outer=(cv2.dilate(group_b.astype(np.uint8)*255,cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(2*rad+1,2*rad+1)))>0)&(~group_b)&(~prot_b)
+    outer_n=int(outer.sum())
+    dist_peaks=[];colored_union=np.zeros(group.shape,dtype=bool)
+    for pk in peaks:
+        cm=_matches_hsv(hsv,int(pk),cfg)
+        inside=float(cm[inner].mean())
+        outside=float(cm[outer].mean()) if outer_n>0 else None
+        if _is_distinguishing_color(inside,outside,outer_n,cfg):
+            dist_peaks.append(int(pk));colored_union|=cm
+    if not dist_peaks:
+        return np.zeros_like(confirmed,dtype=np.uint8),dict(hues=[],候选像素=0,新增像素=0,保护交集像素=0)
+    r=cfg.hole_completion_radius
+    near=cv2.dilate(group_b.astype(np.uint8)*255,cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(2*r+1,2*r+1)))>0
+    guard=prot_b|highlight_guard(image)
+    cand=colored_union&near&(confirmed==0)&(~guard)
+    if not np.any(cand):
+        return np.zeros_like(confirmed,dtype=np.uint8),dict(hues=dist_peaks,候选像素=0,新增像素=0,保护交集像素=0)
+    ys0,xs0=np.where(group_b);cx0,cy0=float(xs0.mean()),float(ys0.mean());area0=float(len(ys0))
+    nbr_info=[]
+    for nm in neighbor_groups:
+        nb=nm>0
+        if not np.any(nb):continue
+        yn,xn=np.where(nb)
+        nbr_info.append((nb,float(xn.mean()),float(yn.mean()),float(len(yn))))
+    if len(nbr_info)<cfg.hole_completion_min_neighbors:
+        return np.zeros_like(confirmed,dtype=np.uint8),dict(hues=dist_peaks,候选像素=int(cand.sum()),新增像素=0,保护交集像素=0)
+    ncc,lbl,st,_=cv2.connectedComponentsWithStats(cand.astype(np.uint8))
+    added=np.zeros(group.shape,dtype=bool)
+    h,w=group.shape[:2]
+    for k in range(1,ncc):
+        if int(st[k,cv2.CC_STAT_AREA])<cfg.hole_completion_min_area:continue
+        cc=(lbl==k);cy_c,cx_c=np.where(cc);c_area=float(len(cy_c))
+        direct_hits=0;shifted_hits=0
+        for nb,cxn,cyn,arean in nbr_info:
+            if float(np.count_nonzero(nb&cc))/c_area>=cfg.hole_completion_overlap_fraction:direct_hits+=1
+            if 0.3*area0<arean<3.0*area0:dx,dy=int(round(cxn-cx0)),int(round(cyn-cy0))
+            else:dx,dy=0,0
+            ny,nx=cy_c+dy,cx_c+dx
+            ok=(ny>=0)&(ny<h)&(nx>=0)&(nx<w)
+            if ok.any() and float(np.count_nonzero(nb[ny[ok],nx[ok]]))/c_area>=cfg.hole_completion_overlap_fraction:shifted_hits+=1
+        if direct_hits>=cfg.hole_completion_min_neighbors or shifted_hits>=cfg.hole_completion_min_neighbors:added|=cc
+    if np.any(added&guard):raise PipelineError('MASK_UNCERTAIN','同色孔洞补全侵入保护区')
+    return added.astype(np.uint8)*255,dict(hues=dist_peaks,候选像素=int(cand.sum()),新增像素=int(added.sum()),保护交集像素=int((added&guard).sum()))
 
 
 def _binary(value,name,shape):
@@ -210,7 +278,7 @@ def measure(source,painted,mask,band,cfg,reference_evidence=None,confirmed=None,
     shape=mask.shape
     known=_binary(confirmed,'确认水印并集',shape);guard=_binary(protected,'保护区',shape)
     if guard is None:guard=np.zeros(shape,bool)
-    temporal=None
+    temporal=None;donor_eval=None
     if reference_evidence is not None:
         if not isinstance(reference_evidence,dict) or not {'background','confidence','counts'}<=reference_evidence.keys():
             raise PipelineError('RESIDUE_INPUT_INVALID','干净参考证据字段缺失')
@@ -219,6 +287,8 @@ def measure(source,painted,mask,band,cfg,reference_evidence=None,confirmed=None,
             raise PipelineError('RESIDUE_INPUT_INVALID','干净参考证据未与施工裁块对齐')
         trusted=(confidence>0)&(counts>=3)
         if trusted.any():temporal=(trusted,cv2.cvtColor(background,cv2.COLOR_BGR2HSV))
+        if callable(reference_evidence.get('evaluate_peak')):
+            donor_eval=reference_evidence['evaluate_peak']
     construction=mask>0;edge=band>0;interior=construction&~edge
     watermark=construction|edge|(known if known is not None else False)
     source_hsv=cv2.cvtColor(source,cv2.COLOR_BGR2HSV);painted_hsv=cv2.cvtColor(painted,cv2.COLOR_BGR2HSV)
@@ -275,6 +345,15 @@ def measure(source,painted,mask,band,cfg,reference_evidence=None,confirmed=None,
             if temporal is not None:
                 trusted=temporal[0][view];background_match=_matches_hsv(temporal[1][view],hue,cfg)
                 t_proof=trusted&background_match;t_refute=trusted&~background_match
+            if donor_eval is not None:
+                seen_f,exact_f,dil1_f=donor_eval(hue,cfg,painted_hsv)
+                seen=seen_f[view];exact_h=exact_f[view];dil1_h=dil1_f[view]
+                hue_proof=(seen>=3)&(exact_h>=3)&(exact_h*2>=seen)
+                adj_strict=cv2.dilate(hue_proof.astype(np.uint8),np.ones((3,3),np.uint8))>0
+                hue_proof|=adj_strict&(seen>=3)&(dil1_h>=3)&(dil1_h*2>=seen)
+                # 仅允许严格RGB一致共识触发时域反证；局部色相举证仅作正例背景证实，避免薄边插值抖动误将待目检升级为确认残留。
+                t_proof=t_proof|hue_proof
+                t_refute=t_refute&~hue_proof
             # 时域干净参考反证优先：外环证实不能覆盖“该处背景本色不是主色”的时域证据。
             left=cand&~(t_proof|(ring_proof&~t_refute))
             g_cand|=cand;g_tp|=cand&t_proof;g_rp|=cand&ring_proof;g_conflict|=cand&ring_proof&t_refute&~t_proof
@@ -312,7 +391,7 @@ def measure(source,painted,mask,band,cfg,reference_evidence=None,confirmed=None,
                 时域证实背景本色=int(np.count_nonzero(temporal_proved)),外环证实背景本色=int(np.count_nonzero(ring_proved)),
                 背景本色证实=int(np.count_nonzero(temporal_proved|ring_proved)),外环证实但时域反证=int(np.count_nonzero(conflict)),
                 遮罩内确认残留=ri,收边带确认残留=re,确认残留=ri+re,遮罩内待目检=pi,收边带待目检=pe,待目检=pi+pe,
-                遮罩内残留=ui,收边带残留=ue,未解释候选=unexplained_total,时域证据可用=temporal is not None,
+                遮罩内残留=ui,收边带残留=ue,未解释候选=unexplained_total,时域证据可用=(temporal is not None or donor_eval is not None),
                 阈值=cfg.maximum_residue_pixels,阈值单位='像素/施工帧',口径=RESIDUE_SCOPE)
     if return_masks:
         result['_masks']=dict(确认残留=residue,待目检=pending,颜色候选=candidates)

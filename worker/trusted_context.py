@@ -13,12 +13,16 @@ class ContextSettings:
     model_sample_count:int=3
     retain_stage_sample_count:int=1
     boundary_exclusion_pixels:int=3
+    dense_reference_frames:int=24
+    detail_preserve_mode:str='none'
 
     def __post_init__(self):
         if self.mask_fraction_limit!=.2:raise ValueError('20%保护不得放宽')
         if self.strategy!='stable_union_or_stop':raise ValueError('不支持隐式跨层回退')
         if not 1<=self.model_sample_count<=3 or not 0<=self.retain_stage_sample_count<=1:raise ValueError('抽样配置超出磁盘预算')
         if not 0<=self.boundary_exclusion_pixels<=8:raise ValueError('可信区边界配置无效')
+        if self.dense_reference_frames<3 or self.dense_reference_frames>96:raise ValueError('参考帧抽样数量超出合理区间')
+        if self.detail_preserve_mode not in {'none','orthogonal_luma'}:raise ValueError('细节保留模式无效')
 
 
 def exclusion_mask(confirmed,cfg):

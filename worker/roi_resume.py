@@ -67,7 +67,7 @@ def recheck(state,row,ownership,work,files,refs,box,start,end,edge_cfg,settings,
         if covered is None or np.any((active>0)&(covered[b:d,a:c]==0)):
             raise PipelineError('CHECKPOINT_INCOMPATIBLE','旧任务有未完成施工像素，禁止用原帧伪装完整检查点')
         source=roi.crop(cv2.imread(str(files[j])),box);mask=roi.crop(confirmed,box,True)
-        evidence={key:value[:d-b,:c-a] for key,value in references.reference_evidence(source,mask,confirmed=mask).items()}
+        evidence={key:(value[:d-b,:c-a] if hasattr(value,'shape') else value) for key,value in references.reference_evidence(source,mask,confirmed=mask).items()}
         image=cv2.imread(str(work/'roi-layer-00'/files[j].name))[b:d,a:c]
         band_path=work/'edge-band'/files[j].name;band=(read_confirmed(band_path)[b:d,a:c]&active) if band_path.exists() else np.zeros(active.shape,np.uint8)
         protected=protection_mask(work,files[j].name,confirmed.shape)[b:d,a:c]
