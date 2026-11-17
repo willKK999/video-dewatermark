@@ -6,6 +6,8 @@ import cv2,numpy as np
 from .process import PipelineError
 from .restoration import CleanReferences
 from .edge_residue import measure
+from .roi_spatial_layers import protection_mask,residue_summary,residue_error
+from .trusted_context import read_confirmed
 from . import roi_inpaint as roi
 
 
@@ -59,7 +61,7 @@ def recheck(state,row,ownership,work,files,refs,box,start,end,edge_cfg,settings,
                                [roi.crop(cv2.imread(str(work/'masks'/files[j].name),0),box,True) for j in refs])
     scores=[];begin=time.monotonic()
     for j in range(start,end):
-        confirmed=cv2.imread(str(work/'masks'/files[j].name),0);active=(confirmed&ownership)[b:d,a:c]
+        confirmed=read_confirmed(work/'masks'/files[j].name);active=(confirmed&ownership)[b:d,a:c]
         if not active.any():continue
         covered=state['done'].get(j)
         if covered is None or np.any((active>0)&(covered[b:d,a:c]==0)):
@@ -67,15 +69,22 @@ def recheck(state,row,ownership,work,files,refs,box,start,end,edge_cfg,settings,
         source=roi.crop(cv2.imread(str(files[j])),box);mask=roi.crop(confirmed,box,True)
         evidence={key:value[:d-b,:c-a] for key,value in references.reference_evidence(source,mask,confirmed=mask).items()}
         image=cv2.imread(str(work/'roi-layer-00'/files[j].name))[b:d,a:c]
-        band_path=work/'edge-band'/files[j].name;band=cv2.imread(str(band_path),0)[b:d,a:c]&active if band_path.exists() else np.zeros(active.shape,np.uint8)
-        scores.append(dict(frame=j,**measure(source[:d-b,:c-a],image,active,band,edge_cfg,reference_evidence=evidence)))
+        band_path=work/'edge-band'/files[j].name;band=(read_confirmed(band_path)[b:d,a:c]&active) if band_path.exists() else np.zeros(active.shape,np.uint8)
+        protected=protection_mask(work,files[j].name,confirmed.shape)[b:d,a:c]
+        scores.append(dict(frame=j,**measure(source[:d-b,:c-a],image,active,band,edge_cfg,reference_evidence=evidence,confirmed=confirmed[b:d,a:c],protected=protected)))
         if (j-start)%20==0:log(f'续跑旧任务={number} 只读复检帧={j}，未运行模型')
     chosen=next((t for t in old['尝试'] if t.get('通过')),None)
     if chosen is None:chosen=next((t for t in old['尝试'] if t['尝试']==old.get('最佳尝试')),None)
     if chosen is None or not scores:raise PipelineError('CHECKPOINT_INCOMPATIBLE','完整前缀缺少已采用尝试或非空施工样本')
-    seam=chosen['重叠最大差异'];passed=seam is not None and seam<=settings.overlap_mae_limit and all(s['通过'] for s in scores)
+    seam=chosen['重叠最大差异'];summary=residue_summary(scores);failure=residue_error(scores)
+    passed=seam is not None and seam<=settings.overlap_mae_limit and failure is None
     row.update(尝试=old['尝试'],原运行通过=old['通过'],原运行未过=old.get('未过块',False),复用检查点=True,复用来源=str(state['source']),
-               复用后复检=scores,复检耗时秒=time.monotonic()-begin,历史补画耗时秒=old['耗时秒'],耗时秒=time.monotonic()-begin,
+               复用后复检=scores,残留汇总=summary,残留判定=summary['判定'],复检耗时秒=time.monotonic()-begin,历史补画耗时秒=old['耗时秒'],耗时秒=time.monotonic()-begin,
                重叠最大差异=seam,通过=bool(passed),原检查记录保留=True)
-    if not passed:row.update(未过块=True,采用未过结果=True,错误码='SEAM_UNCERTAIN' if seam is None or seam>settings.overlap_mae_limit else 'RESIDUE_UNCERTAIN')
+    if not passed:
+        code='SEAM_UNCERTAIN' if seam is None or seam>settings.overlap_mae_limit else failure.code
+        row.update(未过块=True,采用未过结果=True,错误码=code)
+        if failure is not None:
+            row['待目检说明']=('确认残留：背景证据表明该处背景不是水印主色，需补修；颜色问题换接缝窗口无效，不重试' if failure.code=='RESIDUE_FOUND'
+                             else '待目检：主色候选或无模板组缺少可判背景证据，需人工目检，不算通过；颜色问题换接缝窗口无效，不重试')
     return row

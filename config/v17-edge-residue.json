@@ -9,11 +9,10 @@
   "template_contrast_ratio": 2.0,
   "template_minimum_fraction": 0.1,
   "template_reference_radius": 8,
-  "residue_hue_ranges": [
-    [
-      85,
-      130
-    ]
-  ],
-  "clean_reference_tolerance": 0
+  "template_peaks": 3,
+  "background_ring_gap": 3,
+  "background_ring_window": 16,
+  "background_ring_minimum_pixels": 32,
+  "background_proof_fraction": 0.5,
+  "background_refute_fraction": 0.1
 }

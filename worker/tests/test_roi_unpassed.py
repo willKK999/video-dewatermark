@@ -26,26 +26,37 @@ def setup(tmp_path,monkeypatch,layers=2):
 
 def test_four_original_seam_attempts_choose_best_without_passing_and_continue_layers(tmp_path,monkeypatch):
     files,d,mask=setup(tmp_path,monkeypatch);calls=[]
+    # 扩展到9帧并仅在第5帧放置第二连通域，使失败任务落在场景中部窗(3,8)，4次接缝参数互不重复。
+    monkeypatch.setenv('HLS_WINDOW_FRAMES','5');monkeypatch.setenv('HLS_OVERLAP_FRAMES','2')
+    base_mask=np.zeros_like(mask);base_mask[35:50,40:70]=255
+    for i in range(9):
+        p=tmp_path/'frames'/f'{i:06d}.png'
+        if i>=6:cv2.imwrite(str(p),np.full((240,320,3),20+i,np.uint8));files.append(p)
+        frame_mask=mask if i==5 else base_mask
+        for folder in ['masks','layer-00/masks','validated-objects/1']:cv2.imwrite(str(tmp_path/folder/p.name),frame_mask)
+    d['scenes']=[[0,9]];d['tracks'][0]['hints']=[dict(frame=i) for i in range(9)]
     def model(args,**kwargs):
-        n=len(calls);calls.append(args);delta=[20,80,70,60,75][n] if n<5 else 20
+        n=len(calls);calls.append(args);delta=[20,20,80,70,60,75][n] if n<6 else 20
         frames=Path(args[args.index('--video')+1]);masks=Path(args[args.index('--mask')+1]);out=Path(args[args.index('--output')+1])/'frames/frames';out.mkdir(parents=True)
         for p in frames.glob('*.png'):
             x=cv2.imread(str(p));m=cv2.imread(str(masks/p.name),0);x[m>0]+=delta;cv2.imwrite(str(out/p.name),x)
     monkeypatch.setattr(roi_spatial_layers,'run',model)
     result=roi_inpaint.execute(tmp_path,files,d,cfg=roi_inpaint.ROISettings(sequential_layers=True,context_ratio=.25,minimum_context=32))
-    failed=result['任务'][1]
-    assert [p['subvideo_length'] for p in failed['尝试']]==[36,36,36,18]
+    failed=result['任务'][2]
+    assert [p['subvideo_length'] for p in failed['尝试']]==[5,5,5,2]
     assert [p['重叠最大差异'] for p in failed['尝试']]==[60,50,40,55]
     assert not failed['通过'] and failed['最佳尝试']==2 and failed['采用未过结果']
-    assert result['未过块']==[2] and not result['全部ROI通过'] and result['覆盖核验通过']
-    assert len(result['任务'])==4 and all(p['通过'] for p in result['任务'][2:])
-    for p in files:
-        old=cv2.imread(str(p));new=cv2.imread(str(tmp_path/'composite'/p.name));assert np.array_equal(old[mask==0],new[mask==0])
-        assert np.all(new[50:60,160:190]==old[50:60,160:190]+80)
+    assert result['未过块']==[3] and not result['全部ROI通过'] and result['覆盖核验通过']
+    assert len(result['任务'])==8 and all(p['通过'] for p in result['任务'] if p['任务']!=3)
+    for i,p in enumerate(files):
+        old=cv2.imread(str(p));new=cv2.imread(str(tmp_path/'composite'/p.name));frame_mask=mask if i==5 else base_mask
+        assert np.array_equal(old[frame_mask==0],new[frame_mask==0])
+    old5=cv2.imread(str(files[5]));new5=cv2.imread(str(tmp_path/'composite'/files[5].name))
+    assert np.all(new5[50:60,160:190]==old5[50:60,160:190]+80)
     # 失败暂存是无损缓存，后续层改写结果后仍可重建原尝试。
-    image=restore(tmp_path/'roi-0002-attempt-02',tmp_path/'roi-0002-baseline',files[0].name)
-    assert np.all(image[50:60,160:190]==80)
-    assert (tmp_path/'roi-0002-attempt-02/seam-difference'/files[0].name).exists()
+    image=restore(tmp_path/'roi-0003-attempt-02',tmp_path/'roi-0003-baseline',files[5].name)
+    assert np.all(image[50:60,160:190]==85)
+    assert (tmp_path/'roi-0003-attempt-02/seam-difference'/files[5].name).exists()
 
 
 def test_no_complete_candidate_continues_other_tasks_but_refuses_source_fallback(tmp_path,monkeypatch):

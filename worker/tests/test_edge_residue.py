@@ -34,8 +34,12 @@ def test_confirmed_edge_does_not_mix_source_watermark_and_reports_both_domains()
     x,m=sample();repair=np.full_like(x,30);a,_=refine_group(x,m,m,np.zeros_like(m),EdgeSettings())
     output=composite(x,repair,m|a)
     assert np.array_equal(output[(m|a)==0],x[(m|a)==0])
-    assert measure(x,output,m,a,EdgeSettings())['通过']
-    assert not measure(x,x,m,a,EdgeSettings())['通过']
+    assert measure(x,output,m|a,a,EdgeSettings())['通过']
+    source_check=measure(x,x,m|a,a,EdgeSettings())
+    assert not source_check['通过'] and source_check['判定']=='RESIDUE_FOUND'
+    assert source_check['遮罩内确认残留']>0 and source_check['收边带确认残留']>0
+    with pytest.raises(PipelineError) as exc:measure(x,output,m,a,EdgeSettings())
+    assert exc.value.code=='RESIDUE_INPUT_INVALID'
     with pytest.raises(ValueError):EdgeSettings(maximum_residue_pixels=1)
 
 
@@ -97,12 +101,17 @@ def test_wrong_exclusion_builder_cannot_fool_independent_audit(tmp_path,monkeypa
     report=json.loads((tmp_path/'roi-report.json').read_text());assert len(report['任务'])==1
 
 
-def test_residue_retries_all_v6_variants_and_remains_unpassed(tmp_path,monkeypatch):
+@pytest.mark.parametrize('protect_ring,expected_code',[(False,'RESIDUE_FOUND'),(True,'RESIDUE_UNCERTAIN')])
+def test_residue_errors_do_not_trigger_seam_retries_and_remain_unpassed(tmp_path,monkeypatch,protect_ring,expected_code):
     from worker import roi_inpaint,roi_spatial_layers
     from worker.tests.test_roi_inpaint import fixture
     files,d,mask=fixture(tmp_path)
     for p in files:
         x=cv2.imread(str(p));x[mask>0]=(220,160,30);cv2.imwrite(str(p),x)
+    if protect_ring:
+        (tmp_path/'scene-protection').mkdir()
+        guard=np.where(mask>0,0,255).astype(np.uint8)
+        for p in files:cv2.imwrite(str(tmp_path/'scene-protection'/p.name),guard)
     (tmp_path/'inpaint-policy.json').write_text(json.dumps(dict(continue_unpassed=True)))
     monkeypatch.setenv('INPAINT_PYTHON','python');monkeypatch.setenv('PROPAINTER_ROOT',str(tmp_path));calls=[]
     def model(args,**kw):
@@ -110,8 +119,9 @@ def test_residue_retries_all_v6_variants_and_remains_unpassed(tmp_path,monkeypat
         for p in frames.glob('*.png'):cv2.imwrite(str(out/p.name),cv2.imread(str(p)))
     monkeypatch.setattr(roi_spatial_layers,'run',model)
     result=roi_inpaint.execute(tmp_path,files,d,cfg=roi_inpaint.ROISettings(sequential_layers=True,seam_retries=3))
-    assert len(calls)==4 and result['未过块']==[1] and not result['全部ROI通过']
-    assert all(t['错误码']=='RESIDUE_UNCERTAIN' for t in result['任务'][0]['尝试'])
+    assert len(calls)==1 and result['未过块']==[1] and not result['全部ROI通过']
+    assert [t['错误码'] for t in result['任务'][0]['尝试']]==[expected_code]
+    assert result['任务'][0]['残留判定']==expected_code
     assert result['任务'][0]['采用未过结果'] and result['原帧回退数']==0
 
 
@@ -184,5 +194,185 @@ def test_later_layer_residue_template_comes_from_frozen_source_not_prior_repair(
     monkeypatch.setattr(roi_spatial_layers,'run',model)
     result=roi_inpaint.execute(tmp_path,files,d,cfg=roi_inpaint.ROISettings(sequential_layers=True))
     assert result['任务'][0]['通过'] and not result['任务'][1]['通过']
-    assert result['任务'][1]['尝试'][0]['错误码']=='RESIDUE_UNCERTAIN'
+    assert result['任务'][1]['尝试'][0]['错误码']=='RESIDUE_FOUND'
+    assert result['任务'][1]['尝试'][0]['主色残留'][0]['遮罩内确认残留']>0
     assert result['任务'][1]['尝试'][0]['主色残留'][0]['遮罩内残留']>0
+
+
+def _hsv_bgr(h,s,v,shape=(96,120)):
+    hsv=np.zeros((shape[0],shape[1],3),np.uint8)
+    hsv[...,0]=h;hsv[...,1]=s;hsv[...,2]=v
+    return cv2.cvtColor(hsv,cv2.COLOR_HSV2BGR)
+
+
+def test_color_template_flat_plateau_center():
+    from worker.edge_residue import color_template,color_peaks
+    cfg=EdgeSettings()
+    mask=np.zeros((96,120),np.uint8);mask[20:40,20:40]=255
+    for hue in [100,2,178]:
+        img=_hsv_bgr(hue,200,200)
+        assert color_template(img,mask,cfg)==hue
+    # 大面积橙色背景 + 小面积蓝色水印，多峰仍能把蓝色水印峰拆出。
+    mixed=_hsv_bgr(15,200,200)
+    mixed[20:28,20:28]=_hsv_bgr(100,200,200,(8,8))
+    peaks=color_peaks(mixed,mask,cfg)
+    assert peaks[0]==15 and any(abs(p-100)<=2 for p in peaks[1:])
+
+
+def test_measure_temporal_proof_matches_hue_without_exact_rgb_equality():
+    cfg=EdgeSettings()
+    source=np.full((96,120,3),40,np.uint8)
+    mask=np.zeros((96,120),np.uint8);mask[30:50,40:60]=255
+    band=np.zeros_like(mask)
+    source[mask>0]=_hsv_bgr(100,200,200)[mask>0]
+    painted=np.full((96,120,3),40,np.uint8)
+    painted[mask>0]=_hsv_bgr(102,150,180)[mask>0]
+    bg=np.full((96,120,3),40,np.uint8)
+    bg[mask>0]=_hsv_bgr(99,180,220)[mask>0]
+    assert not np.array_equal(painted[mask>0],bg[mask>0])
+    evidence=dict(background=bg,confidence=(mask>0).astype(np.uint8),counts=np.where(mask>0,3,0).astype(np.uint8))
+    ok=measure(source,painted,mask,band,cfg,reference_evidence=evidence)
+    assert ok['通过'] and ok['判定']=='通过' and ok['时域证实背景本色']==400 and ok['确认残留']==0
+    weak=dict(background=bg,confidence=(mask>0).astype(np.uint8),counts=np.where(mask>0,2,0).astype(np.uint8))
+    refuted=measure(source,painted,mask,band,cfg,reference_evidence=weak)
+    assert not refuted['通过'] and refuted['判定']=='RESIDUE_FOUND'
+
+
+def test_measure_outer_ring_proves_background_color():
+    cfg=EdgeSettings()
+    blue=_hsv_bgr(100,200,200)
+    mask=np.zeros((96,120),np.uint8);mask[30:50,40:60]=255
+    band=np.zeros_like(mask)
+    ok=measure(blue,blue.copy(),mask,band,cfg)
+    assert ok['通过'] and ok['判定']=='通过' and ok['外环证实背景本色']==400 and ok['背景本色证实']==400 and ok['确认残留']==0
+    guard=np.where(mask>0,0,255).astype(np.uint8)
+    blocked=measure(blue,blue.copy(),mask,band,cfg,protected=guard)
+    assert not blocked['通过'] and blocked['判定']=='RESIDUE_UNCERTAIN' and blocked['外环证实背景本色']==0
+
+
+def test_measure_adjacent_halo_cannot_prove_background():
+    cfg=EdgeSettings()
+    source=np.full((96,120,3),40,np.uint8)
+    mask=np.zeros((96,120),np.uint8);mask[30:50,40:60]=255
+    halo=np.zeros_like(mask);halo[28:52,38:62]=255
+    blue=_hsv_bgr(100,200,200)
+    source[halo>0]=blue[halo>0]
+    painted=source.copy()
+    res=measure(source,painted,mask,np.zeros_like(mask),cfg)
+    assert not res['通过'] and res['判定']=='RESIDUE_FOUND' and res['外环证实背景本色']==0 and res['确认残留']==400
+    # 相邻已确认水印并集若占满外环区域，传入 confirmed 后不得被当作外环背景证据。
+    confirmed=mask.copy();confirmed[30:50,60:72]=255
+    source_adj=np.full((96,120,3),40,np.uint8)
+    source_adj[confirmed>0]=blue[confirmed>0]
+    res_adj=measure(source_adj,source_adj.copy(),mask,np.zeros_like(mask),cfg,confirmed=confirmed)
+    assert not res_adj['通过'] and res_adj['判定']=='RESIDUE_FOUND' and res_adj['外环证实背景本色']==0
+
+
+def test_measure_real_residue_returns_residue_found():
+    cfg=EdgeSettings()
+    source=np.full((96,120,3),40,np.uint8)
+    core=np.zeros((96,120),np.uint8);core[30:50,40:60]=255
+    band=np.zeros_like(core);band[29:30,40:60]=255
+    mask=core|band
+    source[mask>0]=_hsv_bgr(100,200,200)[mask>0]
+    painted=np.full((96,120,3),40,np.uint8)
+    painted[mask>0]=_hsv_bgr(100,75,85)[mask>0]
+    res=measure(source,painted,mask,band,cfg)
+    assert not res['通过'] and res['判定']=='RESIDUE_FOUND'
+    assert res['遮罩内确认残留']==400 and res['收边带确认残留']==20
+
+
+def test_measure_untemplated_and_unverifiable_return_uncertain():
+    cfg=EdgeSettings()
+    # 组内彩色样本 >=10% 但 <32 像素，无有效主色模板 -> 待目检。
+    source=np.full((96,120,3),40,np.uint8)
+    mask=np.zeros((96,120),np.uint8);mask[30:40,40:50]=255  # 100 px
+    source[32:36,42:47]=_hsv_bgr(100,200,200,(4,5))  # 20 px (>=10%, <32)
+    untemplated=measure(source,np.full_like(source,40),mask,np.zeros_like(mask),cfg)
+    assert not untemplated['通过'] and untemplated['判定']=='RESIDUE_UNCERTAIN' and untemplated['无模板组数']==1
+    # 有合法主色且补画命中候选，但无时域证据且外环被保护区遮挡 -> 待目检。
+    mask2=np.zeros((96,120),np.uint8);mask2[30:50,40:60]=255
+    src2=np.full((96,120,3),40,np.uint8);src2[mask2>0]=_hsv_bgr(100,200,200)[mask2>0]
+    guard=np.where(mask2>0,0,255).astype(np.uint8)
+    pending=measure(src2,src2.copy(),mask2,np.zeros_like(mask2),cfg,protected=guard)
+    assert not pending['通过'] and pending['判定']=='RESIDUE_UNCERTAIN' and pending['待目检']==400
+
+
+@pytest.mark.parametrize('kwargs',[
+    dict(template_peaks=2),
+    dict(template_peaks=7),
+    dict(background_ring_gap=2),
+    dict(background_ring_gap=7),
+    dict(background_ring_window=7),
+    dict(background_ring_window=17),
+    dict(background_ring_minimum_pixels=31),
+    dict(background_ring_minimum_pixels=2000),
+    dict(background_proof_fraction=.49),
+    dict(background_refute_fraction=.5),
+    dict(background_refute_fraction=.3),
+    dict(background_refute_fraction=-.01),
+    dict(maximum_residue_pixels=1),
+])
+def test_edge_settings_reject_relaxed_parameters(kwargs):
+    with pytest.raises(ValueError):
+        EdgeSettings(**kwargs)
+
+
+def test_roi_resume_recheck_aligns_with_measure_confirmed_and_protected(tmp_path):
+    from worker.roi_resume import prepare,recheck
+    from worker.hls_settings import HLSSettings
+    from worker.spatial_roi import SpatialSettings
+    from worker.roi_inpaint import ROISettings
+    old_parent=tmp_path/'old_wrap';work_parent=tmp_path/'work_wrap'
+    old=old_parent/'run';work=work_parent/'run'
+    for sub in ['frames','masks','edge-band','scene-protection','roi-layer-00','roi-coverage']:
+        (old/sub).mkdir(parents=True)
+    for sub in ['frames','masks','edge-band','scene-protection']:
+        (work/sub).mkdir(parents=True)
+    h,w=96,120;mask=np.zeros((h,w),np.uint8);mask[30:50,40:60]=255
+    band=np.zeros((h,w),np.uint8);band[30:32,40:60]=255
+    blue=_hsv_bgr(100,200,200,(h,w))
+    files=[]
+    for i in range(4):
+        name=f'{i:06d}.png'
+        src=np.full((h,w,3),40,np.uint8);src[mask>0]=blue[mask>0]
+        cv2.imwrite(str(work/'frames'/name),src);files.append(work/'frames'/name)
+        cv2.imwrite(str(work/'masks'/name),mask);cv2.imwrite(str(work/'edge-band'/name),band)
+        cv2.imwrite(str(old/'roi-layer-00'/name),src)  # 仍留有源蓝色残留
+        cv2.imwrite(str(old/'roi-coverage'/name),mask)
+    box=[0,0,w,h]
+    shared_meta={'layers':[{'directory':str(work/'masks')}]}
+    for root in [old,work]:
+        (root/'layers.json').write_text(json.dumps(shared_meta))
+        (root/'detections.json').write_text(json.dumps(dict(scenes=[[0,4]])))
+        (root/'spatial-roi.json').write_text(json.dumps(asdict(SpatialSettings(minimum_width=64,minimum_height=64))))
+        (root/'trusted-context.json').write_text(json.dumps(asdict(ContextSettings())))
+    old_row=dict(任务=1,图层=0,开始帧=0,结束帧=4,ROI=box,施工面积像素=int(np.count_nonzero(mask)),通过=False,采用未过结果=True,最佳尝试=0,耗时秒=1.0,
+                 尝试=[dict(尝试=0,重叠最大差异=0.0,通过=False)])
+    (old/'roi-report.json').write_text(json.dumps(dict(任务=[old_row])))
+    cfg=ROISettings(sequential_layers=True);settings=HLSSettings();spatial=SpatialSettings(minimum_width=64,minimum_height=64)
+    profile=dict(ROI=asdict(cfg),窗口=settings.window_frames,重叠=settings.overlap_frames,接缝上限=settings.overlap_mae_limit,每层面积上限=settings.mask_fraction_limit)
+    for parent in [old_parent,work_parent]:
+        (parent/'profile.json').write_text(json.dumps(profile))
+        (parent/'input-binding.json').write_text(json.dumps(dict(frames=4)))
+    state=prepare(work,old,files,cfg,settings,spatial,shared_meta['layers'],lambda *_:None)
+    row=dict(任务=1,图层=0,开始帧=0,结束帧=4,ROI=box,施工面积像素=int(np.count_nonzero(mask)),通过=False)
+    recheck(state,row,mask,work,files,np.array([0,1,2,3]),box,0,4,EdgeSettings(),settings,lambda *_:None)
+    assert not row['通过'] and row['错误码']=='RESIDUE_FOUND' and row['残留判定']=='RESIDUE_FOUND'
+    # 若保护区覆盖外环且无时域参考，则应从 RESIDUE_FOUND 变成 RESIDUE_UNCERTAIN（待目检）。
+    guard=np.where(mask>0,0,255).astype(np.uint8)
+    for p in files:cv2.imwrite(str(work/'scene-protection'/p.name),guard)
+    row_guard=dict(任务=1,图层=0,开始帧=0,结束帧=4,ROI=box,施工面积像素=int(np.count_nonzero(mask)),通过=False)
+    recheck(state,row_guard,mask,work,files,np.array([0,1,2,3]),box,0,4,EdgeSettings(),settings,lambda *_:None)
+    assert not row_guard['通过'] and row_guard['错误码']=='RESIDUE_UNCERTAIN' and row_guard['残留判定']=='RESIDUE_UNCERTAIN'
+
+
+def test_temporal_refute_overrides_ring_proof():
+    # 外环同色但可信时域参考显示该处背景不是主色：不得用外环证实抵消，必须判确认残留。
+    x=np.full((96,120,3),(220,160,30),np.uint8);m=np.zeros(x.shape[:2],np.uint8);cv2.circle(m,(60,48),12,255,-1)
+    band=np.zeros_like(m)
+    evidence=dict(background=np.full_like(x,30),confidence=np.full(m.shape,255,np.uint8),counts=np.full(m.shape,3,np.uint8))
+    result=measure(x,x.copy(),m,band,EdgeSettings(),reference_evidence=evidence)
+    assert result['判定']=='RESIDUE_FOUND' and not result['通过'] and result['外环证实但时域反证']>0
+    # 无时域证据时，同样的外环同色可证实背景本色。
+    assert measure(x,x.copy(),m,band,EdgeSettings())['通过']

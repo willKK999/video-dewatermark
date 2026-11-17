@@ -15,14 +15,63 @@ from .roi_attempt_cache import compact,restore
 
 
 def seam_variants(start,end,scene_start,scene_end,settings,cfg):
-    """最多三次恢复：平移起点增加重叠、双向上下文、缩短模型内部子窗口。"""
+    """最多三次恢复：平移起点增加重叠、双向上下文、缩短模型内部子窗口；参数完全相同的尝试只跑一次。"""
     count=cfg.seam_retries
     if not 0<=count<=3:raise ValueError('接缝重试次数必须在0到3之间')
     step=settings.overlap_frames
-    return [(start,end,settings.window_frames),
-            (max(scene_start,start-step),end,settings.window_frames),
-            (max(scene_start,start-2*step),min(scene_end,end+step),settings.window_frames),
-            (max(scene_start,start-step),min(scene_end,end+step),max(2,settings.window_frames//2))][:count+1]
+    variants=[(start,end,settings.window_frames),
+              (max(scene_start,start-step),end,settings.window_frames),
+              (max(scene_start,start-2*step),min(scene_end,end+step),settings.window_frames),
+              (max(scene_start,start-step),min(scene_end,end+step),max(2,settings.window_frames//2))][:count+1]
+    # 镜头起点处平移无效时，重复参数只会白跑GPU；去重不减少不同参数的恢复次数。
+    return list(dict.fromkeys(variants))
+
+
+# 只有接缝不确定可通过换上下文窗口恢复；颜色残留（确认残留/待目检）换窗口无效，不重试。
+RETRYABLE_ERRORS={'SEAM_UNCERTAIN'}
+RESIDUE_ERRORS={'RESIDUE_FOUND','RESIDUE_UNCERTAIN'}
+
+
+def residue_summary(scores):
+    """逐施工帧残留复检汇总；只汇总数字，不改写逐帧原始候选。"""
+    keys=['颜色候选','遮罩内颜色候选','收边带颜色候选','时域证实背景本色','外环证实背景本色','背景本色证实','外环证实但时域反证',
+          '确认残留','遮罩内确认残留','收边带确认残留','待目检','遮罩内待目检','收边带待目检','未解释候选','遮罩内残留','收边带残留',
+          '无模板遮罩内像素','无模板收边带像素']
+    summary={k:sum(s.get(k,0) for s in scores) for k in keys}
+    reasons=[]
+    for s in scores:
+        for reason in s.get('待目检原因',[]):
+            if len(reasons)<20:reasons.append(f"帧{s['frame']}：{reason}")
+    summary.update(有效施工帧数=len(scores),
+                   通过帧数=sum(1 for s in scores if s.get('判定')=='通过'),
+                   确认残留帧=[s['frame'] for s in scores if s.get('判定')=='RESIDUE_FOUND'],
+                   待目检帧=[s['frame'] for s in scores if s.get('判定')=='RESIDUE_UNCERTAIN'],
+                   单帧最大未解释=max((s.get('未解释候选',0) for s in scores),default=0),
+                   待目检原因=reasons)
+    summary['判定']=('RESIDUE_FOUND' if summary['确认残留帧'] else 'RESIDUE_UNCERTAIN' if summary['待目检帧'] else '通过') if scores else '无施工样本'
+    return summary
+
+
+def residue_error(scores):
+    """把逐帧三态转换为错误；待目检绝不算通过。"""
+    summary=residue_summary(scores)
+    if summary['判定']=='RESIDUE_FOUND':
+        return PipelineError('RESIDUE_FOUND','确认残留：存在有背景证据反证的水印主色候选',details=summary)
+    if summary['判定']=='RESIDUE_UNCERTAIN':
+        return PipelineError('RESIDUE_UNCERTAIN','待目检：主色候选或无模板组缺少可判背景证据，需人工目检，不算通过',details=summary)
+    return None
+
+
+def protection_mask(work,name,shape):
+    """场景/字幕保护区并集；目录不存在时为空集。保护区只排除模板与外环取样，不缩小候选统计。"""
+    result=np.zeros(shape,np.uint8)
+    for folder in ['scene-protection','subtitle-protection']:
+        path=work/folder/name
+        if path.exists():
+            mask=cv2.imread(str(path),0)
+            if mask is None or mask.shape!=shape or not set(np.unique(mask))<={0,255}:raise PipelineError('MASK_INVALID','保护掩膜缺失或几何无效')
+            result|=mask
+    return result
 
 
 def execute(work,files,detected,log,cfg):
@@ -156,9 +205,15 @@ def execute(work,files,detected,log,cfg):
                             log(f'逐层ROI 任务={row["任务"]} 尝试={attempt} 模型已结束，开始CPU参考回填与残留复检')
                             predicted=sorted((task/'out/frames/frames').glob('*.png'))
                             if len(predicted)!=(2 if singleton else right-left):raise PipelineError('ROI_INCOMPLETE','逐层ROI输出帧数缺失，禁止原帧回退')
-                            references=CleanReferences([roi.crop(cv2.imread(str(current[j])),box) for j in refs],
-                                                       [roi.crop(cv2.imread(str(work/'masks'/files[j].name),0),box,True) for j in refs])
-                            maximum=0.;staged=task/'staged';staged.mkdir();frame_scores=[];residue_scores=[]
+                            crop_shape=cv2.imread(str(task/'frames'/'000000.png')).shape
+                            reference_holder=[]
+                            def clean_references():
+                                # 惰性构建：只有需要参考回填/证据的帧才读取同镜头参考。
+                                if not reference_holder:
+                                    reference_holder.append(CleanReferences([roi.crop(cv2.imread(str(current[j])),box) for j in refs],
+                                                                            [roi.crop(cv2.imread(str(work/'masks'/files[j].name),0),box,True) for j in refs]))
+                                return reference_holder[0]
+                            maximum=0.;staged=task/'staged';staged.mkdir();frame_scores=[];residue_scores=[];skipped=dict(上下文帧=0,无施工无重叠帧=0)
                             sample_frames=set();stage_frames=set()
                             if trusted:
                                 active_frames=[j for j in range(start,end) if np.any(masks[j]&ownership)]
@@ -172,10 +227,27 @@ def execute(work,files,detected,log,cfg):
                                 if time.monotonic()-cpu_heartbeat>=30:
                                     log(f'逐层ROI 任务={row["任务"]} 尝试={attempt} CPU合成与复检帧={j}/{right}')
                                     cpu_heartbeat=time.monotonic()
-                                original=roi.crop(cv2.imread(str(current[j])),box);mask=roi.crop(masks[j],box,True)
                                 repair=cv2.imread(str(predicted[j-left]))
-                                if repair is None or repair.shape!=original.shape:raise PipelineError('OUTPUT_INVALID','逐层ROI模型改变几何')
+                                if repair is None or repair.shape!=crop_shape:raise PipelineError('OUTPUT_INVALID','逐层ROI模型改变几何')
+                                construction=start<=j<end
+                                active=(masks[j][b:d,a:c]>0)&(ownership[b:d,a:c]>0)
+                                prior_done=layer_done.get(j)
+                                shared=(prior_done[b:d,a:c]>0)&(masks[j][b:d,a:c]>0) if prior_done is not None else np.zeros(active.shape,bool)
+                                # 纯上下文帧（不在start:end）且无接缝重叠时跳过CleanReferences与残留复检；施工窗内既无施工又无重叠且非抽样帧时，结果逐像素不变，同样跳过。
+                                if not construction and not shared.any():
+                                    skipped['上下文帧']+=1;continue
+                                if not active.any() and not shared.any() and j not in sample_frames:
+                                    skipped['无施工无重叠帧']+=1
+                                    image=cv2.imread(str(dest/files[j].name));roi.atomic_png(staged/files[j].name,image)
+                                    if continue_unpassed:
+                                        roi.atomic_png(task/'seam-difference'/files[j].name,np.zeros(active.shape,np.uint16))
+                                        roi.atomic_png(task/'seam-shared'/files[j].name,np.zeros(active.shape,np.uint8))
+                                        frame_scores.append(dict(frame=j,mae=0.,pixels=0))
+                                    continue
+                                original=roi.crop(cv2.imread(str(current[j])),box);mask=roi.crop(masks[j],box,True)
+                                if original.shape!=crop_shape:raise PipelineError('OUTPUT_INVALID','逐层ROI模型改变几何')
                                 confirmed=roi.crop(read_confirmed(work/'masks'/files[j].name),box,True)
+                                references=clean_references()
                                 restored=references.restore(original,mask,repair,confirmed=confirmed)
                                 painted=composite(original,restored,mask)[:d-b,:c-a]
                                 if j in sample_frames:
@@ -186,13 +258,11 @@ def execute(work,files,detected,log,cfg):
                                     if j in stage_frames:
                                         for label,value in [('source',original),('restored',restored),('composited',painted)]:roi.atomic_png(sample/f'{j:06d}-{label}.png',value)
                                     (sample/'metadata.json').write_text(json.dumps(dict(task=row['任务'],attempt=attempt,roi=box,input=[left,right],construction=[start,end],frames=sorted(sample_frames),说明='raw-model为模型原始预测；restored为参考回填后；composited为羽化后、窗口混合与施工域回写前。'),ensure_ascii=False,indent=2))
-                                image=cv2.imread(str(dest/files[j].name));old=image[b:d,a:c];active=(masks[j][b:d,a:c]>0)&(ownership[b:d,a:c]>0)
-                                prior_done=layer_done.get(j)
-                                shared=(prior_done[b:d,a:c]>0)&(masks[j][b:d,a:c]>0) if prior_done is not None else np.zeros(active.shape,bool)
+                                image=cv2.imread(str(dest/files[j].name));old=image[b:d,a:c]
                                 if shared.any():
                                     disagreement=float(np.abs(old.astype(float)-painted.astype(float))[shared].mean())
                                     maximum=max(maximum,disagreement)
-                                if start<=j<end:
+                                if construction:
                                     if continue_unpassed:
                                         difference=np.where(shared,np.abs(old.astype(float)-painted.astype(float)).mean(axis=2),0.)
                                         roi.atomic_png(task/'seam-difference'/files[j].name,np.rint(difference*256).astype(np.uint16))
@@ -210,17 +280,21 @@ def execute(work,files,detected,log,cfg):
                                         source_color=roi.crop(cv2.imread(str(files[j])),box)[:d-b,:c-a]
                                         evidence=getattr(references,'last_evidence',None)
                                         if evidence is not None:evidence={key:value[:d-b,:c-a] for key,value in evidence.items()}
-                                        score=measure(source_color,old,active.astype(np.uint8)*255,band & ownership[b:d,a:c],edge_cfg,reference_evidence=evidence)
+                                        active_mask=active.astype(np.uint8)*255
+                                        score=measure(source_color,old,active_mask,band & active_mask,edge_cfg,reference_evidence=evidence,
+                                                      confirmed=confirmed[:d-b,:c-a],protected=protection_mask(work,files[j].name,shape)[b:d,a:c])
                                         residue_scores.append(dict(frame=j,**score))
                             trial['主色残留']=residue_scores
+                            trial['残留汇总']=residue_summary(residue_scores)
+                            trial['跳过参考回填帧']=skipped
                             trial['重叠最大差异']=maximum
                             if continue_unpassed:
                                 trial['施工帧差异']=frame_scores;trial['差图尺度']=256
                                 trial['代表施工帧']=max(frame_scores,key=lambda p:p['mae'])['frame']
                             if maximum>settings.overlap_mae_limit:
                                 raise PipelineError('SEAM_UNCERTAIN','逐层ROI重叠差异超过原有保护',details=dict(差异=maximum,上限=settings.overlap_mae_limit))
-                            if any(not p['通过'] for p in residue_scores):
-                                raise PipelineError('RESIDUE_UNCERTAIN','水印主色候选超过零残留门槛',details=dict(帧=residue_scores))
+                            failure=residue_error(residue_scores)
+                            if failure is not None:raise failure
                             for j in range(start,end):
                                 (staged/files[j].name).replace(dest/files[j].name)
                                 done=cv2.imread(str(coverage/files[j].name),0);roi.atomic_png(coverage/files[j].name,done|(masks[j]&ownership))
@@ -232,19 +306,33 @@ def execute(work,files,detected,log,cfg):
                             if continue_unpassed and trial['重叠最大差异'] is not None:
                                 trial['完整暂存']=compact(task,baseline,dest,files,masks,ownership,start,end)
                                 trial['暂存路径']=str(task/'staged-delta');trial['基线路径']=str(baseline)
-                            retry=trial['错误码'] in {'SEAM_UNCERTAIN','RESIDUE_UNCERTAIN'}
+                            retry=trial['错误码'] in RETRYABLE_ERRORS
+                            if trial['错误码'] in RESIDUE_ERRORS:
+                                trial['待目检说明']=('确认残留：背景证据表明该处背景不是水印主色，需补修；颜色问题换接缝窗口无效，不重试' if trial['错误码']=='RESIDUE_FOUND'
+                                                 else '待目检：主色候选或无模板组缺少可判背景证据，需人工目检，不算通过；颜色问题换接缝窗口无效，不重试')
                             if trial['错误码']=='GPU_OOM' and not oom_used:
                                 oom_used=True;retry=True
                                 if attempt+1<len(variants):
                                     variants[attempt+1]=(left,right,max(2,length//2))
+                                elif cfg.seam_retries>0:
+                                    # 去重后已无后续参数时，仍保留原有的一次显存恢复。
+                                    variants.append((left,right,max(2,length//2)))
                             if not retry or attempt==len(variants)-1:
                                 row.update(错误码=trial['错误码'],耗时秒=time.monotonic()-tick)
+                                if '残留汇总' in trial:row['残留判定']=trial['残留汇总']['判定']
+                                if '待目检说明' in trial:row['待目检说明']=trial['待目检说明']
                                 if continue_unpassed:break
                                 raise
                         finally:
                             save_input_audit()
                             trial['耗时秒']=time.monotonic()-attempt_tick;row['耗时秒']=time.monotonic()-tick;save()
                             log(f'逐层ROI 任务={row["任务"]} 尝试={attempt} 参数={left}:{right}/{length} 接缝差异={trial["重叠最大差异"]} 上限={settings.overlap_mae_limit} 通过={trial["通过"]} 错误码={trial.get("错误码", "无")} 耗时秒={trial["耗时秒"]:.3f}')
+                            if '残留汇总' in trial:
+                                s=trial['残留汇总']
+                                log(f'逐层ROI 任务={row["任务"]} 尝试={attempt} 残留复检 判定={s["判定"]} 施工帧={s["有效施工帧数"]} 颜色候选={s["颜色候选"]}'
+                                    f'(遮罩内{s["遮罩内颜色候选"]}/收边带{s["收边带颜色候选"]}) 时域证实={s["时域证实背景本色"]} 外环证实={s["外环证实背景本色"]}'
+                                    f' 确认残留={s["确认残留"]}(遮罩内{s["遮罩内确认残留"]}/收边带{s["收边带确认残留"]}) 待目检={s["待目检"]}(遮罩内{s["遮罩内待目检"]}/收边带{s["收边带待目检"]})'
+                                    f' 无模板像素={s["无模板遮罩内像素"]+s["无模板收边带像素"]} 单帧最大未解释={s["单帧最大未解释"]} 跳过参考回填={trial.get("跳过参考回填帧")}')
                             if continue_unpassed and not trial['通过']:
                                 for name in ['frames','masks','out']:
                                     if (task/name).exists():shutil.rmtree(task/name)
@@ -255,7 +343,12 @@ def execute(work,files,detected,log,cfg):
                         candidates=[p for p in row['尝试'] if p.get('完整暂存') and p.get('重叠最大差异') is not None]
                         unpassed.append(row['任务']);row['未过块']=True
                         if candidates:
-                            best=min(candidates,key=lambda p:p['重叠最大差异']);best_task=work/f"roi-{row['任务']:04d}-attempt-{best['尝试']:02d}"
+                            # 择优：先要求接缝不超上限，再依次少确认残留、少未解释/无模板像素，最后看接缝差异；不因择优改判通过。
+                            best=min(candidates,key=lambda p:(p['重叠最大差异']>settings.overlap_mae_limit,
+                                                              p.get('残留汇总',{}).get('确认残留',0),
+                                                              p.get('残留汇总',{}).get('未解释候选',0)+p.get('残留汇总',{}).get('无模板遮罩内像素',0)+p.get('残留汇总',{}).get('无模板收边带像素',0),
+                                                              p['重叠最大差异']))
+                            best_task=work/f"roi-{row['任务']:04d}-attempt-{best['尝试']:02d}"
                             for j in range(start,end):
                                 roi.atomic_png(dest/files[j].name,restore(best_task,baseline,files[j].name))
                                 done=cv2.imread(str(coverage/files[j].name),0);roi.atomic_png(coverage/files[j].name,done|(masks[j]&ownership))

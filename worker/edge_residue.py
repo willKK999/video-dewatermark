@@ -1,4 +1,4 @@
-"""确认形状约束的主色细边：不向全局颜色或高亮边搜索。"""
+"""确认形状约束的主色细边与按确认水印组的主色残留复检：不向全局颜色或高亮边搜索。"""
 from dataclasses import dataclass
 import cv2
 import numpy as np
@@ -15,8 +15,17 @@ class EdgeSettings:
     template_contrast_ratio:float=2.0
     template_minimum_fraction:float=.1
     template_reference_radius:int=8
-    residue_hue_ranges:tuple=((85,130),)
-    clean_reference_tolerance:int=0
+    # 每个确认组最多建立的源色色相峰数：第一峰即主色，其余峰用于防止大面积背景色抢走主色后漏检水印色。
+    template_peaks:int=3
+    # 外环背景举证：外环像素距所有已确认水印/收边带至少 gap 像素，且在组外 template_reference_radius 以内。
+    background_ring_gap:int=3
+    # 候选像素的“邻域外环”半径（方窗半边长）。
+    background_ring_window:int=16
+    background_ring_minimum_pixels:int=32
+    # 邻域外环（以及其中远离掩膜的外半环）同色比例达到该值，才算外环证实背景本色。
+    background_proof_fraction:float=.5
+    # 邻域外环同色比例不高于该值，视为外环反证（背景不是该色）。
+    background_refute_fraction:float=.1
     maximum_residue_pixels:int=0
     composite_mode:str='confirmed_replace'
 
@@ -24,8 +33,16 @@ class EdgeSettings:
         if not 0<=self.shape_radius<=3 or not 0<self.hue_radius<=15:raise ValueError('形状收边范围无效')
         if not 1<=self.minimum_saturation<=255 or not 1<=self.minimum_value<=255 or self.minimum_template_pixels<1:raise ValueError('主色配置无效')
         if self.template_contrast_ratio<2 or not 0<self.template_minimum_fraction<=1 or self.template_reference_radius<3:raise ValueError('模板区别背景保护无效')
-        if not self.residue_hue_ranges or any(len(x)!=2 or not 0<=x[0]<=x[1]<=179 for x in self.residue_hue_ranges):raise ValueError('复检色相范围无效')
-        if self.clean_reference_tolerance!=0:raise ValueError('背景举证必须逐通道精确相等，不得放宽')
+        if not 3<=self.template_peaks<=6:raise ValueError('每组源色色相峰数必须在3到6之间，不得缩小复检口径')
+        if not self.shape_radius+1<=self.background_ring_gap<=self.template_reference_radius-2:
+            raise ValueError('外环必须与已确认水印和收边带至少相隔shape_radius+1像素，且保留外环宽度')
+        if not self.template_reference_radius<=self.background_ring_window<=2*self.template_reference_radius:
+            raise ValueError('邻域外环窗口不得超过两倍外环半径，禁止远处背景举证')
+        if not 32<=self.background_ring_minimum_pixels<=(2*self.background_ring_window+1)**2:
+            raise ValueError('外环举证样本不得少于32像素且不得超过邻域窗口面积')
+        if not .5<=self.background_proof_fraction<=1:raise ValueError('外环证实比例不得低于50%')
+        if not 0<=self.background_refute_fraction<=min(.25,self.background_proof_fraction/2):
+            raise ValueError('外环反证比例必须在0到25%之间且不超过证实比例的一半')
         if self.maximum_residue_pixels!=0:raise ValueError('残留门槛不得放宽')
         if self.composite_mode!='confirmed_replace':raise ValueError('禁止将源水印混回确认域')
 
@@ -39,19 +56,64 @@ def highlight_guard(image):
     return cv2.dilate(bright.astype(np.uint8),np.ones((3,3),np.uint8))>0
 
 
+def _ellipse(radius):
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(2*radius+1,2*radius+1))
+
+
+def _hue_distance(hues,hue):
+    delta=np.abs(hues.astype(np.int16)-int(hue));return np.minimum(delta,180-delta)
+
+
+def _circular_mode(smooth):
+    """环形直方图取最大值；若最大值是平顶，取最长平顶区间的环形中心，而不是最左端。"""
+    flags=smooth==smooth.max();n=len(flags)
+    if flags.all():return 0
+    shift=int(np.argmin(flags));rolled=np.roll(flags,-shift)  # rolled[0] 必为非最大值
+    best_length=best_start=0;i=0
+    while i<n:
+        if rolled[i]:
+            j=i
+            while j<n and rolled[j]:j+=1
+            if j-i>best_length:best_length,best_start=j-i,i
+            i=j
+        else:i+=1
+    return int((best_start+shift+(best_length-1)//2)%n)
+
+
+def _smooth_histogram(hues,cfg):
+    hist=np.bincount(hues,minlength=180)
+    return sum(np.roll(hist,k) for k in range(-cfg.hue_radius,cfg.hue_radius+1))
+
+
+def _colored(hsv,cfg):
+    return (hsv[...,1]>=cfg.minimum_saturation)&(hsv[...,2]>=cfg.minimum_value)
+
+
+def color_peaks(image,mask,cfg,limit=None,hsv=None):
+    """源色色相峰：第一峰与 color_template 相同；后续峰在去掉已覆盖色相后重算，且自身须有足够样本。"""
+    hsv=cv2.cvtColor(image,cv2.COLOR_BGR2HSV) if hsv is None else hsv
+    eligible=(mask>0)&_colored(hsv,cfg);peaks=[]
+    for _ in range(cfg.template_peaks if limit is None else limit):
+        if eligible.sum()<cfg.minimum_template_pixels:break
+        smooth=_smooth_histogram(hsv[...,0][eligible],cfg);hue=_circular_mode(smooth)
+        if peaks and smooth[hue]<cfg.minimum_template_pixels:break
+        peaks.append(hue);eligible&=_hue_distance(hsv[...,0],hue)>cfg.hue_radius
+    return peaks
+
+
 def color_template(image,mask,cfg):
-    hsv=cv2.cvtColor(image,cv2.COLOR_BGR2HSV)
-    eligible=(mask>0)&(hsv[...,1]>=cfg.minimum_saturation)&(hsv[...,2]>=cfg.minimum_value)
-    if eligible.sum()<cfg.minimum_template_pixels:return None
-    hist=np.bincount(hsv[...,0][eligible],minlength=180)
-    smooth=sum(np.roll(hist,k) for k in range(-cfg.hue_radius,cfg.hue_radius+1))
-    return int(np.argmax(smooth))
+    peaks=color_peaks(image,mask,cfg,limit=1)
+    return peaks[0] if peaks else None
+
+
+def _matches_hsv(hsv,hue,cfg):
+    if hue is None:return np.zeros(hsv.shape[:2],bool)
+    return (_hue_distance(hsv[...,0],hue)<=cfg.hue_radius)&_colored(hsv,cfg)
 
 
 def matches(image,hue,cfg):
     if hue is None:return np.zeros(image.shape[:2],bool)
-    hsv=cv2.cvtColor(image,cv2.COLOR_BGR2HSV);delta=np.abs(hsv[...,0].astype(int)-hue)
-    return (np.minimum(delta,180-delta)<=cfg.hue_radius)&(hsv[...,1]>=cfg.minimum_saturation)&(hsv[...,2]>=cfg.minimum_value)
+    return _matches_hsv(cv2.cvtColor(image,cv2.COLOR_BGR2HSV),hue,cfg)
 
 
 def refine_group(image,group,confirmed,protected,cfg):
@@ -79,8 +141,34 @@ def composite(original,repaired,mask):
     result=original.copy();result[mask>0]=repaired[mask>0];return result
 
 
-def measure(source,painted,mask,band,cfg,reference_evidence=None):
-    """全施工域固定颜色段复检；同色背景只能由至少三份可信源参考举证。"""
+def _binary(value,name,shape):
+    if value is None:return None
+    if value.shape!=shape or value.dtype!=np.uint8 or not set(np.unique(value))<={0,255}:
+        raise PipelineError('RESIDUE_INPUT_INVALID',f'残留复检{name}未与施工裁块对齐或取值无效')
+    return value>0
+
+
+def _box_count(values,size):
+    return cv2.boxFilter(values.astype(np.float32),-1,(size,size),normalize=False,borderType=cv2.BORDER_CONSTANT)
+
+
+RESIDUE_SCOPE=('判定口径：按确认水印组（施工掩膜与全部确认水印经shape_radius膨胀后的连通域）用冻结源图取最多template_peaks个色相峰（第一峰为主色，平顶取环形中心）；'
+               '颜色候选为补画结果在组内施工域（含收边带）中与组色相峰匹配的像素。背景本色证据二选一：'
+               '时域=CleanReferences至少3份一致可信参考（confidence>0且counts>=3）的干净背景本身在hue_radius内匹配该色；'
+               '外环=同帧源图中距全部确认水印/收边带至少background_ring_gap（>=shape_radius+1）像素、非保护区、在组外template_reference_radius内的'
+               '邻域外环（半径background_ring_window，样本>=background_ring_minimum_pixels，且外半环样本>=一半）同色比例均>=background_proof_fraction。'
+               '未解释候选若有时域反证或邻域外环同色比例<=background_refute_fraction则判RESIDUE_FOUND（确认残留），'
+               '否则（无足够可判背景证据，或组有>=10%彩色样本但不足建立主色模板）判RESIDUE_UNCERTAIN（待目检，绝不算通过）。'
+               '允许残留门槛maximum_residue_pixels固定为0；遮罩内=施工掩膜去掉收边带，收边带单列。')
+
+
+def measure(source,painted,mask,band,cfg,reference_evidence=None,confirmed=None,protected=None):
+    """按确认水印组复检主色残留，三态：通过 / RESIDUE_FOUND（确认残留）/ RESIDUE_UNCERTAIN（待目检）。
+
+    source：冻结源图裁块（BGR）；painted：写回后的补画裁块；mask：当前施工掩膜；band：收边带（须在施工掩膜内）；
+    reference_evidence：CleanReferences 时域证据（background/confidence/counts）；confirmed：全部确认水印并集（含收边带）；
+    protected：场景/字幕保护区。后两者缺省时分别退化为施工掩膜与空集。
+    """
     if source is None or painted is None or mask is None or band is None:
         raise PipelineError('RESIDUE_INPUT_INVALID','残留复检输入缺失')
     if source.ndim!=3 or source.shape[2]!=3 or painted.shape!=source.shape or mask.ndim!=2 or band.shape!=mask.shape or mask.shape!=source.shape[:2]:
@@ -89,23 +177,93 @@ def measure(source,painted,mask,band,cfg,reference_evidence=None):
         raise PipelineError('RESIDUE_INPUT_INVALID','残留复检输入类型或掩膜取值无效')
     if not np.any(mask):raise PipelineError('RESIDUE_INPUT_INVALID','残留复检施工样本为空，禁止按零残留通过')
     if np.any((band>0)&(mask==0)):raise PipelineError('RESIDUE_INPUT_INVALID','收边带超出当前施工域')
-    hsv=cv2.cvtColor(painted,cv2.COLOR_BGR2HSV);hues=np.zeros(mask.shape,bool)
-    for lo,hi in cfg.residue_hue_ranges:hues|=(hsv[...,0]>=lo)&(hsv[...,0]<=hi)
-    colored=hues&(hsv[...,1]>=cfg.minimum_saturation)&(hsv[...,2]>=cfg.minimum_value)
-    proved=np.zeros(mask.shape,bool)
+    shape=mask.shape
+    known=_binary(confirmed,'确认水印并集',shape);guard=_binary(protected,'保护区',shape)
+    if guard is None:guard=np.zeros(shape,bool)
+    temporal=None
     if reference_evidence is not None:
         if not isinstance(reference_evidence,dict) or not {'background','confidence','counts'}<=reference_evidence.keys():
             raise PipelineError('RESIDUE_INPUT_INVALID','干净参考证据字段缺失')
         background=reference_evidence['background'];confidence=reference_evidence['confidence'];counts=reference_evidence['counts']
-        if background.shape!=source.shape or confidence.shape!=mask.shape or counts.shape!=mask.shape or background.dtype!=np.uint8 or confidence.dtype!=np.uint8 or counts.dtype!=np.uint8:
+        if background.shape!=source.shape or confidence.shape!=shape or counts.shape!=shape or background.dtype!=np.uint8 or confidence.dtype!=np.uint8 or counts.dtype!=np.uint8:
             raise PipelineError('RESIDUE_INPUT_INVALID','干净参考证据未与施工裁块对齐')
-        proved=(confidence>0)&(counts>=3)&(np.abs(painted.astype(np.int16)-background.astype(np.int16)).max(axis=2)<=cfg.clean_reference_tolerance)
-    uncertain=colored&~proved;inner=int(np.count_nonzero(uncertain&(mask>0)));edge=int(np.count_nonzero(uncertain&(band>0)))
-    sx=cv2.cvtColor(source,cv2.COLOR_BGR2HSV);source_hues=np.zeros(mask.shape,bool)
-    for lo,hi in cfg.residue_hue_ranges:source_hues|=(sx[...,0]>=lo)&(sx[...,0]<=hi)
-    source_colored=source_hues&(sx[...,1]>=cfg.minimum_saturation)&(sx[...,2]>=cfg.minimum_value)
-    return dict(源片同色像素=int(np.count_nonzero(source_colored&(mask>0))),颜色范围=[list(x) for x in cfg.residue_hue_ranges],有效施工像素=int(np.count_nonzero(mask)),边缘带像素=int(np.count_nonzero(band)),统计形状=list(painted.shape),
-                遮罩内颜色候选=int(np.count_nonzero(colored&(mask>0))),收边带颜色候选=int(np.count_nonzero(colored&(band>0))),
-                干净参考证实的背景候选=int(np.count_nonzero(colored&proved&(mask>0))),遮罩内残留=inner,收边带残留=edge,
-                阈值=cfg.maximum_residue_pixels,阈值单位='像素/施工帧',通过=max(inner,edge)<=cfg.maximum_residue_pixels,
-                口径='残留字段为未获可信背景证明的颜色候选，不等同已确认水印真值；同色实物及未消除水印均保留原始颜色数。')
+        trusted=(confidence>0)&(counts>=3)
+        if trusted.any():temporal=(trusted,cv2.cvtColor(background,cv2.COLOR_BGR2HSV))
+    construction=mask>0;edge=band>0;interior=construction&~edge
+    watermark=construction|edge|(known if known is not None else False)
+    source_hsv=cv2.cvtColor(source,cv2.COLOR_BGR2HSV);painted_hsv=cv2.cvtColor(painted,cv2.COLOR_BGR2HSV)
+    h,w=shape;R=cfg.template_reference_radius;L=cfg.background_ring_window;gap=cfg.background_ring_gap;middle=(gap+R+1)//2
+    # 距全部已确认水印（含收边带）的距离；外环只取距离≥gap的像素，紧贴掩膜的光晕不能当背景证据。
+    distance=cv2.distanceTransform((~watermark).astype(np.uint8),cv2.DIST_L2,5)
+    far=(distance>=gap)&~guard;far_outer=(distance>=middle)&~guard
+    count,labels=cv2.connectedComponents(cv2.dilate(watermark.astype(np.uint8),_ellipse(cfg.shape_radius)),connectivity=8)
+    candidates=np.zeros(shape,bool);temporal_proved=np.zeros(shape,bool);ring_proved=np.zeros(shape,bool);conflict=np.zeros(shape,bool)
+    unexplained=np.zeros(shape,bool);residue=np.zeros(shape,bool);untemplated=np.zeros(shape,bool);groups=[];reasons=[]
+    colorless=0;minimum_outer=cfg.background_ring_minimum_pixels//2
+    for label in range(1,count):
+        whole=labels==label
+        if not np.any(whole&construction):continue
+        ys,xs=np.nonzero(whole);margin=R+L+1
+        y0,y1=max(0,ys.min()-margin),min(h,ys.max()+margin+1);x0,x1=max(0,xs.min()-margin),min(w,xs.max()+margin+1)
+        view=(slice(y0,y1),slice(x0,x1));group=whole[view];work=group&construction[view]
+        template_region=group&watermark[view]&~guard[view];s_hsv=source_hsv[view];p_hsv=painted_hsv[view]
+        row=dict(组=len(groups)+1,外接框=[int(xs.min()),int(ys.min()),int(xs.max())+1,int(ys.max())+1],施工像素=int(work.sum()),
+                 遮罩内像素=int((work&interior[view]).sum()),收边带像素=int((work&edge[view]).sum()),模板像素=int(template_region.sum()))
+        eligible=int((template_region&_colored(s_hsv,cfg)).sum());row['彩色样本']=eligible
+        peaks=color_peaks(source[view],template_region,cfg,hsv=s_hsv);row['主色色相']=peaks
+        if not peaks:
+            if eligible>0 and eligible>=cfg.template_minimum_fraction*max(1,row['模板像素']):
+                row['状态']='待目检：组内有彩色样本但不足以建立主色模板';untemplated[view]|=work
+                reasons.append(f"组{row['组']}彩色样本{eligible}<{cfg.minimum_template_pixels}，无有效主色模板")
+            else:
+                row['状态']='无彩色组：源组彩色样本不足10%且少于模板下限，主色复检不适用';colorless+=1
+            groups.append(row);continue
+        group_watermark=group&watermark[view]
+        ring_distance=cv2.distanceTransform((~group_watermark).astype(np.uint8),cv2.DIST_L2,5)
+        ring=(ring_distance<=R)&far[view];ring_outer=ring&far_outer[view]
+        size=2*L+1;ring_n=_box_count(ring,size);outer_n=_box_count(ring_outer,size)
+        judgeable=ring_n>=cfg.background_ring_minimum_pixels
+        g_cand=np.zeros(group.shape,bool);g_tp=np.zeros(group.shape,bool);g_rp=np.zeros(group.shape,bool);g_conflict=np.zeros(group.shape,bool)
+        g_unexplained=np.zeros(group.shape,bool);g_residue=np.zeros(group.shape,bool);contrast=[]
+        for hue in peaks:
+            source_match=_matches_hsv(s_hsv,hue,cfg)
+            inside=float(source_match[template_region].mean()) if template_region.any() else 0.
+            outside=float(source_match[ring].mean()) if ring.any() else None
+            contrast.append(dict(色相=hue,组内密度=round(inside,4),外环密度=None if outside is None else round(outside,4),外环像素=int(ring.sum())))
+            cand=work&_matches_hsv(p_hsv,hue,cfg)
+            if not cand.any():continue
+            ring_c=_box_count(ring&source_match,size);outer_c=_box_count(ring_outer&source_match,size)
+            ring_proof=judgeable&(ring_c>=cfg.background_proof_fraction*ring_n)&(outer_n>=minimum_outer)&(outer_c>=cfg.background_proof_fraction*outer_n)
+            ring_refute=judgeable&(ring_c<=cfg.background_refute_fraction*ring_n)
+            t_proof=t_refute=np.zeros(group.shape,bool)
+            if temporal is not None:
+                trusted=temporal[0][view];background_match=_matches_hsv(temporal[1][view],hue,cfg)
+                t_proof=trusted&background_match;t_refute=trusted&~background_match
+            # 时域干净参考反证优先：外环证实不能覆盖“该处背景本色不是主色”的时域证据。
+            left=cand&~(t_proof|(ring_proof&~t_refute))
+            g_cand|=cand;g_tp|=cand&t_proof;g_rp|=cand&ring_proof;g_conflict|=cand&ring_proof&t_refute&~t_proof
+            g_unexplained|=left;g_residue|=left&(t_refute|ring_refute)
+        g_pending=g_unexplained&~g_residue
+        row.update(主色模板对比=contrast,外环像素=int(ring.sum()),颜色候选=int(g_cand.sum()),时域证实=int(g_tp.sum()),外环证实=int(g_rp.sum()),
+                   外环证实但时域反证=int(g_conflict.sum()),确认残留=int(g_residue.sum()),待目检=int(g_pending.sum()))
+        row['状态']='确认残留' if g_residue.any() else '待目检：候选处既无时域也无外环可判证据' if g_pending.any() else '通过'
+        if g_pending.any():reasons.append(f"组{row['组']}有{int(g_pending.sum())}个主色候选无可判背景证据")
+        groups.append(row)
+        candidates[view]|=g_cand;temporal_proved[view]|=g_tp;ring_proved[view]|=g_rp;conflict[view]|=g_conflict
+        unexplained[view]|=g_unexplained;residue[view]|=g_residue
+    pending=unexplained&~residue
+    def split(values):return int(np.count_nonzero(values&interior)),int(np.count_nonzero(values&edge))
+    ci,ce=split(candidates);ri,re=split(residue);pi,pe=split(pending);ui,ue=split(unexplained);ti,te=split(untemplated)
+    unexplained_total=ui+ue
+    if residue.any():verdict='RESIDUE_FOUND'
+    elif unexplained_total>cfg.maximum_residue_pixels or untemplated.any():verdict='RESIDUE_UNCERTAIN'
+    else:verdict='通过'
+    return dict(判定=verdict,通过=verdict=='通过',待目检原因=reasons,组=groups,组数=len(groups),无彩色组数=colorless,
+                无模板组数=sum(1 for g in groups if g['状态'].startswith('待目检：组内')),无模板遮罩内像素=ti,无模板收边带像素=te,
+                有效施工像素=int(np.count_nonzero(construction)),遮罩内像素=int(np.count_nonzero(interior)),边缘带像素=int(np.count_nonzero(edge)),统计形状=list(painted.shape),
+                遮罩内颜色候选=ci,收边带颜色候选=ce,颜色候选=ci+ce,
+                时域证实背景本色=int(np.count_nonzero(temporal_proved)),外环证实背景本色=int(np.count_nonzero(ring_proved)),
+                背景本色证实=int(np.count_nonzero(temporal_proved|ring_proved)),外环证实但时域反证=int(np.count_nonzero(conflict)),
+                遮罩内确认残留=ri,收边带确认残留=re,确认残留=ri+re,遮罩内待目检=pi,收边带待目检=pe,待目检=pi+pe,
+                遮罩内残留=ui,收边带残留=ue,未解释候选=unexplained_total,时域证据可用=temporal is not None,
+                阈值=cfg.maximum_residue_pixels,阈值单位='像素/施工帧',口径=RESIDUE_SCOPE)
