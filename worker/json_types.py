@@ -4,11 +4,14 @@ import numbers
 
 
 def json_native(value):
-    if isinstance(value,Mapping):
+    value_type = type(value)
+    if value_type in (str, int, float, bool, type(None)):
+        return value
+    if value_type is dict or isinstance(value,Mapping):
         return {json_native(k):json_native(v) for k,v in value.items()}
     if isinstance(value,(list,tuple)):
         return [json_native(v) for v in value]
-    if type(value).__module__.split('.')[0]=='numpy':
+    if value_type.__module__.partition('.')[0]=='numpy':
         if hasattr(value,'tolist') and getattr(value,'ndim',0)>0:
             return json_native(value.tolist())
         if isinstance(value,numbers.Integral):return int(value)

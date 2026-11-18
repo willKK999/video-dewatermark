@@ -8,6 +8,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pytest
 
 from worker import roi_inpaint, roi_spatial_layers as rsl
 from worker.edge_residue import EdgeSettings, measure
@@ -145,7 +146,8 @@ def _sha(p: Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
-def test_parallel_and_serial_execute_are_bitwise_identical(tmp_path: Path, monkeypatch):
+@pytest.mark.parametrize("prefetch", ["0", "1"])
+def test_parallel_and_serial_execute_are_bitwise_identical(tmp_path: Path, monkeypatch, prefetch):
     """验证并行（多进程+SharedMemory）与串行（ROI_CPU_WORKERS=1）在合成数据上逐帧逐像素一致。"""
     monkeypatch.setenv('INPAINT_PYTHON', 'python3')
     monkeypatch.setenv('PROPAINTER_ROOT', str(tmp_path))
@@ -163,7 +165,10 @@ def test_parallel_and_serial_execute_are_bitwise_identical(tmp_path: Path, monke
     parallel_dir = tmp_path / 'parallel'
     files_p, det_p = _build_synthetic_workspace(parallel_dir)
     monkeypatch.setenv('ROI_CPU_WORKERS', '3')
-    rep_p = roi_inpaint.execute(parallel_dir, files_p, det_p, cfg=cfg)
+    monkeypatch.setenv('ROI_MODEL_PREFETCH', prefetch)
+    logs = []
+    rep_p = roi_inpaint.execute(parallel_dir, files_p, det_p, log=logs.append, cfg=cfg)
+    assert any('开始预取首轮模型' in line for line in logs) == (prefetch == '1')
 
     # 1. roi-report.json 除耗时外完全一致
     assert _strip_timing(rep_s, serial_dir) == _strip_timing(rep_p, parallel_dir)

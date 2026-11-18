@@ -177,6 +177,7 @@ class CleanReferences:
         num, labels, stats, _ = cv2.connectedComponentsWithStats(cv2.dilate(support.astype(np.uint8), np.ones((3, 3), np.uint8)))
         local_crops = []
         gray_f32 = gray.astype(np.float32)
+        flow_cache = {}
 
         for k in range(1, num):
             kx = int(stats[k, cv2.CC_STAT_LEFT])
@@ -244,11 +245,23 @@ class CleanReferences:
                         off_pts[:, 0, 1] -= sy0
                         src_win = np.ascontiguousarray(gray[sy0:sy1, sx0:sx1])
                         gray_e = gray_f32[ey0:ey1, ex0:ex1]
+                        # 同帧遇到完全相同的搜索窗和点序列时，复用光流结果。
+                        flow_key = (sx0, sy0, sx1, sy1, off_pts.tobytes())
+                        flows = flow_cache.get(flow_key)
+                        if flows is None:
+                            if len(flow_cache) >= 64:
+                                del flow_cache[next(iter(flow_cache))]
+                            flows = flow_cache[flow_key] = {}
 
                         for rf_idx, (ref_bgr, ref_tr, ref_gr) in enumerate(zip(self.images, self.trusted, self.grays)):
                             if np.all(used_by_ref[rf_idx][cc_crop_mask]):
                                 continue
-                            nxt, st, _ = cv2.calcOpticalFlowPyrLK(src_win, ref_gr[sy0:sy1, sx0:sx1], off_pts, None)
+                            if rf_idx not in flows:
+                                nxt, st, _ = cv2.calcOpticalFlowPyrLK(
+                                    src_win, ref_gr[sy0:sy1, sx0:sx1], off_pts, None
+                                )
+                                flows[rf_idx] = nxt, st
+                            nxt, st = flows[rf_idx]
                             if nxt is None or st is None:
                                 continue
                             good = st.reshape(-1) == 1

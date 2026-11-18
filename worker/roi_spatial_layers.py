@@ -1,8 +1,10 @@
 """空间连通ROI：冻结前层、独立施工域和上下文接缝核验。"""
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from multiprocessing import shared_memory
 from pathlib import Path
+from threading import Event
 import hashlib,json,multiprocessing as mp,os,shutil,time
 import cv2
 import numpy as np
@@ -252,19 +254,22 @@ def _repair_confirmed_residue_pass(
         conf_cache[j]=conf_crop
         prot_crop=protection_mask(work,files[j].name,shape)[b:d,a:c]
         prot_cache[j]=prot_crop
-        staged_img=cv2.imread(str(staged/files[j].name))
-        if staged_img is None:
-            continue
-        ev=sc.get('_evidence')
-        active_mask=active.astype(np.uint8)*255
-        full_sc=measure_fn(
-            source_color,staged_img[b:d,a:c],active_mask,band&active_mask,edge_cfg,
-            reference_evidence=ev,
-            confirmed=conf_crop,
-            protected=prot_crop,
-            return_masks=True,
-        )
-        rm=full_sc.get('_masks',{}).get('确认残留')
+        packed_residue = sc.get('_repair_residue')
+        if packed_residue is not None:
+            rm = _unpack_bool(packed_residue, active.shape)
+        else:
+            staged_img=cv2.imread(str(staged/files[j].name))
+            if staged_img is None:
+                continue
+            active_mask=active.astype(np.uint8)*255
+            full_sc=measure_fn(
+                source_color,staged_img[b:d,a:c],active_mask,band&active_mask,edge_cfg,
+                reference_evidence=sc.get('_evidence'),
+                confirmed=conf_crop,
+                protected=prot_crop,
+                return_masks=True,
+            )
+            rm=full_sc.get('_masks',{}).get('确认残留')
         if rm is not None and np.any(rm>0):
             r_dil=edge_cfg.residue_repair_dilate_radius
             ker=cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(2*r_dil+1,2*r_dil+1))
@@ -579,6 +584,57 @@ def _prep_frame_worker(item):
     return ('OK',j,entry)
 
 
+def _prepare_parallel_inputs(pool, task, current, files, masks, ownership, box,
+                             start, end, left, right, pixels, trusted, audit, check):
+    """在冻结的上一图层上准备并自检模型输入。"""
+    a, b, c, d = box
+    trusted_dict = asdict(trusted) if trusted is not None else None
+    items = [
+        (j, start, end, left, box, pixels, str(current[j]), str(task.parent/'masks'/files[j].name),
+         str(task/'frames'/f'{j-left:06d}.png'), str(task/'masks'/f'{j-left:06d}.png'),
+         _pack_bool((masks[j][b:d,a:c]>0)&(ownership[b:d,a:c]>0)), (d-b,c-a), trusted_dict)
+        for j in range(left, right)
+    ]
+    for status, frame, *details in pool.imap(_prep_frame_worker, items):
+        check()
+        if status == 'MASK_UNCERTAIN':
+            raise PipelineError('MASK_UNCERTAIN', details[1])
+        if status == 'AUDIT_ERR':
+            code, message, evidence = details
+            audit['帧'].append(dict(frame=frame, **evidence))
+            audit['错误码'] = code
+            raise PipelineError(code, message, details=evidence)
+        if audit is not None and details[0] is not None:
+            audit['帧'].append(details[0])
+
+
+def _run_attempt_model(task, length, singleton, cfg, timeout, check):
+    if singleton:
+        for name in ('frames', 'masks'):
+            shutil.copy2(task/name/'000000.png', task/name/'000001.png')
+    root = Path(os.environ['PROPAINTER_ROOT'])
+    args = [
+        os.environ['INPAINT_PYTHON'], str(Path(__file__).with_name('torch_stage.py')),
+        '--metrics', task/'metrics.json', '--frames-only', '--script', root/'inference_propainter.py',
+        '--video', task/'frames', '--mask', task/'masks', '--output', task/'out', '--save_frames',
+        '--mask_dilation', '0', '--subvideo_length', str(length), '--neighbor_length', '6', '--ref_stride', '20',
+    ]
+    if cfg.fp16:
+        args.append('--fp16')
+    _model_stage(args, task, task.name, check=check, cwd=os.environ['PROPAINTER_ROOT'],
+                 timeout=timeout, stage='逐层ROI-ProPainter')
+
+
+def _make_attempt_dirs(task):
+    task.mkdir()
+    (task/'frames').mkdir()
+    (task/'masks').mkdir()
+
+
+def _attempt_audit(task_number, layer, attempt, left, right, box):
+    return dict(任务=task_number, 图层=layer, 尝试=attempt, 输入区间=[left, right], ROI=box, 通过=False, 帧=[])
+
+
 def _commit_restore_worker(item):
     """并行回写未过块最佳暂存帧并更新覆盖掩膜 PNG。"""
     best_task_str,baseline_str,file_name,dest_path,cov_path,active_packed,shape=item
@@ -597,7 +653,7 @@ def _commit_pass_worker(item):
 
 def _process_frame_worker(item):
     """并行执行单帧参考回填、正交亮度细节保留、接缝计算、暂存写出与主色残留复检。"""
-    (j,box,crop_shape,shape,construction,in_completed,weight,in_sample,in_stage,
+    (j,box,crop_shape,shape,construction,in_completed,weight,dest_has_changes,in_sample,in_stage,
      continue_unpassed,need_repair_ev,detail_mode,edge_dict,active_packed,shared_packed,mask_crop_packed,
      trk_hp_sparse,shm_name,shm_spec,paths,dense_ctx)=item
     (pred_path,current_path,file_path,dest_path,mask_path_src,band_path,work_dir_str,file_name,
@@ -637,15 +693,25 @@ def _process_frame_worker(item):
             if in_stage:
                 for label,value in [('source',original),('restored',restored),('composited',painted)]:
                     roi.atomic_png(sample/f'{j:06d}-{label}.png',value)
-        image=cv2.imread(dest_path);old=image[b:d,a:c]
-        disagreement=float(np.abs(old.astype(float)-painted.astype(float))[shared].mean()) if shared.any() else None
+        image = cv2.imread(dest_path) if dest_has_changes else current_img
+        old = image[b:d,a:c]
+        shared_pixels = int(np.count_nonzero(shared))
+        shared_difference = None
+        if shared_pixels:
+            shared_difference = np.abs(old[shared].astype(float)-painted[shared].astype(float))
+        disagreement = float(shared_difference.mean()) if shared_difference is not None else None
         frame_score=None;residue_score=None;repair_ev_payload=None
         if construction:
             if continue_unpassed:
-                difference=np.where(shared,np.abs(old.astype(float)-painted.astype(float)).mean(axis=2),0.)
-                roi.atomic_png(Path(seam_diff_path),np.rint(difference*256).astype(np.uint16))
+                difference = np.zeros(sub_shape, dtype=np.uint16)
+                seam_mae = 0.
+                if shared_difference is not None:
+                    pixel_difference = shared_difference.mean(axis=1)
+                    difference[shared] = np.rint(pixel_difference*256).astype(np.uint16)
+                    seam_mae = float(pixel_difference.mean())
+                roi.atomic_png(Path(seam_diff_path),difference)
                 roi.atomic_png(Path(seam_shared_path),shared.astype(np.uint8)*255)
-                frame_score=dict(frame=j,mae=float(difference[shared].mean()) if shared.any() else 0.,pixels=int(np.count_nonzero(shared)))
+                frame_score=dict(frame=j,mae=seam_mae,pixels=shared_pixels)
             if in_completed:
                 mixed=cv2.addWeighted(painted,weight,old,1-weight,0)
                 painted[active&shared]=mixed[active&shared]
@@ -660,7 +726,8 @@ def _process_frame_worker(item):
                 active_mask=active.astype(np.uint8)*255
                 conf_crop=confirmed[:d-b,:c-a];prot_crop=protection_mask(Path(work_dir_str),file_name,shape)[b:d,a:c]
                 score=_edge_residue_mod.measure(source_color,old,active_mask,band&active_mask,edge_cfg,
-                                                reference_evidence=evidence,confirmed=conf_crop,protected=prot_crop)
+                                                reference_evidence=evidence,confirmed=conf_crop,protected=prot_crop,
+                                                return_masks=need_repair_ev)
                 if score.get('判定') in RESIDUE_ERRORS and dense_ctx is not None:
                     scene_start,scene_end,task_refs_tuple,cur_paths,fil_paths=dense_ctx
                     preloaded={int(rf): (ref_imgs[idx],ref_tr[idx],ref_gr[idx]) for idx,rf in enumerate(task_refs_tuple)}
@@ -672,10 +739,14 @@ def _process_frame_worker(item):
                     if dense_ev is not None:
                         dense_ev={key:(value[:d-b,:c-a] if hasattr(value,'shape') else value) for key,value in dense_ev.items()}
                         dense_sc=_edge_residue_mod.measure(source_color,old,active_mask,band&active_mask,edge_cfg,
-                                                           reference_evidence=dense_ev,confirmed=conf_crop,protected=prot_crop)
+                                                           reference_evidence=dense_ev,confirmed=conf_crop,protected=prot_crop,
+                                                           return_masks=need_repair_ev)
                         if (dense_sc.get('确认残留',0),dense_sc.get('待目检',0))<(score.get('确认残留',0),score.get('待目检',0)):
                             score=dense_sc;evidence=dense_ev;donor_crops=dense_crops
+                repair_masks = score.pop('_masks', None)
                 residue_score=dict(frame=j,**score)
+                if repair_masks is not None and score.get('判定') == 'RESIDUE_FOUND':
+                    residue_score['_repair_residue'] = _pack_bool(repair_masks['确认残留'])
                 if need_repair_ev and score.get('判定')=='RESIDUE_FOUND' and evidence is not None:
                     repair_ev_payload=(evidence['background'],evidence['confidence'],evidence['counts'],donor_crops)
         return ('OK',j,disagreement,frame_score,residue_score,repair_ev_payload)
@@ -723,7 +794,7 @@ def execute(work,files,detected,log,cfg):
             口径='所有冻结确认水印并集与实际写入模型掩膜逐像素核对，覆盖重试和上下文帧；不是未检测水印的真值召回率',
             模型排除区='全部确认水印并集',回写域='当前层与当前ROI施工域交集',
             源水印未排除像素=sum(f.get('源水印未排除像素',0) for a in input_audits for f in a['帧']),
-            全部已检查尝试通过=all(a['通过'] for a in input_audits),尝试=input_audits)),ensure_ascii=False,indent=2))
+            全部已检查尝试通过=all(a['通过'] for a in input_audits),尝试=input_audits)),ensure_ascii=False,separators=(',',':')))
     save_input_audit()
     layers=json.loads((work/'layers.json').read_text())['layers']
     animation_path=work/'animation-events.json'
@@ -745,7 +816,7 @@ def execute(work,files,detected,log,cfg):
         summary=dict(空间配置=asdict(spatial),配置=asdict(cfg),任务=records,未过块=unpassed,不可填块=unfillable,全部ROI通过=len(layer_records)==len(layers) and all(r['通过'] for r in records),图层=layer_records,实际图层数=len(layers),
                      窗口=settings.window_frames,重叠=settings.overlap_frames,
                      总耗时秒=time.monotonic()-started,原帧回退数=0)
-        (work/'roi-report.json').write_text(json.dumps(json_native(summary),ensure_ascii=False,indent=2))
+        (work/'roi-report.json').write_text(json.dumps(json_native(summary),ensure_ascii=False,separators=(',',':')))
         return summary
     try:
         for k,layer in enumerate(layers):
@@ -786,18 +857,47 @@ def execute(work,files,detected,log,cfg):
                 if animation_plan:
                     events=[e['interval'] for e in animation_plan['layers'].get(str(k),[]) if scene_start<=e['interval'][0]<scene_end]
                     schedule=planned_windows(scene_start,scene_end,settings.window_frames,settings.overlap_frames,events,animation_cfg)
+                prefetch_enabled = can_parallel and resume is None and os.environ.get('ROI_MODEL_PREFETCH') == '1'
+                executor = ThreadPoolExecutor(max_workers=1) if prefetch_enabled else None
+                prefetch_stop = Event()
+                pending = None
+                max_tasks = int(os.environ.get('ROI_MAX_TASKS') or 0)
+                timeout = min(840, policy.get('model_timeout_seconds') or 840)
+
+                def planned_jobs():
+                    for job_start, job_end in schedule:
+                        variants = seam_variants(job_start,job_end,scene_start,scene_end,settings,cfg)
+                        footprint = np.bitwise_or.reduce(masks[job_start:job_end])
+                        jobs = plan(footprint,max(r-l for l,r,_ in variants),cfg,spatial)
+                        if jobs:
+                            yield job_start, job_end, variants, jobs
+
+                def prepare_next(task, job, pool, audit, left, right, length):
+                    job_start, job_end, fragment = job
+
+                    def check():
+                        if prefetch_stop.is_set():
+                            raise PipelineError('ROI_PREFETCH_CANCELLED', '逐层ROI预取已取消')
+
+                    check()
+                    _make_attempt_dirs(task)
+                    _prepare_parallel_inputs(pool,task,current,files,masks,fragment['ownership'],fragment['box'],
+                                             job_start,job_end,left,right,pixels,trusted,audit,check)
+                    audit['通过'] = True
+                    _run_attempt_model(task,length,False,cfg,timeout,check)
+
                 try:
-                    for start,end in schedule:
-                        footprint=np.bitwise_or.reduce(masks[start:end])
-                        budget=max(r-l for l,r,_ in seam_variants(start,end,scene_start,scene_end,settings,cfg))
-                        jobs=plan(footprint,budget,cfg,spatial)
-                        for fragment in jobs:
+                    task_groups = planned_jobs()
+                    queued = next(task_groups, None)
+                    while queued is not None:
+                        start, end, window_variants, jobs = queued
+                        queued = next(task_groups, None) if executor else None
+                        for job_index, fragment in enumerate(jobs):
                             ownership=fragment['ownership'];box=fragment['box'];a,b,c,d=box
                             completed={j for j in range(scene_start,scene_end) if j in layer_done and np.any(layer_done[j]&ownership)}
                             task_refs=_window_refs(scene_start,scene_end,start,end,refs,trusted.dense_reference_frames if trusted else 24)
                             row=dict(任务=len(records)+1,图层=k,开始帧=start,结束帧=end,ROI=box,fp16=cfg.fp16,
                                      施工面积像素=int(np.count_nonzero(ownership)),裁块像素=padded_area(box),像素帧预算=spatial.maximum_pixel_frames,输入图层=k-1,窗口=settings.window_frames,重叠=settings.overlap_frames,通过=False,尝试=[])
-                            max_tasks=int(os.environ.get('ROI_MAX_TASKS') or 0)
                             if max_tasks and len(records)>=max_tasks:
                                 log(f'逐层ROI 验收夹具 ROI_MAX_TASKS={max_tasks} 已完成，停止后续任务');save();normal_exit=True;raise SystemExit(0)
                             records.append(row);tick=time.monotonic();save()
@@ -807,42 +907,37 @@ def execute(work,files,detected,log,cfg):
                                 save();log(f'逐层ROI 任务={row["任务"]} 检查点复用完成 通过={row["通过"]}；未运行补画模型')
                                 continue
                             baseline=work/f'roi-{len(records):04d}-baseline'
-                            variants=seam_variants(start,end,scene_start,scene_end,settings,cfg)
+                            variants=list(window_variants)
                             oom_used=False
                             task_shm=None;task_shm_spec=None
                             try:
                                 for attempt,(left,right,length) in enumerate(variants):
                                     task=work/f'roi-{len(records):04d}-attempt-{attempt:02d}'
-                                    task.mkdir();(task/'frames').mkdir();(task/'masks').mkdir()
+                                    prefetched = pending if pending is not None and pending[0] == task else None
+                                    if prefetched is not None:
+                                        pending = None
+                                    else:
+                                        _make_attempt_dirs(task)
                                     trial=dict(尝试=attempt,开始帧=left,结束帧=right,subvideo_length=length,
                                                前向重叠帧数=sum(j in completed for j in range(left,start+settings.overlap_frames)),
                                                通过=False,重叠最大差异=None)
                                     row['尝试'].append(trial);attempt_tick=time.monotonic();save()
                                     audit=None
                                     if trusted:
-                                        audit=dict(任务=row['任务'],图层=k,尝试=attempt,输入区间=[left,right],ROI=box,通过=False,帧=[]);input_audits.append(audit)
+                                        audit = prefetched[1] if prefetched else _attempt_audit(row['任务'],k,attempt,left,right,box)
+                                        input_audits.append(audit)
                                     log(f'逐层ROI 任务={row["任务"]} 尝试={attempt} 输入帧={left}:{right} 施工帧={start}:{end} subvideo={length} 裁块={c-a}×{d-b}')
                                     try:
                                         if padded_area(box)*(right-left)>spatial.maximum_pixel_frames:raise PipelineError('GPU_BUDGET_EXCEEDED','空间裁块超过配置像素帧预算')
-                                        if can_parallel and right-left>1:
-                                            trusted_dict=asdict(trusted) if trusted is not None else None
-                                            sub_shape=(d-b,c-a)
-                                            prep_items=[
-                                                (j,start,end,left,box,pixels,str(current[j]),str(work/'masks'/files[j].name),
-                                                 str(task/'frames'/f'{j-left:06d}.png'),str(task/'masks'/f'{j-left:06d}.png'),
-                                                 _pack_bool((masks[j][b:d,a:c]>0)&(ownership[b:d,a:c]>0)),sub_shape,trusted_dict)
-                                                for j in range(left,right)
-                                            ]
-                                            for res_p in get_pool().imap(_prep_frame_worker,prep_items):
-                                                st_p=res_p[0]
-                                                if st_p=='MASK_UNCERTAIN':
-                                                    raise PipelineError('MASK_UNCERTAIN',res_p[3])
-                                                if st_p=='AUDIT_ERR':
-                                                    _,j_err,code,msg,det=res_p
-                                                    audit['帧'].append(dict(frame=j_err,**det));audit['错误码']=code;save_input_audit()
-                                                    raise PipelineError(code,msg,details=det)
-                                                if trusted and res_p[2] is not None:
-                                                    audit['帧'].append(res_p[2])
+                                        if prefetched is not None:
+                                            try:
+                                                prefetched[2].result()
+                                            finally:
+                                                if audit['通过']:
+                                                    trial['超时秒'] = timeout
+                                        elif can_parallel and right-left>1:
+                                            _prepare_parallel_inputs(get_pool(),task,current,files,masks,ownership,box,
+                                                                     start,end,left,right,pixels,trusted,audit,lambda: None)
                                         else:
                                             for j in range(left,right):
                                                 roi.atomic_png(task/'frames'/f'{j-left:06d}.png',roi.crop(get_current_img(j),box))
@@ -857,23 +952,38 @@ def execute(work,files,detected,log,cfg):
                                                     audit['帧'].append(dict(frame=j,context=not(start<=j<end),模型掩膜sha256=hashlib.sha256(mask_path.read_bytes()).hexdigest(),**checked))
                                         if trusted:audit['通过']=True;save_input_audit();log(f'逐层ROI 任务={row["任务"]} 尝试={attempt} 层输入自检通过，未排除像素=0，检查帧数={right-left}')
                                         singleton=right-left==1
-                                        if singleton:
-                                            for name in ['frames','masks']:shutil.copy2(task/name/'000000.png',task/name/'000001.png')
-                                        args=[os.environ['INPAINT_PYTHON'],str(Path(__file__).with_name('torch_stage.py')),
-                                              '--metrics',task/'metrics.json','--frames-only','--script',Path(os.environ['PROPAINTER_ROOT'])/'inference_propainter.py',
-                                              '--video',task/'frames','--mask',task/'masks','--output',task/'out','--save_frames',
-                                              '--mask_dilation','0','--subvideo_length',str(length),'--neighbor_length','6','--ref_stride','20']
-                                        if cfg.fp16:args.append('--fp16')
-                                        # 按实际像素帧工作量扩展保护，不限制整块总预算。
-                                        timeout=min(840,policy.get('model_timeout_seconds') or 840)
                                         trial['超时秒']=timeout
-                                        heartbeat=[time.monotonic()]
-                                        def check_model():
-                                            if time.monotonic()-heartbeat[0]>=30:
-                                                phase='模型指标已写出，等待子进程退出' if (task/'metrics.json').exists() else '模型进程仍存活，正在计算'
-                                                log(f'逐层ROI 任务={row["任务"]} 尝试={attempt} {phase}')
-                                                heartbeat[0]=time.monotonic()
-                                        _model_stage(args,task,task.name,check=check_model,cwd=os.environ['PROPAINTER_ROOT'],timeout=timeout,stage='逐层ROI-ProPainter')
+                                        if prefetched is None:
+                                            heartbeat=time.monotonic()
+
+                                            def check_model():
+                                                nonlocal heartbeat
+                                                if time.monotonic()-heartbeat>=30:
+                                                    phase='模型指标已写出，等待子进程退出' if (task/'metrics.json').exists() else '模型进程仍存活，正在计算'
+                                                    log(f'逐层ROI 任务={row["任务"]} 尝试={attempt} {phase}')
+                                                    heartbeat=time.monotonic()
+
+                                            _run_attempt_model(task,length,singleton,cfg,timeout,check_model)
+                                        next_number = len(records) + 1
+                                        if executor and pending is None and (not max_tasks or next_number <= max_tasks):
+                                            if job_index+1 < len(jobs):
+                                                next_job = start, end, jobs[job_index+1]
+                                                next_left, next_right, next_length = window_variants[0]
+                                            elif queued is not None:
+                                                next_start, next_end, next_variants, next_jobs = queued
+                                                next_job = next_start, next_end, next_jobs[0]
+                                                next_left, next_right, next_length = next_variants[0]
+                                            else:
+                                                next_job = None
+                                            if next_job is not None and next_right-next_left > 1:
+                                                next_box = next_job[2]['box']
+                                                if padded_area(next_box)*(next_right-next_left) <= spatial.maximum_pixel_frames:
+                                                    next_task = work/f'roi-{next_number:04d}-attempt-00'
+                                                    next_audit = _attempt_audit(next_number,k,0,next_left,next_right,next_box)
+                                                    future = executor.submit(prepare_next,next_task,next_job,get_pool(),next_audit,
+                                                                             next_left,next_right,next_length)
+                                                    pending = next_task, next_audit, future
+                                                    log(f'逐层ROI 任务={next_number} 开始预取首轮模型')
                                         log(f'逐层ROI 任务={row["任务"]} 尝试={attempt} 模型已结束，开始CPU参考回填与残留复检')
                                         predicted=sorted((task/'out/frames/frames').glob('*.png'))
                                         if len(predicted)!=(2 if singleton else right-left):raise PipelineError('ROI_INCOMPLETE','逐层ROI输出帧数缺失，禁止原帧回退')
@@ -957,7 +1067,7 @@ def execute(work,files,detected,log,cfg):
                                                         str(sample_dir),str(task/'masks'/f'{j-left:06d}.png'),
                                                     )
                                                     worker_items.append((
-                                                        j,box,crop_shape,shape,construction,in_comp,weight,
+                                                        j,box,crop_shape,shape,construction,in_comp,weight,resume is not None or j in layer_done,
                                                         j in sample_frames,j in stage_frames,continue_unpassed,need_repair_ev,
                                                         detail_mode,edge_dict,_pack_bool(active),_pack_bool(shared),_pack_bool(mask_crop),
                                                         trk_sparse,task_shm.name,task_shm_spec,paths,dense_ctx,
@@ -1080,7 +1190,9 @@ def execute(work,files,detected,log,cfg):
                                                 )
                                                 if repair_info is not None:trial['确认残留补修']=repair_info
                                         # 清理临时内存回调引用后再序列化 JSON
-                                        for sc in residue_scores:sc.pop('_evidence',None)
+                                        for sc in residue_scores:
+                                            sc.pop('_evidence',None)
+                                            sc.pop('_repair_residue',None)
                                         trial['主色残留']=residue_scores
                                         trial['残留汇总']=residue_summary(residue_scores)
                                         trial['跳过参考回填帧']=skipped
@@ -1185,7 +1297,12 @@ def execute(work,files,detected,log,cfg):
                                     log(f'逐层ROI 任务={row["任务"]} 未过块=True 无完整模型候选；继续其余任务，禁止原帧伪造成片')
                                 save()
                             log(f'逐层ROI 任务={row["任务"]} 完成 耗时秒={row["耗时秒"]:.3f}')
+                        if executor is None:
+                            queued = next(task_groups, None)
                 finally:
+                    if executor is not None:
+                        prefetch_stop.set()
+                        executor.shutdown(wait=True, cancel_futures=True)
                     scene_img_cache.clear()
                     scene_conf_cache.clear()
             layer_records.append(dict(图层=k,耗时秒=time.monotonic()-begin,活动帧数=sum(bool(m.any()) for m in masks)))
@@ -1204,5 +1321,5 @@ def execute(work,files,detected,log,cfg):
         save();raise PipelineError('ROI_UNFILLABLE','其余任务已执行，但部分未过块无完整模型候选，禁止原帧回退',details=dict(tasks=unfillable))
     roi.assert_coverage(work,files)
     summary=save();summary.update(覆盖核验通过=True,任务数=len(records))
-    (work/'roi-report.json').write_text(json.dumps(json_native(summary),ensure_ascii=False,indent=2))
+    (work/'roi-report.json').write_text(json.dumps(json_native(summary),ensure_ascii=False,separators=(',',':')))
     return summary

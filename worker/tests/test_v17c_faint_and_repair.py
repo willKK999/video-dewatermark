@@ -294,7 +294,8 @@ def test_restore_orthogonal_luma_detail_preserves_bg_blocks_strokes():
     assert float(out[58:70, 50:78].mean()) < 145.0
 
 
-def test_repair_confirmed_residue_pass_bounded(tmp_path: Path, monkeypatch):
+@pytest.mark.parametrize("reuse_residue", [False, True])
+def test_repair_confirmed_residue_pass_bounded(tmp_path: Path, monkeypatch, reuse_residue):
     """验证确认残留有界一轮补修：仅对确认残留膨胀区域补画并重检，若仍残留或接缝超限如实失败。"""
     from types import SimpleNamespace
     from worker import roi_spatial_layers as rsl
@@ -338,7 +339,13 @@ def test_repair_confirmed_residue_pass_bounded(tmp_path: Path, monkeypatch):
     scores_before = []
     for j in range(3):
         st_j = cv2.imread(str(staged / files[j].name))
-        sc = measure(cv2.imread(str(files[j])), st_j, masks[j], np.zeros((h, w), dtype=np.uint8), edge_cfg, confirmed=masks[j])
+        sc = measure(
+            cv2.imread(str(files[j])), st_j, masks[j], np.zeros((h, w), dtype=np.uint8),
+            edge_cfg, confirmed=masks[j], return_masks=reuse_residue,
+        )
+        if reuse_residue:
+            repair_masks = sc.pop('_masks')
+            sc['_repair_residue'] = rsl._pack_bool(repair_masks['确认残留'])
         scores_before.append(dict(frame=j, **sc))
     assert any(s['判定'] == 'RESIDUE_FOUND' for s in scores_before)
 
