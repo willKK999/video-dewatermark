@@ -31,8 +31,12 @@ def exclusion_mask(confirmed,cfg):
     return context_mask(confirmed,cfg.boundary_exclusion_pixels)
 
 
+def _is_binary_u8(mask):
+    return not np.any((mask != 0) & (mask != 255))
+
+
 def verify_input(expected,actual,construction,frame_pixels,cfg):
-    if actual is None or expected is None or construction is None or expected.shape!=actual.shape or actual.shape!=construction.shape or not set(np.unique(actual))<={0,255}:
+    if actual is None or expected is None or construction is None or expected.shape!=actual.shape or actual.shape!=construction.shape or not _is_binary_u8(actual):
         raise PipelineError('CONTEXT_MASK_INVALID','模型排除掩膜形状或取值不符')
     missing=int(np.count_nonzero((expected>0)&(actual==0)))
     outside=int(np.count_nonzero((construction>0)&(expected==0)))
@@ -49,7 +53,7 @@ def stable_union_layers(frames,limit=.2):
     maximum=0.;count=0
     for mask in frames:
         count+=1
-        if mask is None or not set(np.unique(mask))<={0,255}:raise PipelineError('MASK_INVALID','确认水印并集无效')
+        if mask is None or not _is_binary_u8(mask):raise PipelineError('MASK_INVALID','确认水印并集无效')
         maximum=max(maximum,np.count_nonzero(mask)/mask.size)
         if maximum>limit:raise PipelineError('MASK_UNCERTAIN','稳定联合层超过20%，不得迁移部件或拆层绕过可信区保护')
     if not count:raise PipelineError('MASK_INVALID','冻结确认水印输入为空，禁止生成空计划')
@@ -58,7 +62,7 @@ def stable_union_layers(frames,limit=.2):
 
 def read_confirmed(path):
     mask=cv2.imread(str(path),0)
-    if mask is None or mask.ndim!=2 or not set(np.unique(mask))<={0,255}:
+    if mask is None or mask.ndim!=2 or not _is_binary_u8(mask):
         raise PipelineError('MASK_INVALID','确认水印掩膜缺失或无效')
     return mask
 

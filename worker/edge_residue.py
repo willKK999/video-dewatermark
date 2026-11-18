@@ -237,9 +237,13 @@ def complete_group_color_holes(image,group,confirmed,protected,neighbor_groups,c
     return added.astype(np.uint8)*255,dict(hues=dist_peaks,候选像素=int(cand.sum()),新增像素=int(added.sum()),保护交集像素=int((added&guard).sum()))
 
 
+def _is_binary_u8(value):
+    return not np.any((value!=0)&(value!=255))
+
+
 def _binary(value,name,shape):
     if value is None:return None
-    if value.shape!=shape or value.dtype!=np.uint8 or not set(np.unique(value))<={0,255}:
+    if value.shape!=shape or value.dtype!=np.uint8 or not _is_binary_u8(value):
         raise PipelineError('RESIDUE_INPUT_INVALID',f'残留复检{name}未与施工裁块对齐或取值无效')
     return value>0
 
@@ -271,7 +275,7 @@ def measure(source,painted,mask,band,cfg,reference_evidence=None,confirmed=None,
         raise PipelineError('RESIDUE_INPUT_INVALID','残留复检输入缺失')
     if source.ndim!=3 or source.shape[2]!=3 or painted.shape!=source.shape or mask.ndim!=2 or band.shape!=mask.shape or mask.shape!=source.shape[:2]:
         raise PipelineError('RESIDUE_INPUT_INVALID','残留复检要求对齐的三通道BGR和二维掩膜')
-    if source.dtype!=np.uint8 or painted.dtype!=np.uint8 or mask.dtype!=np.uint8 or band.dtype!=np.uint8 or not set(np.unique(mask))<={0,255} or not set(np.unique(band))<={0,255}:
+    if source.dtype!=np.uint8 or painted.dtype!=np.uint8 or mask.dtype!=np.uint8 or band.dtype!=np.uint8 or not _is_binary_u8(mask) or not _is_binary_u8(band):
         raise PipelineError('RESIDUE_INPUT_INVALID','残留复检输入类型或掩膜取值无效')
     if not np.any(mask):raise PipelineError('RESIDUE_INPUT_INVALID','残留复检施工样本为空，禁止按零残留通过')
     if np.any((band>0)&(mask==0)):raise PipelineError('RESIDUE_INPUT_INVALID','收边带超出当前施工域')
@@ -296,19 +300,21 @@ def measure(source,painted,mask,band,cfg,reference_evidence=None,confirmed=None,
     # 距全部已确认水印（含收边带）的距离；外环只取距离≥gap的像素，紧贴掩膜的光晕不能当背景证据。
     distance=cv2.distanceTransform((~watermark).astype(np.uint8),cv2.DIST_L2,5)
     far=(distance>=gap)&~guard;far_outer=(distance>=middle)&~guard
-    count,labels=cv2.connectedComponents(cv2.dilate(watermark.astype(np.uint8),_ellipse(cfg.shape_radius)),connectivity=8)
+    count,labels,stats,_=cv2.connectedComponentsWithStats(cv2.dilate(watermark.astype(np.uint8),_ellipse(cfg.shape_radius)),connectivity=8)
     candidates=np.zeros(shape,bool);temporal_proved=np.zeros(shape,bool);ring_proved=np.zeros(shape,bool);conflict=np.zeros(shape,bool)
     unexplained=np.zeros(shape,bool);residue=np.zeros(shape,bool);untemplated=np.zeros(shape,bool);ring_uncertain=np.zeros(shape,bool)
     same_color_mask=np.zeros(shape,bool);groups=[];reasons=[]
     colorless=0;same_color_groups=0;minimum_outer=cfg.background_ring_minimum_pixels//2
+    margin=R+L+1
     for label in range(1,count):
-        whole=labels==label
-        if not np.any(whole&construction):continue
-        ys,xs=np.nonzero(whole);margin=R+L+1
-        y0,y1=max(0,ys.min()-margin),min(h,ys.max()+margin+1);x0,x1=max(0,xs.min()-margin),min(w,xs.max()+margin+1)
-        view=(slice(y0,y1),slice(x0,x1));group=whole[view];work=group&construction[view]
+        bx=int(stats[label,cv2.CC_STAT_LEFT]);by=int(stats[label,cv2.CC_STAT_TOP])
+        bw=int(stats[label,cv2.CC_STAT_WIDTH]);bh=int(stats[label,cv2.CC_STAT_HEIGHT])
+        bx1,by1=bx+bw,by+bh
+        if not np.any((labels[by:by1,bx:bx1]==label)&construction[by:by1,bx:bx1]):continue
+        y0,y1=max(0,by-margin),min(h,by1+margin);x0,x1=max(0,bx-margin),min(w,bx1+margin)
+        view=(slice(y0,y1),slice(x0,x1));group=labels[view]==label;work=group&construction[view]
         template_region=group&watermark[view]&~guard[view];s_hsv=source_hsv[view];p_hsv=painted_hsv[view]
-        row=dict(组=len(groups)+1,外接框=[int(xs.min()),int(ys.min()),int(xs.max())+1,int(ys.max())+1],施工像素=int(work.sum()),
+        row=dict(组=len(groups)+1,外接框=[bx,by,bx1,by1],施工像素=int(work.sum()),
                  遮罩内像素=int((work&interior[view]).sum()),收边带像素=int((work&edge[view]).sum()),模板像素=int(template_region.sum()))
         eligible=int((template_region&_colored(s_hsv,cfg)).sum());row['彩色样本']=eligible
         peaks=color_peaks(source[view],template_region,cfg,hsv=s_hsv);row['主色色相']=peaks

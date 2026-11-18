@@ -36,14 +36,22 @@ def fill_small_holes(background, confidence, mask):
     holes = ((closed > 0) & (reliable == 0) & core).astype(np.uint8)
     n, labels, stats, _ = cv2.connectedComponentsWithStats(holes)
     fill = np.zeros_like(holes)
+    rh, rw = holes.shape
+    ker3 = np.ones((3, 3), np.uint8)
     for label in range(1, n):
         if stats[label, cv2.CC_STAT_AREA] > 64:
             continue
-        component = (labels == label).astype(np.uint8)
-        border = (cv2.dilate(component, np.ones((3, 3), np.uint8)) > 0) & (component == 0)
-        if (border.any() and np.mean(reliable[border] > 0) >= .7
-                and region[border].astype(float).std(axis=0).max() <= 8):
-            fill[component > 0] = 255
+        lx = int(stats[label, cv2.CC_STAT_LEFT])
+        ly = int(stats[label, cv2.CC_STAT_TOP])
+        lw = int(stats[label, cv2.CC_STAT_WIDTH])
+        lh = int(stats[label, cv2.CC_STAT_HEIGHT])
+        lx0, lx1 = max(0, lx - 1), min(rw, lx + lw + 1)
+        ly0, ly1 = max(0, ly - 1), min(rh, ly + lh + 1)
+        component = (labels[ly0:ly1, lx0:lx1] == label).astype(np.uint8)
+        border = (cv2.dilate(component, ker3) > 0) & (component == 0)
+        if (border.any() and np.mean(reliable[ly0:ly1, lx0:lx1][border] > 0) >= .7
+                and region[ly0:ly1, lx0:lx1][border].astype(float).std(axis=0).max() <= 8):
+            fill[ly0:ly1, lx0:lx1][component > 0] = 255
     if fill.any():
         region = cv2.inpaint(region, fill, 3, cv2.INPAINT_TELEA)
         reliable[fill > 0] = 1
@@ -61,54 +69,79 @@ def _crop_affine(transform, ox, oy):
 
 def _build_donor_evaluator(shape, donor_crops):
     """构造按色相峰值延迟评估已对齐干净供体的回调函数，避免重复计算HSV。"""
-    from worker.edge_residue import _matches_hsv
+    from worker.edge_residue import _colored, _hue_distance
 
     hsv_cache = []
+    seen_base = None
+    ctx_key = None
+    ctx_painted_ref = None
+    ctx_crops = []
+    peak_cache = {}
+    ker3 = np.ones((3, 3), dtype=np.uint8)
 
     def evaluate_peak(hue, cfg, painted_hsv=None):
+        nonlocal seen_base, ctx_key, ctx_painted_ref, ctx_crops
         if not hsv_cache:
+            seen_acc = np.zeros(shape, dtype=np.uint8)
             for y0, y1, x0, x1, bgr_crop, tr_crop in donor_crops:
+                seen_acc[y0:y1, x0:x1] += tr_crop.astype(np.uint8)
                 hsv_cache.append((y0, y1, x0, x1, cv2.cvtColor(bgr_crop, cv2.COLOR_BGR2HSV), tr_crop))
-        seen = np.zeros(shape, dtype=np.uint8)
+            seen_base = seen_acc
+        cur_key = (cfg, None if painted_hsv is None else id(painted_hsv))
+        if cur_key != ctx_key or painted_hsv is not ctx_painted_ref:
+            ctx_key = cur_key
+            ctx_painted_ref = painted_hsv
+            peak_cache.clear()
+            local_hue_tol = max(6, cfg.hue_radius // 2 + 2)
+            min_s = max(0, int(cfg.minimum_saturation) - 10)
+            min_v = max(0, int(cfg.minimum_value) - 10)
+            ctx_crops = []
+            for y0, y1, x0, x1, hsv_crop, tr_crop in hsv_cache:
+                colored_crop = _colored(hsv_crop, cfg)
+                self_match = None
+                # 若干净未遮挡供体在色相峰边界内与成片自身颜色高度一致（消除量化悬崖误反证），也计入匹配。
+                if painted_hsv is not None:
+                    ph, pw = painted_hsv.shape[:2]
+                    iy1, ix1 = min(y1, ph), min(x1, pw)
+                    if iy1 > y0 and ix1 > x0:
+                        p_hsv = painted_hsv[y0:iy1, x0:ix1]
+                        hc = hsv_crop[: iy1 - y0, : ix1 - x0]
+                        dh = np.abs(hc[:, :, 0].astype(np.int16) - p_hsv[:, :, 0].astype(np.int16))
+                        dh = np.minimum(dh, 180 - dh)
+                        self_match = (dh <= local_hue_tol) & (hc[:, :, 1] >= min_s) & (hc[:, :, 2] >= min_v)
+                ctx_crops.append((y0, y1, x0, x1, hsv_crop[:, :, 0], colored_crop, tr_crop, self_match))
+        h_int = int(hue)
+        cached = peak_cache.get(h_int)
+        if cached is not None:
+            return seen_base.copy(), cached[0].copy(), cached[1].copy()
         exact = np.zeros(shape, dtype=np.uint8)
         dil1 = np.zeros(shape, dtype=np.uint8)
-        ker3 = np.ones((3, 3), dtype=np.uint8)
-        h_int = int(hue)
-        local_hue_tol = max(6, cfg.hue_radius // 2 + 2)
-        min_s = max(0, int(cfg.minimum_saturation) - 10)
-        min_v = max(0, int(cfg.minimum_value) - 10)
-        for y0, y1, x0, x1, hsv_crop, tr_crop in hsv_cache:
-            hm = _matches_hsv(hsv_crop, h_int, cfg)
-            # 若干净未遮挡供体在色相峰边界内与成片自身颜色高度一致（消除量化悬崖误反证），也计入匹配。
-            if painted_hsv is not None:
-                ph, pw = painted_hsv.shape[:2]
-                iy1, ix1 = min(y1, ph), min(x1, pw)
-                if iy1 > y0 and ix1 > x0:
-                    p_hsv = painted_hsv[y0:iy1, x0:ix1]
-                    hc = hsv_crop[: iy1 - y0, : ix1 - x0]
-                    dh = np.abs(hc[:, :, 0].astype(np.int16) - p_hsv[:, :, 0].astype(np.int16))
-                    dh = np.minimum(dh, 180 - dh)
-                    self_match = (dh <= local_hue_tol) & (hc[:, :, 1] >= min_s) & (hc[:, :, 2] >= min_v)
-                    hm[: iy1 - y0, : ix1 - x0] |= self_match
+        hue_rad = cfg.hue_radius
+        for y0, y1, x0, x1, h_plane, colored_crop, tr_crop, self_match in ctx_crops:
+            hm = (_hue_distance(h_plane, h_int) <= hue_rad) & colored_crop
+            if self_match is not None:
+                sh, sw = self_match.shape
+                hm[:sh, :sw] |= self_match
             hm_d = cv2.dilate(hm.astype(np.uint8), ker3) > 0
-            seen[y0:y1, x0:x1] += tr_crop.astype(np.uint8)
             exact[y0:y1, x0:x1] += (tr_crop & hm).astype(np.uint8)
             dil1[y0:y1, x0:x1] += (tr_crop & hm_d).astype(np.uint8)
-        return seen, exact, dil1
+        peak_cache[h_int] = (exact, dil1)
+        return seen_base.copy(), exact.copy(), dil1.copy()
 
     return evaluate_peak
 
 
 class CleanReferences:
     """保守的全局+局部仿射背景回填；移动物体、遮挡和不一致参考自动退回模型。"""
-    def __init__(self, images, masks, enable_local_donors=True):
+    def __init__(self, images, masks, enable_local_donors=True, trusted=None, grays=None):
         self.stats = dict(processed_frames=0, masked_pixels=0, restored_pixels=0, interpolated_pixels=0, reference_frames=len(images))
         self.timings = dict(tracking_seconds=0., alignment_seconds=0., median_seconds=0.)
-        self.trusted = [255-context_mask(mask, 3) for mask in masks]
+        self.trusted = list(trusted) if trusted is not None else [255-context_mask(mask, 3) for mask in masks]
         self.images = images
         self.masks = masks
-        self.grays = [cv2.cvtColor(im, cv2.COLOR_BGR2GRAY) for im in images]
+        self.grays = list(grays) if grays is not None else [cv2.cvtColor(im, cv2.COLOR_BGR2GRAY) for im in images]
         self.enable_local_donors = enable_local_donors
+        self.last_donor_crops = []
 
     def _track(self, gray, refgray, points, reftrusted=None):
         tracked, status, _ = cv2.calcOpticalFlowPyrLK(gray, refgray, points, None)
@@ -141,16 +174,20 @@ class CleanReferences:
         if int(np.count_nonzero(global_ring)) < 200:
             global_ring = tgt_trusted
 
-        num, labels = cv2.connectedComponents(cv2.dilate(support.astype(np.uint8), np.ones((3, 3), np.uint8)))
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(cv2.dilate(support.astype(np.uint8), np.ones((3, 3), np.uint8)))
         local_crops = []
+        gray_f32 = gray.astype(np.float32)
 
         for k in range(1, num):
-            cc_support = (labels == k) & support
-            cc_miss = cc_support & missing
-            if not np.any(cc_miss):
+            kx = int(stats[k, cv2.CC_STAT_LEFT])
+            ky = int(stats[k, cv2.CC_STAT_TOP])
+            kw = int(stats[k, cv2.CC_STAT_WIDTH])
+            kh = int(stats[k, cv2.CC_STAT_HEIGHT])
+            cc_miss_sub = (labels[ky:ky + kh, kx:kx + kw] == k) & missing[ky:ky + kh, kx:kx + kw]
+            if not np.any(cc_miss_sub):
                 continue
-            ys_c, xs_c = np.where(cc_miss)
-            mcx0, mcy0, mcx1, mcy1 = int(xs_c.min()), int(ys_c.min()), int(xs_c.max()) + 1, int(ys_c.max()) + 1
+            ys_c, xs_c = np.where(cc_miss_sub)
+            mcx0, mcy0, mcx1, mcy1 = kx + int(xs_c.min()), ky + int(ys_c.min()), kx + int(xs_c.max()) + 1, ky + int(ys_c.max()) + 1
             # 仅对跨度超过128像素的大连通域分块，保持常规水印/背景块完整以避免破坏局部刚性特征环
             mw_cc, mh_cc = mcx1 - mcx0, mcy1 - mcy0
             tile_w = 96 if mw_cc > 128 else mw_cc
@@ -159,14 +196,13 @@ class CleanReferences:
                 for tx0 in range(mcx0, mcx1, tile_w):
                     ty1 = min(mcy1, ty0 + tile_h)
                     tx1 = min(mcx1, tx0 + tile_w)
-                    tile_miss = np.zeros_like(cc_miss)
-                    tile_miss[ty0:ty1, tx0:tx1] = cc_miss[ty0:ty1, tx0:tx1]
-                    if not np.any(tile_miss):
+                    tile_sub = missing[ty0:ty1, tx0:tx1] & (labels[ty0:ty1, tx0:tx1] == k)
+                    if not np.any(tile_sub):
                         continue
-                    tys, txs = np.where(tile_miss)
-                    cx0, cy0, cx1, cy1 = int(txs.min()), int(tys.min()), int(txs.max()) + 1, int(tys.max()) + 1
+                    tys, txs = np.where(tile_sub)
+                    cx0, cy0, cx1, cy1 = tx0 + int(txs.min()), ty0 + int(tys.min()), tx0 + int(txs.max()) + 1, ty0 + int(tys.max()) + 1
                     cw, ch = cx1 - cx0, cy1 - cy0
-                    cc_crop_mask = tile_miss[cy0:cy1, cx0:cx1]
+                    cc_crop_mask = missing[cy0:cy1, cx0:cx1] & (labels[cy0:cy1, cx0:cx1] == k)
                     used_by_ref = [
                         (global_seen_refs[rf_idx][cy0:cy1, cx0:cx1].copy() if global_seen_refs[rf_idx] is not None else np.zeros((ch, cw), dtype=bool))
                         for rf_idx in range(len(self.images))
@@ -206,10 +242,11 @@ class CleanReferences:
                         off_pts = pts_full.copy()
                         off_pts[:, 0, 0] -= sx0
                         off_pts[:, 0, 1] -= sy0
-                        src_win = gray[sy0:sy1, sx0:sx1]
+                        src_win = np.ascontiguousarray(gray[sy0:sy1, sx0:sx1])
+                        gray_e = gray_f32[ey0:ey1, ex0:ex1]
 
                         for rf_idx, (ref_bgr, ref_tr, ref_gr) in enumerate(zip(self.images, self.trusted, self.grays)):
-                            if np.all(~(cc_crop_mask & (~used_by_ref[rf_idx]))):
+                            if np.all(used_by_ref[rf_idx][cc_crop_mask]):
                                 continue
                             nxt, st, _ = cv2.calcOpticalFlowPyrLK(src_win, ref_gr[sy0:sy1, sx0:sx1], off_pts, None)
                             if nxt is None or st is None:
@@ -229,7 +266,7 @@ class CleanReferences:
                             if int(np.count_nonzero(both_e)) < min_both:
                                 continue
                             al_gr_e = cv2.warpAffine(ref_gr, m_e, (ew, eh), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP)
-                            diffs = np.abs(gray[ey0:ey1, ex0:ex1].astype(np.float32) - al_gr_e.astype(np.float32))[both_e]
+                            diffs = np.abs(gray_e - al_gr_e.astype(np.float32))[both_e]
                             if float(diffs.mean()) > 6.5 or float(np.percentile(diffs, 90)) > 15.0:
                                 continue
                             m_c = _crop_affine(mat, cx0, cy0)
@@ -249,7 +286,7 @@ class CleanReferences:
                     if len(cc_rgb_stack) >= 3:
                         stack = np.stack(cc_rgb_stack)
                         valid_cnt = np.sum(np.stack(cc_valid_stack), axis=0)
-                        miss_crop = cc_miss[cy0:cy1, cx0:cx1]
+                        miss_crop = cc_crop_mask
                         elig = miss_crop & (valid_cnt >= 3)
                         if np.any(elig):
                             vals = stack[:, elig]
@@ -272,6 +309,7 @@ class CleanReferences:
 
     def restore(self, image, mask, repaired, confirmed=None):
         self.last_evidence=dict(background=np.zeros_like(image),confidence=np.zeros(mask.shape,np.uint8),counts=np.zeros(mask.shape,np.uint8))
+        self.last_donor_crops = []
         self.stats["processed_frames"] += 1
         self.stats["masked_pixels"] += int(np.count_nonzero(mask))
         if not mask.any() or len(self.images) < 3:
@@ -291,6 +329,7 @@ class CleanReferences:
         global_seen_refs = [None] * len(self.images)
 
         if points is not None and len(points) >= 16 and ring.sum() >= 32:
+            ring_min = .35 * ring.sum()
             for rf_idx, (reference, reftrusted, refgray) in enumerate(zip(self.images, self.trusted, self.grays)):
                 started = time.perf_counter()
                 transform = self._track(gray, refgray, points, reftrusted)
@@ -298,12 +337,13 @@ class CleanReferences:
                 if transform is None:
                     continue
                 started = time.perf_counter()
-                aligned = cv2.warpAffine(reference, transform, (w, h), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP)
                 trusted = cv2.warpAffine(reftrusted, transform, (w, h), flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP) > 0
-                self.timings['alignment_seconds'] += time.perf_counter()-started
                 usable = ring & trusted
-                if usable.sum() < .35*ring.sum():
+                if usable.sum() < ring_min:
+                    self.timings['alignment_seconds'] += time.perf_counter()-started
                     continue
+                aligned = cv2.warpAffine(reference, transform, (w, h), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP)
+                self.timings['alignment_seconds'] += time.perf_counter()-started
                 error = np.abs(aligned[usable].astype(np.float32)-image[usable].astype(np.float32)).mean(axis=1)
                 if error.mean() > 6 or np.percentile(error, 90) > 14:
                     continue
@@ -343,6 +383,7 @@ class CleanReferences:
                 )
 
         all_crops = global_crops + local_crops
+        self.last_donor_crops = all_crops
         if not np.any(evidence_counts >= 3) and not all_crops:
             return repaired
 
@@ -408,15 +449,17 @@ def restore_orthogonal_luma_detail(
         cand[:, :, ch] = np.where(active, np.clip(cand[:, :, ch] + delta_y, 0.0, 255.0), cand[:, :, ch])
     out = np.clip(np.rint(cand), 0, 255).astype(np.uint8)
 
-    peaks = color_peaks(source, msk, edge_cfg)
+    peaks = color_peaks(source, msk, edge_cfg, hsv=hsv_src)
     if peaks:
-        pnt_hsv = cv2.cvtColor(repaired, cv2.COLOR_BGR2HSV)
-        out_hsv = cv2.cvtColor(out, cv2.COLOR_BGR2HSV)
-        revert = np.zeros(msk.shape, dtype=bool)
+        mx0, my0, mw, mh = cv2.boundingRect(msk.astype(np.uint8))
+        mx1, my1 = mx0 + mw, my0 + mh
+        pnt_hsv = cv2.cvtColor(repaired[my0:my1, mx0:mx1], cv2.COLOR_BGR2HSV)
+        out_hsv = cv2.cvtColor(out[my0:my1, mx0:mx1], cv2.COLOR_BGR2HSV)
+        revert = np.zeros((mh, mw), dtype=bool)
         for pk in peaks:
             revert |= _matches_hsv(out_hsv, int(pk), edge_cfg) & (~_matches_hsv(pnt_hsv, int(pk), edge_cfg))
         if np.any(revert):
-            out[revert] = repaired[revert]
+            out[my0:my1, mx0:mx1][revert] = repaired[my0:my1, mx0:mx1][revert]
 
     final = source.copy()
     final[msk] = out[msk]
