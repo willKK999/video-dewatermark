@@ -530,7 +530,16 @@ def _build_ref_shm(ref_imgs,ref_trusted,ref_grays,static_hp):
 
 
 def _attach_ref_shm(shm_name,spec):
-    shm=shared_memory.SharedMemory(name=shm_name,create=False,track=False)
+    try:
+        shm=shared_memory.SharedMemory(name=shm_name,create=False,track=False)
+    except TypeError:
+        # Python<3.13 无 track 参数：附着后从资源跟踪器注销，避免工作进程重复登记/误删共享内存（不影响计算）。
+        shm=shared_memory.SharedMemory(name=shm_name,create=False)
+        try:
+            from multiprocessing import resource_tracker
+            resource_tracker.unregister(shm._name,'shared_memory')
+        except Exception:
+            pass
     offsets=spec['offsets'];views={}
     for name in ('imgs','tr','gr','hp'):
         off,shp,dt,nb=offsets[name]
