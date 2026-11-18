@@ -4,6 +4,17 @@ import cv2
 import numpy as np
 
 
+from worker import roi_cuda
+
+
+def _donor_consensus(values):
+    if roi_cuda.enabled():
+        return roi_cuda.donor_consensus(values)
+    median = np.nanmedian(values, axis=0)
+    agreement = np.nanmax(np.abs(values - median), axis=(0, 2)) <= 10
+    return median, agreement
+
+
 def context_mask(mask, radius=3):
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*radius+1, 2*radius+1))
     return cv2.dilate(mask, kernel)
@@ -303,8 +314,7 @@ class CleanReferences:
                         elig = miss_crop & (valid_cnt >= 3)
                         if np.any(elig):
                             vals = stack[:, elig]
-                            med = np.nanmedian(vals, axis=0)
-                            agree = np.nanmax(np.abs(vals - med), axis=(0, 2)) <= 10
+                            med, agree = _donor_consensus(vals)
                             bg_sub = background[cy0:cy1, cx0:cx1]
                             cf_sub = confidence[cy0:cy1, cx0:cx1]
                             cnt_sub = evidence_counts[cy0:cy1, cx0:cx1]
@@ -380,8 +390,7 @@ class CleanReferences:
             eligible[support] = count >= 3
             if eligible.any():
                 values = stack[:, count >= 3]
-                median = np.nanmedian(values, axis=0)
-                agreement = np.nanmax(np.abs(values-median), axis=(0, 2)) <= 10
+                median, agreement = _donor_consensus(values)
                 confidence[eligible] = agreement.astype(np.uint8)
                 background[eligible] = np.clip(np.rint(median), 0, 255).astype(np.uint8)
             evidence_counts[support] = np.minimum(count, 255).astype(np.uint8)

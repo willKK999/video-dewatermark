@@ -249,6 +249,10 @@ def _binary(value,name,shape):
 
 
 def _box_count(values,size):
+    from worker import roi_cuda
+
+    if roi_cuda.enabled():
+        return roi_cuda.box_count(values,size)
     return cv2.boxFilter(values.astype(np.float32),-1,(size,size),normalize=False,borderType=cv2.BORDER_CONSTANT)
 
 
