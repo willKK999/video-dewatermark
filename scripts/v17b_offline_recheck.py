@@ -11,7 +11,7 @@ import numpy as np
 from worker.edge_residue import EdgeSettings, measure
 from worker.hls_settings import HLSSettings
 from worker.json_types import json_native
-from worker.restoration import CleanReferences
+from worker.restoration import CleanReferences, _build_donor_evaluator
 from worker.roi_inpaint import ROISettings, crop
 from worker.roi_spatial_layers import protection_mask, residue_summary, seam_variants
 from worker.spatial_roi import SpatialSettings, plan
@@ -20,6 +20,16 @@ from worker.trusted_context import read_confirmed
 
 PANEL_LABEL_HEIGHT = 28
 
+
+
+def _clip_donor_crops(crops, height, width):
+    clipped = []
+    for y0, y1, x0, x1, bgr_crop, tr_crop in crops:
+        if y0 >= height or x0 >= width:
+            continue
+        y1c, x1c = min(y1, height), min(x1, width)
+        clipped.append((y0, y1c, x0, x1c, bgr_crop[:y1c - y0, :x1c - x0], tr_crop[:y1c - y0, :x1c - x0]))
+    return clipped
 
 def parse_tasks(spec, available=None):
     """解析任务编号范围（如 '1-8'、'1,3,5-6' 或 'all'）。"""
@@ -432,10 +442,17 @@ def _recheck_task(payload):
             if idx not in evidence_cache:
                 source_padded = crop(original, box)
                 union_padded = crop(confirmed_full, box, True)
+                raw_evidence = references.reference_evidence(source_padded, union_padded, confirmed=union_padded)
                 evidence_cache[idx] = {
                     key: value[:d - b, :c - a].copy()
-                    for key, value in references.reference_evidence(source_padded, union_padded, confirmed=union_padded).items()
+                    for key, value in raw_evidence.items()
+                    if not callable(value)
                 }
+                if callable(raw_evidence.get('evaluate_peak')):
+                    # v17c 起供体色相判定是闭包；按裁剪后的尺寸重建，供体块同样裁到该尺寸内。
+                    evidence_cache[idx]['evaluate_peak'] = _build_donor_evaluator(
+                        (d - b, c - a), _clip_donor_crops(references.last_donor_crops, d - b, c - a)
+                    )
             evidence = evidence_cache[idx]
 
             score = measure(
