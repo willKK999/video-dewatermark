@@ -1,4 +1,5 @@
 """在原水印形状掩膜内融合；只用同镜头、经几何与颜色验证的原始背景。"""
+import os
 import time
 import cv2
 import numpy as np
@@ -152,15 +153,22 @@ class CleanReferences:
         self.masks = masks
         self.grays = list(grays) if grays is not None else [cv2.cvtColor(im, cv2.COLOR_BGR2GRAY) for im in images]
         self.enable_local_donors = enable_local_donors
+        self._cuda_tracker = None
+        if os.environ.get("ROI_CUDA_LK") == "1":
+            from worker.roi_lk_cuda import track
+            self._cuda_tracker = track
         self.last_donor_crops = []
 
-    def _track(self, gray, refgray, points, reftrusted=None):
-        tracked, status, _ = cv2.calcOpticalFlowPyrLK(gray, refgray, points, None)
-        if tracked is None:
-            return None
-        back, reverse, _ = cv2.calcOpticalFlowPyrLK(refgray, gray, tracked, None)
-        if back is None:
-            return None
+    def _track(self, gray, refgray, points, reftrusted=None, flows=None):
+        if flows is None:
+            tracked, status, _ = cv2.calcOpticalFlowPyrLK(gray, refgray, points, None)
+            if tracked is None:
+                return None
+            back, reverse, _ = cv2.calcOpticalFlowPyrLK(refgray, gray, tracked, None)
+            if back is None:
+                return None
+        else:
+            tracked, status, back, reverse = flows
         good = (status.ravel() > 0) & (reverse.ravel() > 0) & (np.linalg.norm(back-points, axis=2).ravel() < 1)
         if reftrusted is not None:
             xy=np.rint(tracked.reshape(-1,2)).astype(int)
@@ -264,6 +272,14 @@ class CleanReferences:
                                 del flow_cache[next(iter(flow_cache))]
                             flows = flow_cache[flow_key] = {}
 
+                        if self._cuda_tracker is not None:
+                            pending = [i for i in range(len(self.grays))
+                                       if i not in flows and not np.all(used_by_ref[i][cc_crop_mask])]
+                            if pending:
+                                batch = [self.grays[i][sy0:sy1, sx0:sx1] for i in pending]
+                                coordinates, validity = self._cuda_tracker(src_win, batch, off_pts)
+                                flows.update(zip(pending, zip(coordinates, validity)))
+
                         for rf_idx, (ref_bgr, ref_tr, ref_gr) in enumerate(zip(self.images, self.trusted, self.grays)):
                             if np.all(used_by_ref[rf_idx][cc_crop_mask]):
                                 continue
@@ -353,9 +369,16 @@ class CleanReferences:
 
         if points is not None and len(points) >= 16 and ring.sum() >= 32:
             ring_min = .35 * ring.sum()
+            batched_flows = None
+            if self._cuda_tracker is not None:
+                batched_flows = self._cuda_tracker(gray, self.grays, points, bidirectional=True)
             for rf_idx, (reference, reftrusted, refgray) in enumerate(zip(self.images, self.trusted, self.grays)):
                 started = time.perf_counter()
-                transform = self._track(gray, refgray, points, reftrusted)
+                if batched_flows is None:
+                    transform = self._track(gray, refgray, points, reftrusted)
+                else:
+                    flows = tuple(values[rf_idx] for values in batched_flows)
+                    transform = self._track(gray, refgray, points, reftrusted, flows)
                 self.timings['tracking_seconds'] += time.perf_counter()-started
                 if transform is None:
                     continue
