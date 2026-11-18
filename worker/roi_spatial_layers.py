@@ -14,6 +14,26 @@ from .spatial_roi import SpatialSettings,plan,padded_area
 from .roi_attempt_cache import compact,restore
 
 
+def _model_stage(args,out_dir,key,**kw):
+    """补画模型调用；验收夹具可用环境变量保存/复用模型原始输出（只做文件拷贝，不改变任何计算）。"""
+    reuse=os.environ.get('ROI_MODEL_OUTPUT_REUSE');keep=os.environ.get('ROI_MODEL_OUTPUT_KEEP')
+    out_dir=Path(out_dir)
+    if reuse:
+        src=Path(reuse)/key
+        if not (src/'frames').is_dir():raise PipelineError('ROI_INCOMPLETE',f'复用模型输出缺失：{key}')
+        (out_dir/'out/frames').mkdir(parents=True,exist_ok=True)
+        shutil.copytree(src/'frames',out_dir/'out/frames/frames')
+        if (src/'metrics.json').exists():shutil.copy2(src/'metrics.json',out_dir/'metrics.json')
+        return
+    run(args,**kw)
+    if keep:
+        dst=Path(keep)/key
+        if dst.exists():shutil.rmtree(dst)
+        dst.mkdir(parents=True)
+        shutil.copytree(out_dir/'out/frames/frames',dst/'frames')
+        if (out_dir/'metrics.json').exists():shutil.copy2(out_dir/'metrics.json',dst/'metrics.json')
+
+
 def _scene_static_highpass(images):
     """估算同镜头参考帧的静止水印高通成分，作为细节投影正交基底。"""
     if not images:
@@ -181,7 +201,7 @@ def _repair_confirmed_residue_pass(
     if cfg.fp16:
         args.append('--fp16')
     timeout=min(840,policy.get('model_timeout_seconds') or 840)
-    run(args,cwd=os.environ['PROPAINTER_ROOT'],timeout=timeout,stage='逐层ROI-确认残留补修')
+    _model_stage(args,rep_dir,task.name+'-'+rep_dir.name,cwd=os.environ['PROPAINTER_ROOT'],timeout=timeout,stage='逐层ROI-确认残留补修')
     predicted=sorted((rep_dir/'out/frames/frames').glob('*.png'))
     if len(predicted)!=(2 if singleton else right-left):
         shutil.rmtree(rep_dir)
@@ -399,6 +419,9 @@ def execute(work,files,detected,log,cfg):
                     task_refs=_window_refs(scene_start,scene_end,start,end,refs,trusted.dense_reference_frames if trusted else 24)
                     row=dict(任务=len(records)+1,图层=k,开始帧=start,结束帧=end,ROI=box,fp16=cfg.fp16,
                              施工面积像素=int(np.count_nonzero(ownership)),裁块像素=padded_area(box),像素帧预算=spatial.maximum_pixel_frames,输入图层=k-1,窗口=settings.window_frames,重叠=settings.overlap_frames,通过=False,尝试=[])
+                    max_tasks=int(os.environ.get('ROI_MAX_TASKS') or 0)
+                    if max_tasks and len(records)>=max_tasks:
+                        log(f'逐层ROI 验收夹具 ROI_MAX_TASKS={max_tasks} 已完成，停止后续任务');save();raise SystemExit(0)
                     records.append(row);tick=time.monotonic();save()
                     if resume and row['任务']<=len(resume['rows']):
                         resume_recheck(resume,row,ownership,work,files,refs,box,start,end,edge_cfg,settings,log)
@@ -451,7 +474,7 @@ def execute(work,files,detected,log,cfg):
                                     phase='模型指标已写出，等待子进程退出' if (task/'metrics.json').exists() else '模型进程仍存活，正在计算'
                                     log(f'逐层ROI 任务={row["任务"]} 尝试={attempt} {phase}')
                                     heartbeat[0]=time.monotonic()
-                            run(args,check=check_model,cwd=os.environ['PROPAINTER_ROOT'],timeout=timeout,stage='逐层ROI-ProPainter')
+                            _model_stage(args,task,task.name,check=check_model,cwd=os.environ['PROPAINTER_ROOT'],timeout=timeout,stage='逐层ROI-ProPainter')
                             log(f'逐层ROI 任务={row["任务"]} 尝试={attempt} 模型已结束，开始CPU参考回填与残留复检')
                             predicted=sorted((task/'out/frames/frames').glob('*.png'))
                             if len(predicted)!=(2 if singleton else right-left):raise PipelineError('ROI_INCOMPLETE','逐层ROI输出帧数缺失，禁止原帧回退')
