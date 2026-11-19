@@ -19,6 +19,12 @@ from worker.faint_watermark import (
     reclassify_watermark_subtitles,
 )
 from worker.hls_layers import VerifiedLayers, write_manifest
+from worker.mask_continuity import (
+    ContinuitySettings,
+    expand_adaptive_halo,
+    prune_isolated_specks,
+    repair_group_temporal_dropouts,
+)
 from worker.process import PipelineError
 from worker.trusted_context import ContextSettings, exclusion_mask
 
@@ -237,6 +243,107 @@ def refine_v17c_masks(
         _atomic_write_png(out_dir / 'masks' / fname, final_mask)
         _atomic_write_png(out_dir / 'edge-band' / fname, edge_frame)
 
+    # 4. v23 通用时域掩膜连续性修复、低饱和抗锯齿外晕扩展与单帧微噪点清理
+    cont_cfg = ContinuitySettings()
+    scenes = det.get('scenes') or [[0, total]]
+    all_groups = groups + ['group-faint']
+
+    def _load_out_group(g_name: str, frame_i: int) -> np.ndarray:
+        return _read_mask(out_dir / 'group-objects' / g_name / files[frame_i].name, shape)
+
+    def _save_out_group(g_name: str, frame_i: int, arr: np.ndarray) -> None:
+        _atomic_write_png(out_dir / 'group-objects' / g_name / files[frame_i].name, arr)
+
+    def _load_out_conf(frame_i: int) -> np.ndarray:
+        return _read_mask(out_dir / 'masks' / files[frame_i].name, shape)
+
+    def _save_out_conf(frame_i: int, arr: np.ndarray) -> None:
+        _atomic_write_png(out_dir / 'masks' / files[frame_i].name, arr)
+
+    def _load_out_edge(frame_i: int) -> np.ndarray:
+        return _read_mask(out_dir / 'edge-band' / files[frame_i].name, shape)
+
+    def _save_out_edge(frame_i: int, arr: np.ndarray) -> None:
+        _atomic_write_png(out_dir / 'edge-band' / files[frame_i].name, arr)
+
+    def _load_scene_prot(frame_i: int) -> np.ndarray:
+        return _read_mask(base_dir / 'scene-protection' / files[frame_i].name, shape)
+
+    def _load_out_sub_prot(frame_i: int) -> np.ndarray:
+        return _read_mask(out_dir / 'subtitle-protection' / files[frame_i].name, shape)
+
+    def _save_out_sub_prot(frame_i: int, arr: np.ndarray) -> None:
+        _atomic_write_png(out_dir / 'subtitle-protection' / files[frame_i].name, arr)
+
+    continuity_report = repair_group_temporal_dropouts(
+        total_frames=total,
+        scenes=scenes,
+        groups=groups,
+        load_bgr=load_bgr,
+        load_group=_load_out_group,
+        save_group=_save_out_group,
+        load_confirmed=_load_out_conf,
+        save_confirmed=_save_out_conf,
+        load_scene_prot=_load_scene_prot,
+        load_sub_prot=_load_out_sub_prot,
+        save_sub_prot=_save_out_sub_prot,
+        edge_cfg=e_cfg,
+        ctx_cfg=ctx_cfg,
+        cfg=cont_cfg,
+    )
+
+    halo_added_px = 0
+    for idx, fp in enumerate(files):
+        fname = fp.name
+        image = load_bgr(idx)
+        cur_conf = _load_out_conf(idx)
+        cur_edge = _load_out_edge(idx)
+        protected = _load_scene_prot(idx) | _load_out_sub_prot(idx)
+        halo_frame = np.zeros(shape, dtype=np.uint8)
+        for g in all_groups:
+            gm = _load_out_group(g, idx)
+            if not np.any(gm):
+                continue
+            h_add, _ = expand_adaptive_halo(image, gm, cur_conf | halo_frame, protected, e_cfg, cont_cfg)
+            if np.any(h_add):
+                cand = cur_conf | halo_frame | h_add
+                if float(np.count_nonzero(exclusion_mask(cand, ctx_cfg))) / pixels <= ctx_cfg.mask_fraction_limit:
+                    halo_frame |= h_add
+        if np.any(halo_frame):
+            _save_out_conf(idx, cur_conf | halo_frame)
+            _save_out_edge(idx, cur_edge | halo_frame)
+            halo_added_px += int(np.count_nonzero(halo_frame))
+
+    speck_report = prune_isolated_specks(
+        total_frames=total,
+        scenes=scenes,
+        groups=all_groups,
+        load_confirmed=_load_out_conf,
+        save_confirmed=_save_out_conf,
+        load_edge=_load_out_edge,
+        save_edge=_save_out_edge,
+        load_group=_load_out_group,
+        save_group=_save_out_group,
+        cfg=cont_cfg,
+    )
+
+    max_excl_frac = 0.0
+    total_final_px = 0
+    total_edge_px = 0
+    for idx in range(total):
+        fm = _load_out_conf(idx)
+        eb = _load_out_edge(idx)
+        excl_frac = float(np.count_nonzero(exclusion_mask(fm, ctx_cfg))) / float(pixels)
+        if excl_frac > ctx_cfg.mask_fraction_limit:
+            raise PipelineError(
+                'MASK_UNCERTAIN',
+                f'第{idx}帧确认水印排除区占比{excl_frac:.4f}超过20%保护上限',
+                details=dict(frame=idx, exclusion_fraction=excl_frac),
+            )
+        max_excl_frac = max(max_excl_frac, excl_frac)
+        total_final_px += int(np.count_nonzero(fm))
+        total_edge_px += int(np.count_nonzero(eb))
+
     # 更新 detections.json 与 layers.json
     det_out = json.loads(json.dumps(det))
     det_out['edge_settings'] = asdict(e_cfg)
@@ -254,18 +361,24 @@ def refine_v17c_masks(
     VerifiedLayers(out_dir / 'layers.json', out_dir / 'detections.json')
 
     provenance = {
-        '方法说明': 'v17c通用掩膜精修（半透明轨迹对齐/跨镜头迁移检测 + 非对话OCR重分类 + 邻帧同色孔洞补全 + 窄收边）',
+        '方法说明': 'v23通用掩膜精修（半透明轨迹对齐/跨镜头迁移 + 非对话OCR重分类 + 同色孔洞 + 时域连续性恢复 + 自适应低饱和外晕 + 单帧微噪点清理）',
         '总帧数': total,
         '原掩膜总像素': total_base_px,
         '新增淡字像素': total_faint_px,
         '新增同色孔洞像素': total_hole_px,
+        '新增时域补全像素': continuity_report['新增像素'],
+        '释放时域OCR字幕保护像素': continuity_report['释放字幕保护像素'],
+        '新增自适应外晕像素': halo_added_px,
         '新增收边带像素': total_edge_px,
-        '最终掩膜总像素': total_base_px + total_faint_px + total_hole_px + total_edge_px,
+        '清理孤立微噪点像素': speck_report['清理像素'],
+        '清理孤立微噪点连通域': speck_report['清理连通域'],
+        '最终掩膜总像素': total_final_px,
         '重分类OCR字幕条目数': len(reclassified_audit),
         '最大单帧模型排除占比': round(max_excl_frac, 6),
         '全部帧满足20%保护': max_excl_frac <= ctx_cfg.mask_fraction_limit,
         '淡字帧记录数': len(faint_records),
         '同色孔洞记录': hole_records,
+        '时域连续性修复': continuity_report,
         '重分类OCR明细': reclassified_audit,
         '淡字轨迹汇总': faint_res['track_summary'],
     }
@@ -308,7 +421,7 @@ def main() -> None:
             {
                 k: v
                 for k, v in summary.items()
-                if k not in ('同色孔洞记录', '重分类OCR明细', '淡字轨迹汇总')
+                if k not in ('同色孔洞记录', '时域连续性修复', '重分类OCR明细', '淡字轨迹汇总')
             },
             ensure_ascii=False,
         )

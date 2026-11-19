@@ -20,6 +20,6 @@
   "hole_completion_min_area": 12,
   "hole_completion_min_neighbors": 3,
   "hole_completion_overlap_fraction": 0.5,
-  "residue_repair_rounds": 1,
+  "residue_repair_rounds": 2,
   "residue_repair_dilate_radius": 5
 }

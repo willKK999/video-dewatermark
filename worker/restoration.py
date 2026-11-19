@@ -443,8 +443,13 @@ class CleanReferences:
             return repaired
         background, confidence, filled = fill_small_holes(background, confidence, mask)
         self.stats["interpolated_pixels"] += filled
-        # 仅在一致区域内部逐渐采用参考，避免局部回填产生新接缝。
-        weight = np.clip(cv2.distanceTransform(confidence, cv2.DIST_L2, 5)/3, 0, 1)
+        # 仅在一致区域内部逐渐采用参考，避免局部回填产生新接缝；多份供体一致且与模型输出差异较大时快速切换到干净参考。
+        dist = cv2.distanceTransform(confidence, cv2.DIST_L2, 5)
+        weight = np.clip(dist / 2.0, 0, 1)
+        strong_disagree = (confidence > 0) & (evidence_counts >= 5) & (
+            np.abs(repaired.astype(np.float32) - background.astype(np.float32)).mean(axis=2) > 18.0
+        )
+        weight[strong_disagree] = 1.0
         self.stats["restored_pixels"] += int(np.count_nonzero(weight >= .5))
         result = repaired.copy()
         active = weight > 0
@@ -473,8 +478,10 @@ def restore_orthogonal_luma_detail(
     src_y = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY).astype(np.float32)
     pnt_y = cv2.cvtColor(repaired, cv2.COLOR_BGR2GRAY).astype(np.float32)
     wm_hp = watermark_highpass.astype(np.float32) if watermark_highpass is not None else np.zeros_like(src_y)
-    # 同时排除静态/轨迹级水印笔画与逐帧强亮度跳变水印主体，禁止将原水印笔画回注成片。
-    stroke_core = (np.abs(wm_hp) > 3.0) | colored_src | (np.abs(src_y - pnt_y) > 16.0)
+    # 排除静态/轨迹级水印笔画、强亮度跳变主体，以及平滑后仍保持一致偏置的半透明淡笔画，防止鬼影回注。
+    smooth_diff = cv2.boxFilter(src_y - pnt_y, -1, (5, 5), normalize=True)
+    coherent_faint = (np.abs(smooth_diff) > 5.0) & ((src_y - pnt_y) * smooth_diff > 0)
+    stroke_core = (np.abs(wm_hp) > 3.0) | colored_src | (np.abs(src_y - pnt_y) > 16.0) | coherent_faint
     excluded = cv2.dilate(stroke_core.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
     active = msk & (~excluded)
     if not np.any(active):

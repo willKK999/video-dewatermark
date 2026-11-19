@@ -163,15 +163,48 @@ def _scene_track_highpass(detected,files,scene_start,scene_end,shape):
     return per_frame
 
 
-def _window_refs(scene_start,scene_end,start,end,base_refs,max_refs):
-    """在场景均匀抽样基础上补充施工窗口邻近帧，便于运动背景下获取足够干净供体。"""
-    if max_refs<=len(base_refs):
-        return base_refs
-    extra_budget=max_refs-len(base_refs)
+def _window_refs(scene_start,scene_end,start,end,base_refs,max_refs,roi_mask_fractions=None):
+    """在场景均匀抽样基础上优先补充施工ROI低遮挡干净帧与窗口邻近帧，避免参考帧全被水印遮挡。"""
+    if roi_mask_fractions is None:
+        if max_refs<=len(base_refs):
+            return base_refs
+        extra_budget=max_refs-len(base_refs)
+        w0=max(scene_start,start-12);w1=min(scene_end,end+16)
+        local_grid=np.linspace(w0,max(w0,w1-1),min(extra_budget*2,max(1,w1-w0)),dtype=int)
+        merged=list(dict.fromkeys([int(x) for x in base_refs]+[int(x) for x in local_grid]))
+        return np.array(sorted(merged[:max_refs]),dtype=int)
+
+    all_scene=list(range(scene_start,scene_end))
+    if len(all_scene)<=max_refs:
+        return np.array(all_scene,dtype=int)
     w0=max(scene_start,start-12);w1=min(scene_end,end+16)
-    local_grid=np.linspace(w0,max(w0,w1-1),min(extra_budget*2,max(1,w1-w0)),dtype=int)
-    merged=list(dict.fromkeys([int(x) for x in base_refs]+[int(x) for x in local_grid]))
-    return np.array(sorted(merged[:max_refs]),dtype=int)
+    mid=(start+end)*0.5
+    # 优先挑选目标区域几乎无水印的帧（<=2%），再按时间均匀覆盖并兼顾窗口邻近。
+    clean_frames=[f for f in all_scene if roi_mask_fractions.get(f,1.0)<=0.02]
+    chosen=[]
+    if clean_frames:
+        clean_budget=min(len(clean_frames),max(max_refs//2,12))
+        if len(clean_frames)<=clean_budget:
+            chosen.extend(clean_frames)
+        else:
+            q_idx=np.linspace(0,len(clean_frames)-1,clean_budget,dtype=int)
+            chosen.extend(clean_frames[int(q)] for q in q_idx)
+    local_cands=sorted(range(w0,w1),key=lambda f:(round(roi_mask_fractions.get(f,1.0),2),abs(f-mid)))
+    for f in local_cands:
+        if len(chosen)>=max_refs:
+            break
+        if f not in chosen:
+            chosen.append(int(f))
+    for f in base_refs:
+        if len(chosen)>=max_refs:
+            break
+        if int(f) not in chosen:
+            chosen.append(int(f))
+    if len(chosen)<max_refs:
+        rest=sorted((f for f in all_scene if f not in chosen),key=lambda f:(round(roi_mask_fractions.get(f,1.0),2),abs(f-mid)))
+        for f in rest[:max_refs-len(chosen)]:
+            chosen.append(int(f))
+    return np.array(sorted(chosen[:max_refs]),dtype=int)
 
 
 def _dense_frame_evidence(j,scene_start,scene_end,box,current,work,files,existing_refs,original,mask,confirmed,preloaded_refs=None,return_crops=False):
@@ -224,204 +257,285 @@ def _repair_prep_worker(item):
     return ('OK',j)
 
 
+def _connected_residue_target(rm, pm, active, r_dil):
+    """联合确认残留与同连通域内待目检色块，防止二次补画把未遮蔽同色邻域重新拷入。"""
+    rm_b = (rm > 0) & active
+    if not np.any(rm_b):
+        return np.zeros(active.shape, dtype=bool)
+    combined = rm_b
+    if pm is not None:
+        pm_b = (pm > 0) & active
+        if np.any(pm_b):
+            ker_cc = np.ones((5, 5), dtype=np.uint8)
+            grown = cv2.dilate((rm_b | pm_b).astype(np.uint8), ker_cc) > 0
+            _, labels = cv2.connectedComponents(grown.astype(np.uint8), connectivity=8)
+            hit_labels = set(np.unique(labels[rm_b])) - {0}
+            if hit_labels:
+                combined = rm_b | (pm_b & np.isin(labels, list(hit_labels)))
+    ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r_dil + 1, 2 * r_dil + 1))
+    return (cv2.dilate(combined.astype(np.uint8) * 255, ker) > 0) & active
+
+
 def _repair_confirmed_residue_pass(
     task,work,files,current,dest,staged,baseline,completed,layer_done,
     masks,ownership,box,left,right,start,end,length,shape,pixels,
     edge_cfg,settings,cfg,trusted,policy,residue_scores,maximum,reference_holder,
-    refs,detected,log,measure_fn,read_confirmed_fn,exclusion_fn,overlap_weight_fn,pool=None,
+    refs,detected,log,measure_fn,read_confirmed_fn,exclusion_fn,overlap_weight_fn,pool=None,dirty_frames=None,
 ):
-    """对判为RESIDUE_FOUND的尝试执行最多一轮有界确认残留补修，并严格重检残留与接缝。"""
+    """对判为RESIDUE_FOUND的尝试执行最多residue_repair_rounds轮有界确认残留补修，并严格重检残留与接缝。"""
     a,b,c,d=box
-    res_targets={}
-    before_summary=residue_summary(residue_scores)
+    init_summary=residue_summary(residue_scores)
     band_cache={}
     src_cache={}
     conf_cache={}
     prot_cache={}
-    for sc in residue_scores:
-        j=int(sc['frame'])
-        if sc.get('判定')!='RESIDUE_FOUND':
-            continue
-        active=(masks[j][b:d,a:c]>0)&(ownership[b:d,a:c]>0)
-        if not active.any():
-            continue
-        band_path=work/'edge-band'/files[j].name
-        band=read_confirmed_fn(band_path)[b:d,a:c] if band_path.exists() else np.zeros(active.shape,np.uint8)
-        band_cache[j]=band
-        source_color=roi.crop(cv2.imread(str(files[j])),box)[:d-b,:c-a]
-        src_cache[j]=source_color
-        conf_crop=roi.crop(read_confirmed_fn(work/'masks'/files[j].name),box,True)[:d-b,:c-a]
-        conf_cache[j]=conf_crop
-        prot_crop=protection_mask(work,files[j].name,shape)[b:d,a:c]
-        prot_cache[j]=prot_crop
-        packed_residue = sc.get('_repair_residue')
-        if packed_residue is not None:
-            rm = _unpack_bool(packed_residue, active.shape)
+    cur_scores=residue_scores
+    cur_max=maximum
+    total_rounds=max(1,int(edge_cfg.residue_repair_rounds))
+    last_info=None
+    rounds_run=0
+
+    for repair_round in range(1,total_rounds+1):
+        before_summary=residue_summary(cur_scores)
+        if before_summary['确认残留']<=0:
+            break
+        r_dil=min(12,edge_cfg.residue_repair_dilate_radius+(repair_round-1)*2)
+        res_targets={}
+        pending_by_frame={}
+        for sc in cur_scores:
+            j=int(sc['frame'])
+            active=(masks[j][b:d,a:c]>0)&(ownership[b:d,a:c]>0)
+            if not active.any():
+                continue
+            if j not in band_cache:
+                band_path=work/'edge-band'/files[j].name
+                band_cache[j]=read_confirmed_fn(band_path)[b:d,a:c] if band_path.exists() else np.zeros(active.shape,np.uint8)
+                src_cache[j]=roi.crop(cv2.imread(str(files[j])),box)[:d-b,:c-a]
+                conf_cache[j]=roi.crop(read_confirmed_fn(work/'masks'/files[j].name),box,True)[:d-b,:c-a]
+                prot_cache[j]=protection_mask(work,files[j].name,shape)[b:d,a:c]
+            rm=None;pm=None
+            packed_res=sc.get('_repair_residue')
+            packed_pend=sc.get('_repair_pending')
+            if packed_res is not None and (packed_pend is not None or sc.get('待目检',0)==0):
+                rm=_unpack_bool(packed_res,active.shape)
+                pm=_unpack_bool(packed_pend,active.shape) if packed_pend is not None else None
+            elif sc.get('判定')=='RESIDUE_UNCERTAIN' and packed_pend is not None:
+                rm=None
+                pm=_unpack_bool(packed_pend,active.shape)
+            elif sc.get('判定')=='RESIDUE_FOUND' or sc.get('待目检',0)>0:
+                staged_img=cv2.imread(str(staged/files[j].name))
+                if staged_img is not None:
+                    active_mask=active.astype(np.uint8)*255
+                    full_sc=measure_fn(
+                        src_cache[j],staged_img[b:d,a:c],active_mask,band_cache[j]&active_mask,edge_cfg,
+                        reference_evidence=sc.get('_evidence'),
+                        confirmed=conf_cache[j],
+                        protected=prot_cache[j],
+                        return_masks=True,
+                    )
+                    m_dict=full_sc.get('_masks',{})
+                    rm=m_dict.get('确认残留')
+                    pm=m_dict.get('待目检')
+            if pm is not None and np.any(pm>0):
+                pending_by_frame[j]=(pm>0)&active
+            if sc.get('判定')!='RESIDUE_FOUND' or rm is None or not np.any(rm>0):
+                continue
+            target_j=_connected_residue_target(rm,pm,active,r_dil)
+            if np.any(target_j):
+                res_targets[j]=target_j
+
+        if not res_targets:
+            break
+
+        # 对紧邻±3帧中也存在重叠待目检像素的施工帧一并遮蔽，避免相邻帧回传同块残留色。
+        ker_nbr=np.ones((5,5),dtype=np.uint8)
+        base_frames=list(res_targets.keys())
+        for j in base_frames:
+            grown_j=cv2.dilate(res_targets[j].astype(np.uint8),ker_nbr)>0
+            for jn in range(max(start,j-3),min(end,j+4)):
+                if jn==j or jn not in pending_by_frame:
+                    continue
+                ov=pending_by_frame[jn]&grown_j
+                if np.any(ov):
+                    ker_r=cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(2*r_dil+1,2*r_dil+1))
+                    active_n=(masks[jn][b:d,a:c]>0)&(ownership[b:d,a:c]>0)
+                    extra_n=(cv2.dilate(ov.astype(np.uint8)*255,ker_r)>0)&active_n
+                    if np.any(extra_n):
+                        res_targets[jn]=res_targets[jn]|extra_n if jn in res_targets else extra_n
+
+        rep_dir=task/f'residue-repair-{repair_round:02d}'
+        if rep_dir.exists():
+            shutil.rmtree(rep_dir)
+        (rep_dir/'frames').mkdir(parents=True);(rep_dir/'masks').mkdir(parents=True)
+        ctx_r=trusted.boundary_exclusion_pixels if trusted else 3
+        limit=trusted.mask_fraction_limit if trusted else settings.mask_fraction_limit
+        total_target_px=sum(int(np.count_nonzero(m)) for m in res_targets.values())
+        if pool is not None and right-left>1 and read_confirmed_fn is _ORIG_READ_CONFIRMED:
+            items=[]
+            for j in range(left,right):
+                is_constr=start<=j<end
+                if is_constr and (staged/files[j].name).exists():in_path=str(staged/files[j].name)
+                elif j in completed:in_path=str(dest/files[j].name)
+                else:in_path=str(current[j])
+                done_j=layer_done.get(j)
+                painted_packed=None
+                if is_constr:painted_packed=_pack_bool((masks[j]>0)&(ownership>0))
+                elif j in completed and done_j is not None:painted_packed=_pack_bool(done_j>0)
+                if j in res_targets:
+                    excl_j=res_targets[j]|pending_by_frame.get(j,np.zeros((d-b,c-a),bool))
+                    target_packed=_pack_bool(excl_j)
+                elif j in pending_by_frame:
+                    target_packed=_pack_bool(pending_by_frame[j])
+                else:
+                    target_packed=None
+                items.append((
+                    j,left,box,shape,pixels,ctx_r,limit,in_path,str(work/'masks'/files[j].name),
+                    str(rep_dir/'frames'/f'{j-left:06d}.png'),str(rep_dir/'masks'/f'{j-left:06d}.png'),
+                    is_constr,j in completed,painted_packed,target_packed,
+                ))
+            for status,_ in pool.imap(_repair_prep_worker,items):
+                if status=='LIMIT':
+                    shutil.rmtree(rep_dir)
+                    return cur_scores,cur_max,last_info or dict(跳过原因='补修排除掩膜接近20%保护上限',补修前残留=init_summary['确认残留'])
         else:
-            staged_img=cv2.imread(str(staged/files[j].name))
-            if staged_img is None:
-                continue
-            active_mask=active.astype(np.uint8)*255
-            full_sc=measure_fn(
-                source_color,staged_img[b:d,a:c],active_mask,band&active_mask,edge_cfg,
-                reference_evidence=sc.get('_evidence'),
-                confirmed=conf_crop,
-                protected=prot_crop,
-                return_masks=True,
-            )
-            rm=full_sc.get('_masks',{}).get('确认残留')
-        if rm is not None and np.any(rm>0):
-            r_dil=edge_cfg.residue_repair_dilate_radius
-            ker=cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(2*r_dil+1,2*r_dil+1))
-            dilated=(cv2.dilate((rm>0).astype(np.uint8)*255,ker)>0)&active
-            if np.any(dilated):
-                res_targets[j]=dilated
-    if not res_targets:
-        return residue_scores,maximum,None
+            for j in range(left,right):
+                is_constr=start<=j<end
+                if is_constr and (staged/files[j].name).exists():
+                    in_img=cv2.imread(str(staged/files[j].name))
+                elif j in completed:
+                    in_img=cv2.imread(str(dest/files[j].name))
+                else:
+                    in_img=cv2.imread(str(current[j]))
+                roi.atomic_png(rep_dir/'frames'/f'{j-left:06d}.png',roi.crop(in_img,box))
+                full_conf=read_confirmed_fn(work/'masks'/files[j].name)
+                done_j=layer_done.get(j)
+                # 对尚未完成施工的像素始终保持全确认排除，同时强制排除本轮确认残留补修目标与同帧待目检区域
+                unpainted_conf=(full_conf>0)
+                if is_constr or j in completed:
+                    painted_here=(masks[j]>0)&(ownership>0) if is_constr else (done_j>0 if done_j is not None else np.zeros(shape,bool))
+                    unpainted_conf=unpainted_conf&(~painted_here)
+                if j in res_targets:
+                    unpainted_conf[b:d,a:c]|=res_targets[j]|pending_by_frame.get(j,np.zeros((d-b,c-a),bool))
+                elif j in pending_by_frame:
+                    unpainted_conf[b:d,a:c]|=pending_by_frame[j]
+                excl_full=cv2.dilate(unpainted_conf.astype(np.uint8)*255,cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(2*ctx_r+1,2*ctx_r+1)))
+                if np.count_nonzero(excl_full)/pixels>limit:
+                    shutil.rmtree(rep_dir)
+                    return cur_scores,cur_max,last_info or dict(跳过原因='补修排除掩膜接近20%保护上限',补修前残留=init_summary['确认残留'])
+                roi.atomic_png(rep_dir/'masks'/f'{j-left:06d}.png',roi.crop(excl_full,box,True))
 
-    rep_dir=task/'residue-repair-01'
-    if rep_dir.exists():
-        shutil.rmtree(rep_dir)
-    (rep_dir/'frames').mkdir(parents=True);(rep_dir/'masks').mkdir(parents=True)
-    ctx_r=trusted.boundary_exclusion_pixels if trusted else 3
-    limit=trusted.mask_fraction_limit if trusted else settings.mask_fraction_limit
-    total_target_px=sum(int(np.count_nonzero(m)) for m in res_targets.values())
-    if pool is not None and right-left>1 and read_confirmed_fn is _ORIG_READ_CONFIRMED:
-        items=[]
+        singleton=(right-left)==1
+        if singleton:
+            for name in ['frames','masks']:
+                shutil.copy2(rep_dir/name/'000000.png',rep_dir/name/'000001.png')
+        args=[os.environ['INPAINT_PYTHON'],str(Path(__file__).with_name('torch_stage.py')),
+              '--metrics',rep_dir/'metrics.json','--frames-only','--script',Path(os.environ['PROPAINTER_ROOT'])/'inference_propainter.py',
+              '--video',rep_dir/'frames','--mask',rep_dir/'masks','--output',rep_dir/'out','--save_frames',
+              '--mask_dilation','0','--subvideo_length',str(length),'--neighbor_length','6','--ref_stride','20']
+        if cfg.fp16:
+            args.append('--fp16')
+        timeout=min(840,policy.get('model_timeout_seconds') or 840)
+        _model_stage(args,rep_dir,task.name+'-'+rep_dir.name,cwd=os.environ['PROPAINTER_ROOT'],timeout=timeout,stage='逐层ROI-确认残留补修')
+        predicted=sorted((rep_dir/'out/frames/frames').glob('*.png'))
+        if len(predicted)!=(2 if singleton else right-left):
+            shutil.rmtree(rep_dir)
+            return cur_scores,cur_max,last_info or dict(跳过原因='补修输出帧数不完整',补修前残留=init_summary['确认残留'])
+
+        new_staged={};new_scores=[]
+        new_max_seam=0.
         for j in range(left,right):
-            is_constr=start<=j<end
-            if is_constr and (staged/files[j].name).exists():in_path=str(staged/files[j].name)
-            elif j in completed:in_path=str(dest/files[j].name)
-            else:in_path=str(current[j])
-            done_j=layer_done.get(j)
-            painted_packed=None
-            if is_constr:painted_packed=_pack_bool((masks[j]>0)&(ownership>0))
-            elif j in completed and done_j is not None:painted_packed=_pack_bool(done_j>0)
-            target_packed=_pack_bool(res_targets[j]) if j in res_targets else None
-            items.append((
-                j,left,box,shape,pixels,ctx_r,limit,in_path,str(work/'masks'/files[j].name),
-                str(rep_dir/'frames'/f'{j-left:06d}.png'),str(rep_dir/'masks'/f'{j-left:06d}.png'),
-                is_constr,j in completed,painted_packed,target_packed,
-            ))
-        for status,_ in pool.imap(_repair_prep_worker,items):
-            if status=='LIMIT':
-                shutil.rmtree(rep_dir)
-                return residue_scores,maximum,dict(跳过原因='补修排除掩膜接近20%保护上限',补修前残留=before_summary['确认残留'])
-    else:
-        for j in range(left,right):
-            is_constr=start<=j<end
-            if is_constr and (staged/files[j].name).exists():
-                in_img=cv2.imread(str(staged/files[j].name))
-            elif j in completed:
-                in_img=cv2.imread(str(dest/files[j].name))
-            else:
-                in_img=cv2.imread(str(current[j]))
-            roi.atomic_png(rep_dir/'frames'/f'{j-left:06d}.png',roi.crop(in_img,box))
-            full_conf=read_confirmed_fn(work/'masks'/files[j].name)
-            done_j=layer_done.get(j)
-            # 对尚未完成施工的像素始终保持全确认排除，同时强制排除本轮确认残留补修目标
-            unpainted_conf=(full_conf>0)
-            if is_constr or j in completed:
-                painted_here=(masks[j]>0)&(ownership>0) if is_constr else (done_j>0 if done_j is not None else np.zeros(shape,bool))
-                unpainted_conf=unpainted_conf&(~painted_here)
+            if not (start<=j<end):
+                continue
+            prior_done=layer_done.get(j)
+            shared=(prior_done[b:d,a:c]>0)&(masks[j][b:d,a:c]>0) if prior_done is not None else np.zeros((d-b,c-a),bool)
+            if j not in res_targets and not shared.any():
+                continue
+            cur_staged=cv2.imread(str(staged/files[j].name))
+            if cur_staged is None:
+                continue
             if j in res_targets:
-                unpainted_conf[b:d,a:c]|=res_targets[j]
-            excl_full=cv2.dilate(unpainted_conf.astype(np.uint8)*255,cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(2*ctx_r+1,2*ctx_r+1)))
-            if np.count_nonzero(excl_full)/pixels>limit:
-                shutil.rmtree(rep_dir)
-                return residue_scores,maximum,dict(跳过原因='补修排除掩膜接近20%保护上限',补修前残留=before_summary['确认残留'])
-            roi.atomic_png(rep_dir/'masks'/f'{j-left:06d}.png',roi.crop(excl_full,box,True))
-
-    singleton=(right-left)==1
-    if singleton:
-        for name in ['frames','masks']:
-            shutil.copy2(rep_dir/name/'000000.png',rep_dir/name/'000001.png')
-    args=[os.environ['INPAINT_PYTHON'],str(Path(__file__).with_name('torch_stage.py')),
-          '--metrics',rep_dir/'metrics.json','--frames-only','--script',Path(os.environ['PROPAINTER_ROOT'])/'inference_propainter.py',
-          '--video',rep_dir/'frames','--mask',rep_dir/'masks','--output',rep_dir/'out','--save_frames',
-          '--mask_dilation','0','--subvideo_length',str(length),'--neighbor_length','6','--ref_stride','20']
-    if cfg.fp16:
-        args.append('--fp16')
-    timeout=min(840,policy.get('model_timeout_seconds') or 840)
-    _model_stage(args,rep_dir,task.name+'-'+rep_dir.name,cwd=os.environ['PROPAINTER_ROOT'],timeout=timeout,stage='逐层ROI-确认残留补修')
-    predicted=sorted((rep_dir/'out/frames/frames').glob('*.png'))
-    if len(predicted)!=(2 if singleton else right-left):
-        shutil.rmtree(rep_dir)
-        return residue_scores,maximum,dict(跳过原因='补修输出帧数不完整',补修前残留=before_summary['确认残留'])
-
-    new_staged={};new_scores=[]
-    new_max_seam=0.
-    for j in range(left,right):
-        if not (start<=j<end):
-            continue
-        prior_done=layer_done.get(j)
-        shared=(prior_done[b:d,a:c]>0)&(masks[j][b:d,a:c]>0) if prior_done is not None else np.zeros((d-b,c-a),bool)
-        if j not in res_targets and not shared.any():
-            continue
-        cur_staged=cv2.imread(str(staged/files[j].name))
-        if cur_staged is None:
-            continue
-        if j in res_targets:
-            rep2=cv2.imread(str(predicted[j-left]))
-            if rep2 is None:
-                continue
-            cand_roi=cur_staged[b:d,a:c].copy()
-            tmask=res_targets[j]
-            cand_roi[tmask]=rep2[:d-b,:c-a][tmask]
-            if j in completed:
-                weight=overlap_weight_fn(j,start,end,completed)
+                rep2=cv2.imread(str(predicted[j-left]))
+                if rep2 is None:
+                    continue
+                cand_roi=cur_staged[b:d,a:c].copy()
+                tmask=res_targets[j]
+                cand_roi[tmask]=rep2[:d-b,:c-a][tmask]
+                if j in completed and not (dirty_frames and j in dirty_frames):
+                    weight=overlap_weight_fn(j,start,end,completed)
+                    base_old=cv2.imread(str(dest/files[j].name))[b:d,a:c]
+                    mixed=cv2.addWeighted(cand_roi,weight,base_old,1-weight,0)
+                    cand_roi[tmask&shared]=mixed[tmask&shared]
+                cur_staged[b:d,a:c]=cand_roi
+                new_staged[j]=cur_staged
+            if shared.any():
                 base_old=cv2.imread(str(dest/files[j].name))[b:d,a:c]
-                mixed=cv2.addWeighted(cand_roi,weight,base_old,1-weight,0)
-                cand_roi[tmask&shared]=mixed[tmask&shared]
-            cur_staged[b:d,a:c]=cand_roi
-            new_staged[j]=cur_staged
-        if shared.any():
-            base_old=cv2.imread(str(dest/files[j].name))[b:d,a:c]
-            disagree=float(np.abs(base_old.astype(float)-cur_staged[b:d,a:c].astype(float))[shared].mean())
-            new_max_seam=max(new_max_seam,disagree)
+                disagree=float(np.abs(base_old.astype(float)-cur_staged[b:d,a:c].astype(float))[shared].mean())
+                new_max_seam=max(new_max_seam,disagree)
 
-    if new_max_seam>settings.overlap_mae_limit:
+        if new_max_seam>settings.overlap_mae_limit:
+            shutil.rmtree(rep_dir)
+            if last_info is None:
+                return cur_scores,cur_max,dict(
+                    补修前残留=init_summary['确认残留'],补修目标像素=total_target_px,
+                    补修后接缝=new_max_seam,采用补修=False,原因='补修后接缝超过上限，保留补修前暂存',
+                )
+            break
+
+        need_next_masks=repair_round<total_rounds
+        for sc in cur_scores:
+            j=int(sc['frame'])
+            if j not in res_targets:
+                new_scores.append(sc)
+                continue
+            active=(masks[j][b:d,a:c]>0)&(ownership[b:d,a:c]>0)
+            active_mask=active.astype(np.uint8)*255
+            band=band_cache[j];source_color=src_cache[j];ev=sc.get('_evidence')
+            upd_img=new_staged[j][b:d,a:c]
+            new_sc=measure_fn(
+                source_color,upd_img,active_mask,band&active_mask,edge_cfg,
+                reference_evidence=ev,
+                confirmed=conf_cache[j],
+                protected=prot_cache[j],
+                return_masks=need_next_masks,
+            )
+            upd_masks=new_sc.pop('_masks',None)
+            entry=dict(frame=j,**new_sc,_evidence=ev)
+            if upd_masks is not None:
+                if new_sc.get('判定')=='RESIDUE_FOUND':
+                    entry['_repair_residue']=_pack_bool(upd_masks['确认残留'])
+                if np.any(upd_masks['待目检']):
+                    entry['_repair_pending']=_pack_bool(upd_masks['待目检'])
+            new_scores.append(entry)
+
+        after_summary=residue_summary(new_scores)
+        improved=(after_summary['确认残留'],after_summary['待目检'])<(before_summary['确认残留'],before_summary['待目检'])
         shutil.rmtree(rep_dir)
-        return residue_scores,maximum,dict(
-            补修前残留=before_summary['确认残留'],补修目标像素=total_target_px,
-            补修后接缝=new_max_seam,采用补修=False,原因='补修后接缝超过上限，保留补修前暂存',
-        )
+        rounds_run=repair_round
+        if improved:
+            for j,img_upd in new_staged.items():
+                roi.atomic_png(staged/files[j].name,img_upd)
+            cur_scores=new_scores;cur_max=max(cur_max,new_max_seam)
+            last_info=dict(
+                补修轮数=rounds_run,补修帧=sorted(res_targets.keys()),补修目标像素=total_target_px,
+                补修前残留=init_summary['确认残留'],补修后残留=after_summary['确认残留'],
+                补修前待目检=init_summary['待目检'],补修后待目检=after_summary['待目检'],
+                补修后接缝=round(new_max_seam,4),采用补修=True,
+            )
+            log(f'逐层ROI 任务={task.name} 确认残留补修 轮={repair_round} 补修前={before_summary["确认残留"]} 补修后={after_summary["确认残留"]} 采用=True')
+            if after_summary['确认残留']==0:
+                break
+        else:
+            if last_info is None:
+                last_info=dict(
+                    补修轮数=rounds_run,补修帧=sorted(res_targets.keys()),补修目标像素=total_target_px,
+                    补修前残留=init_summary['确认残留'],补修后残留=after_summary['确认残留'],
+                    补修前待目检=init_summary['待目检'],补修后待目检=after_summary['待目检'],
+                    补修后接缝=round(new_max_seam,4),采用补修=False,
+                )
+            log(f'逐层ROI 任务={task.name} 确认残留补修 轮={repair_round} 补修前={before_summary["确认残留"]} 补修后={after_summary["确认残留"]} 采用=False')
+            break
 
-    old_by_frame={int(s['frame']):s for s in residue_scores}
-    for sc in residue_scores:
-        j=int(sc['frame'])
-        if j not in res_targets:
-            new_scores.append(sc)
-            continue
-        active=(masks[j][b:d,a:c]>0)&(ownership[b:d,a:c]>0)
-        active_mask=active.astype(np.uint8)*255
-        band=band_cache[j];source_color=src_cache[j];ev=sc.get('_evidence')
-        upd_img=new_staged[j][b:d,a:c]
-        new_sc=measure_fn(
-            source_color,upd_img,active_mask,band&active_mask,edge_cfg,
-            reference_evidence=ev,
-            confirmed=conf_cache[j],
-            protected=prot_cache[j],
-        )
-        new_scores.append(dict(frame=j,**new_sc,_evidence=ev))
-
-    after_summary=residue_summary(new_scores)
-    improved=(after_summary['确认残留'],after_summary['待目检'])<(before_summary['确认残留'],before_summary['待目检'])
-    if improved:
-        for j,img_upd in new_staged.items():
-            roi.atomic_png(staged/files[j].name,img_upd)
-        res_out=new_scores;seam_out=max(maximum,new_max_seam)
-    else:
-        res_out=residue_scores;seam_out=maximum
-    shutil.rmtree(rep_dir)
-    info=dict(
-        补修帧=sorted(res_targets.keys()),补修目标像素=total_target_px,
-        补修前残留=before_summary['确认残留'],补修后残留=after_summary['确认残留'],
-        补修前待目检=before_summary['待目检'],补修后待目检=after_summary['待目检'],
-        补修后接缝=round(new_max_seam,4),采用补修=bool(improved),
-    )
-    log(f'逐层ROI 任务={task.name} 确认残留补修 补修前={before_summary["确认残留"]} 补修后={after_summary["确认残留"]} 采用={improved}')
-    return res_out,seam_out,info
+    return cur_scores,cur_max,last_info
 
 
 def seam_variants(start,end,scene_start,scene_end,settings,cfg):
@@ -745,9 +859,12 @@ def _process_frame_worker(item):
                             score=dense_sc;evidence=dense_ev;donor_crops=dense_crops
                 repair_masks = score.pop('_masks', None)
                 residue_score=dict(frame=j,**score)
-                if repair_masks is not None and score.get('判定') == 'RESIDUE_FOUND':
-                    residue_score['_repair_residue'] = _pack_bool(repair_masks['确认残留'])
-                if need_repair_ev and score.get('判定')=='RESIDUE_FOUND' and evidence is not None:
+                if repair_masks is not None:
+                    if score.get('判定') == 'RESIDUE_FOUND':
+                        residue_score['_repair_residue'] = _pack_bool(repair_masks['确认残留'])
+                    if np.any(repair_masks['待目检']):
+                        residue_score['_repair_pending'] = _pack_bool(repair_masks['待目检'])
+                if need_repair_ev and score.get('判定') in RESIDUE_ERRORS and evidence is not None:
                     repair_ev_payload=(evidence['background'],evidence['confidence'],evidence['counts'],donor_crops)
         return ('OK',j,disagreement,frame_score,residue_score,repair_ev_payload)
     finally:
@@ -833,7 +950,7 @@ def execute(work,files,detected,log,cfg):
                 for p,source in zip(files,current):
                     try:os.link(source,dest/p.name)
                     except OSError:shutil.copy2(source,dest/p.name)
-            layer_done=resume['done'] if resume else {};log(f'逐层ROI 图层={k+1}/{len(layers)} 开始')
+            layer_done=resume['done'] if resume else {};layer_dirty={};log(f'逐层ROI 图层={k+1}/{len(layers)} 开始')
             for scene_start,scene_end in detected['scenes']:
                 scene_img_cache=_LRUCache(160)
                 scene_conf_cache=_LRUCache(260)
@@ -895,7 +1012,10 @@ def execute(work,files,detected,log,cfg):
                         for job_index, fragment in enumerate(jobs):
                             ownership=fragment['ownership'];box=fragment['box'];a,b,c,d=box
                             completed={j for j in range(scene_start,scene_end) if j in layer_done and np.any(layer_done[j]&ownership)}
-                            task_refs=_window_refs(scene_start,scene_end,start,end,refs,trusted.dense_reference_frames if trusted else 24)
+                            dirty_frames={j for j in completed if j in layer_dirty and np.any(layer_dirty[j][b:d,a:c]&(masks[j][b:d,a:c]>0)&(ownership[b:d,a:c]>0))}
+                            roi_area=max(1,(c-a)*(d-b))
+                            roi_mask_fractions={j:float(np.count_nonzero(masks[j][b:d,a:c]))/roi_area for j in range(scene_start,scene_end)}
+                            task_refs=_window_refs(scene_start,scene_end,start,end,refs,trusted.dense_reference_frames if trusted else 24,roi_mask_fractions=roi_mask_fractions)
                             row=dict(任务=len(records)+1,图层=k,开始帧=start,结束帧=end,ROI=box,fp16=cfg.fp16,
                                      施工面积像素=int(np.count_nonzero(ownership)),裁块像素=padded_area(box),像素帧预算=spatial.maximum_pixel_frames,输入图层=k-1,窗口=settings.window_frames,重叠=settings.overlap_frames,通过=False,尝试=[])
                             if max_tasks and len(records)>=max_tasks:
@@ -1048,7 +1168,7 @@ def execute(work,files,detected,log,cfg):
                                                 worker_items=[]
                                                 for j,construction,active,shared in work_frames:
                                                     in_comp=j in completed
-                                                    weight=overlap_weight(j,start,end,completed) if (construction and in_comp) else 1.0
+                                                    weight=1.0 if j in dirty_frames else (overlap_weight(j,start,end,completed) if (construction and in_comp) else 1.0)
                                                     mask_crop=roi.crop(masks[j],box,True)>0
                                                     trk_sparse=None
                                                     if detail_mode=='orthogonal_luma' and j in scene_track_hps:
@@ -1157,7 +1277,7 @@ def execute(work,files,detected,log,cfg):
                                                         frame_scores.append(dict(frame=j,mae=float(difference[shared].mean()) if shared.any() else 0.,pixels=int(np.count_nonzero(shared))))
                                                     if j in completed:
                                                         overlap=sum(t in completed for t in range(start,end))
-                                                        weight=overlap_weight(j,start,end,completed)
+                                                        weight=1.0 if j in dirty_frames else overlap_weight(j,start,end,completed)
                                                         mixed=cv2.addWeighted(painted,weight,old,1-weight,0)
                                                         painted[active&shared]=mixed[active&shared]
                                                     old[active]=painted[active];roi.atomic_png(staged/files[j].name,image)
@@ -1186,13 +1306,14 @@ def execute(work,files,detected,log,cfg):
                                                     masks,ownership,box,left,right,start,end,length,shape,pixels,
                                                     edge_cfg,settings,cfg,trusted,policy,residue_scores,maximum,reference_holder,
                                                     task_refs,detected,log,measure,read_confirmed,exclusion_mask,overlap_weight,
-                                                    pool=get_pool() if can_parallel else None,
+                                                    pool=get_pool() if can_parallel else None,dirty_frames=dirty_frames,
                                                 )
                                                 if repair_info is not None:trial['确认残留补修']=repair_info
                                         # 清理临时内存回调引用后再序列化 JSON
                                         for sc in residue_scores:
                                             sc.pop('_evidence',None)
                                             sc.pop('_repair_residue',None)
+                                            sc.pop('_repair_pending',None)
                                         trial['主色残留']=residue_scores
                                         trial['残留汇总']=residue_summary(residue_scores)
                                         trial['跳过参考回填帧']=skipped
@@ -1214,11 +1335,15 @@ def execute(work,files,detected,log,cfg):
                                                 pass
                                             for j in range(start,end):
                                                 layer_done.setdefault(j,np.zeros(shape,np.uint8))[:] |= masks[j]&ownership
+                                                if j in layer_dirty:
+                                                    layer_dirty[j][(masks[j]&ownership)>0]=False
                                         else:
                                             for j in range(start,end):
                                                 (staged/files[j].name).replace(dest/files[j].name)
                                                 done=cv2.imread(str(coverage/files[j].name),0);roi.atomic_png(coverage/files[j].name,done|(masks[j]&ownership))
                                                 layer_done.setdefault(j,np.zeros(shape,np.uint8))[:] |= masks[j]&ownership
+                                                if j in layer_dirty:
+                                                    layer_dirty[j][(masks[j]&ownership)>0]=False
                                         trial['通过']=True;row.update(通过=True,重叠最大差异=maximum)
                                     except Exception as exc:
                                         trial['错误码']=getattr(exc,'code',type(exc).__name__)
@@ -1290,6 +1415,13 @@ def execute(work,files,detected,log,cfg):
                                             roi.atomic_png(dest/files[j].name,restore(best_task,baseline,files[j].name))
                                             done=cv2.imread(str(coverage/files[j].name),0);roi.atomic_png(coverage/files[j].name,done|(masks[j]&ownership))
                                             layer_done.setdefault(j,np.zeros(shape,np.uint8))[:] |= masks[j]&ownership
+                                    best_res_frames={int(s['frame']) for s in best.get('主色残留',[]) if s.get('确认残留',0)>0}
+                                    for j in range(start,end):
+                                        act_j=(masks[j]&ownership)>0
+                                        if j in best_res_frames:
+                                            layer_dirty.setdefault(j,np.zeros(shape,bool))[:] |= act_j
+                                        elif j in layer_dirty:
+                                            layer_dirty[j][act_j]=False
                                     row.update(最佳尝试=best['尝试'],最佳接缝=best['重叠最大差异'],采用未过结果=True,代表施工帧=best['代表施工帧'])
                                     log(f'逐层ROI 任务={row["任务"]} 未过块=True 采用最佳尝试={best["尝试"]} MAE={best["重叠最大差异"]}；继续其余任务，不标通过')
                                 else:
