@@ -1,6 +1,6 @@
 """空间连通ROI：冻结前层、独立施工域和上下文接缝核验。"""
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import asdict
 from multiprocessing import shared_memory
 from pathlib import Path
@@ -250,7 +250,7 @@ def _repair_confirmed_residue_pass(
     task,work,files,current,dest,staged,baseline,completed,layer_done,
     masks,ownership,box,left,right,start,end,length,shape,pixels,
     edge_cfg,settings,cfg,trusted,policy,residue_scores,maximum,reference_holder,
-    refs,detected,log,measure_fn,read_confirmed_fn,exclusion_fn,overlap_weight_fn,pool=None,
+    refs,detected,log,measure_fn,read_confirmed_fn,exclusion_fn,overlap_weight_fn,pool=None,oom_recovery=None,
 ):
     """对判为RESIDUE_FOUND的尝试执行最多一轮有界确认残留补修，并严格重检残留与接缝。"""
     a,b,c,d=box
@@ -366,7 +366,7 @@ def _repair_confirmed_residue_pass(
         args.append('--fp16')
     timeout=min(840,policy.get('model_timeout_seconds') or 840)
     _model_stage(args,rep_dir,task.name+'-'+rep_dir.name,cwd=os.environ['PROPAINTER_ROOT'],timeout=timeout,stage='逐层ROI-确认残留补修',
-                 oom_recovery=lambda: log(f'逐层ROI {rep_dir.name} 显存降档：重启模型进程并启用可扩展显存段'))
+                 oom_recovery=oom_recovery or (lambda: log(f'逐层ROI {rep_dir.name} 显存降档：重启模型进程并启用可扩展显存段')))
     predicted=sorted((rep_dir/'out/frames/frames').glob('*.png'))
     if len(predicted)!=(2 if singleton else right-left):
         shutil.rmtree(rep_dir)
@@ -950,12 +950,16 @@ def execute(work,files,detected,log,cfg):
                                         audit = prefetched[1] if prefetched else _attempt_audit(row['任务'],k,attempt,left,right,box)
                                         input_audits.append(audit)
                                     log(f'逐层ROI 任务={row["任务"]} 尝试={attempt} 输入帧={left}:{right} 施工帧={start}:{end} subvideo={length} 裁块={c-a}×{d-b}')
-                                    def recover_model():
+                                    def recover_model(stage="主补画"):
                                         nonlocal allow_prefetch
                                         allow_prefetch = False
-                                        trial['显存降档'] = '同输入重启模型进程，启用可扩展显存段，停止本镜头后续模型预取'
-                                        log(f'逐层ROI 任务={row["任务"]} 尝试={attempt} 显存降档：{trial["显存降档"]}')
-                                        # 预取已结束，回收空闲进程的 CUDA 上下文与分配缓存。
+                                        action = f'{stage}同输入重启，启用可扩展显存段，停止本镜头后续模型预取'
+                                        trial.setdefault('显存降档', []).append(action)
+                                        log(f'逐层ROI 任务={row["任务"]} 尝试={attempt} 显存降档：{action}')
+                                        # 让已提交的预取完成，保留其结果或错误供对应任务消费。
+                                        if pending is not None:
+                                            wait((pending[2],))
+                                        # 回收空闲进程的 CUDA 上下文与分配缓存。
                                         if pool_holder[0] is not None:
                                             pool_holder[0].close()
                                             pool_holder[0].join()
@@ -1226,6 +1230,7 @@ def execute(work,files,detected,log,cfg):
                                                     edge_cfg,settings,cfg,trusted,policy,residue_scores,maximum,reference_holder,
                                                     task_refs,detected,log,measure,read_confirmed,exclusion_mask,overlap_weight,
                                                     pool=get_pool() if can_parallel else None,
+                                                    oom_recovery=lambda: recover_model('确认残留补修'),
                                                 )
                                                 if repair_info is not None:trial['确认残留补修']=repair_info
                                         # 清理临时内存回调引用后再序列化 JSON
