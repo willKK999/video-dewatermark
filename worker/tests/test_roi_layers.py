@@ -127,9 +127,13 @@ def test_gpu_oom_only_retries_once_and_keeps_checkpoint(tmp_path,monkeypatch):
     monkeypatch.setattr(roi_layers,'run',oom)
     with pytest.raises(PipelineError) as exc:
         roi_inpaint.execute(tmp_path,files,d,cfg=roi_inpaint.ROISettings(sequential_layers=True))
-    assert exc.value.code=='GPU_OOM' and len(calls)==2
+    assert exc.value.code=='ROI_UNFILLABLE' and len(calls)==2
     report=json.loads((tmp_path/'roi-report.json').read_text())
-    assert len(report['任务'][0]['尝试'])==2 and not report['任务'][0]['通过']
+    row=report['任务'][0]
+    assert report['不可填块']==[row['任务']] and row['错误码']=='GPU_OOM'
+    assert len(row['尝试'])==1 and row['尝试'][0]['显存降档'] and not row['通过']
+    assert (tmp_path/'roi-0001-attempt-00/frames').exists()
+    assert not (tmp_path/'composite').exists()
 
 
 def test_clean_reference_rejects_other_watermark_layers(tmp_path,monkeypatch):
