@@ -1,6 +1,7 @@
 """逐层ROI多进程并行与缓存优化路径的逐位等价性单元测试（合成数据）。"""
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import asdict
 import hashlib
 import json
@@ -13,6 +14,7 @@ import pytest
 from worker import roi_inpaint, roi_spatial_layers as rsl
 from worker.edge_residue import EdgeSettings, measure
 from worker.hls_layers import write_manifest
+from worker.process import PipelineError
 from worker.restoration import CleanReferences, restore_orthogonal_luma_detail
 from worker.spatial_roi import SpatialSettings
 from worker.trusted_context import ContextSettings
@@ -203,6 +205,76 @@ def test_parallel_and_serial_execute_are_bitwise_identical(tmp_path: Path, monke
         assert [x.relative_to(serial_dir) for x in s_files] == [x.relative_to(parallel_dir) for x in p_files]
         for sf, pf in zip(s_files, p_files):
             assert _sha(sf) == _sha(pf), f'{sf} 不一致'
+
+
+@pytest.mark.parametrize('prefetch', ['0', '1'])
+def test_model_oom_retries_identical_inputs_and_preserves_other_tasks(tmp_path, monkeypatch, prefetch):
+    monkeypatch.setenv('INPAINT_PYTHON', 'python3')
+    monkeypatch.setenv('PROPAINTER_ROOT', str(tmp_path))
+    monkeypatch.setenv('ROI_CPU_WORKERS', '2')
+    monkeypatch.setenv('ROI_MODEL_PREFETCH', prefetch)
+    monkeypatch.setenv('HLS_WINDOW_FRAMES', '8')
+    monkeypatch.setenv('HLS_OVERLAP_FRAMES', '3')
+    monkeypatch.setenv('PYTORCH_CUDA_ALLOC_CONF', 'roundup_power2_divisions:[256:1,>:2],expandable_segments:False')
+    monkeypatch.delenv('PYTORCH_ALLOC_CONF', raising=False)
+    cfg = roi_inpaint.ROISettings(sequential_layers=True, fp16=False, seam_retries=0)
+    fake = _fake_propainter_factory()
+    target = 'roi-0002-attempt-00'
+
+    def execute(name, fail_count):
+        root = tmp_path / name
+        files, det = _build_synthetic_workspace(root)
+        calls = {}
+        seen = Counter()
+
+        def model(args, **kwargs):
+            task = Path(args[args.index('--video') + 1]).parent
+            key = str(task.relative_to(root))
+            seen[key] += 1
+            inputs = [p.read_bytes() for sub in ('frames', 'masks') for p in sorted((task / sub).glob('*.png'))]
+            command = [str(arg).replace(str(root), '<工作目录>') for arg in args]
+            if seen[key] == 1:
+                calls[key] = command, inputs
+            else:
+                assert key == target and calls[key] == (command, inputs)
+                assert kwargs['env']['PYTORCH_CUDA_ALLOC_CONF'] == 'roundup_power2_divisions:[256:1,>:2],expandable_segments:True'
+                assert not (task / 'out').exists()
+                assert not (task / 'metrics.json').exists()
+            if key == target and seen[key] <= fail_count:
+                (task / 'out').mkdir()
+                (task / 'out' / 'partial').touch()
+                (task / 'metrics.json').touch()
+                raise PipelineError('GPU_OOM', '合成显存不足')
+            return fake(args, **kwargs)
+
+        monkeypatch.setattr(rsl, 'run', model)
+        if fail_count == 2:
+            with pytest.raises(PipelineError) as error:
+                roi_inpaint.execute(root, files, det, cfg=cfg)
+            assert error.value.code == 'ROI_UNFILLABLE'
+        else:
+            roi_inpaint.execute(root, files, det, cfg=cfg)
+        report = json.loads((root / 'roi-report.json').read_text())
+        return root, calls, seen, report
+
+    base, inputs, counts, _ = execute('正常', 0)
+    retried, retry_inputs, retry_counts, recovered = execute('恢复', 1)
+    assert retry_inputs == inputs
+    assert retry_counts == counts + Counter({target: 1})
+    assert recovered['任务'][1]['尝试'][0]['显存降档']
+    assert 'GPU_OOM' not in [row.get('错误码') for row in recovered['任务']]
+    for folder in ('composite', 'roi-coverage'):
+        for p in (base / folder).glob('*.png'):
+            assert p.read_bytes() == (retried / folder / p.name).read_bytes()
+
+    exhausted, _, failed_counts, failed = execute('耗尽', 2)
+    assert failed_counts[target] == 2
+    assert failed_counts['roi-0001-attempt-00'] == 1
+    assert failed_counts['roi-0003-attempt-00'] == 1
+    assert failed['不可填块'] == [2]
+    assert failed['任务'][1]['错误码'] == 'GPU_OOM'
+    assert failed['任务'][1]['采用未过结果'] is False
+    assert not (exhausted / 'composite').exists()
 
 
 def test_clean_references_and_ortho_luma_cache_equivalence():

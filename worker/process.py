@@ -25,13 +25,14 @@ class LeaseLost(Exception):
     pass
 
 
-def run(args, check=lambda: None, cwd=None, timeout=900, *, stage=None, event_path=None, workload=None):
+def run(args, check=lambda: None, cwd=None, timeout=900, *, stage=None, event_path=None, workload=None, env=None):
     check()
     # File-backed capture prevents pipe deadlock and unbounded RAM consumption.
     with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
         p = subprocess.Popen(
             [str(a) for a in args],
             cwd=cwd,
+            env=env,
             stdout=out,
             stderr=err,
             start_new_session=True,

@@ -5,7 +5,7 @@ from dataclasses import asdict
 from multiprocessing import shared_memory
 from pathlib import Path
 from threading import Event
-import hashlib,json,multiprocessing as mp,os,shutil,time
+import hashlib,json,multiprocessing as mp,os,re,shutil,time
 import cv2
 import numpy as np
 from . import edge_residue as _edge_residue_mod, roi_inpaint as roi, trusted_context as _trusted_context_mod
@@ -87,7 +87,7 @@ class _LRUCache:
         self._data.clear()
 
 
-def _model_stage(args,out_dir,key,**kw):
+def _model_stage(args,out_dir,key,*,oom_recovery=None,oom_pending=False,**kw):
     """补画模型调用；验收夹具可用环境变量保存/复用模型原始输出（只做文件拷贝，不改变任何计算）。"""
     reuse=os.environ.get('ROI_MODEL_OUTPUT_REUSE');keep=os.environ.get('ROI_MODEL_OUTPUT_KEEP')
     out_dir=Path(out_dir)
@@ -98,7 +98,29 @@ def _model_stage(args,out_dir,key,**kw):
         shutil.copytree(src/'frames',out_dir/'out/frames/frames')
         if (src/'metrics.json').exists():shutil.copy2(src/'metrics.json',out_dir/'metrics.json')
         return
-    run(args,**kw)
+    if not oom_pending:
+        try:
+            run(args,**kw)
+        except PipelineError as exc:
+            if exc.code != 'GPU_OOM' or oom_recovery is None:
+                raise
+        else:
+            return _keep_model_output(keep, key, out_dir)
+    oom_recovery()
+    if (out_dir/'out').exists():
+        shutil.rmtree(out_dir/'out')
+    (out_dir/'metrics.json').unlink(missing_ok=True)
+    env = os.environ.copy()
+    allocator = env.get('PYTORCH_ALLOC_CONF') or env.get('PYTORCH_CUDA_ALLOC_CONF', '')
+    options = [opt for opt in re.split(r',(?=[^\[\]]*(?:\[|$))', allocator)
+               if opt.strip() and opt.partition(':')[0].strip() != 'expandable_segments']
+    options.append('expandable_segments:True')
+    env['PYTORCH_ALLOC_CONF'] = env['PYTORCH_CUDA_ALLOC_CONF'] = ','.join(options)
+    run(args,env=env,**kw)
+    _keep_model_output(keep, key, out_dir)
+
+
+def _keep_model_output(keep, key, out_dir):
     if keep:
         dst=Path(keep)/key
         if dst.exists():shutil.rmtree(dst)
@@ -343,7 +365,8 @@ def _repair_confirmed_residue_pass(
     if cfg.fp16:
         args.append('--fp16')
     timeout=min(840,policy.get('model_timeout_seconds') or 840)
-    _model_stage(args,rep_dir,task.name+'-'+rep_dir.name,cwd=os.environ['PROPAINTER_ROOT'],timeout=timeout,stage='逐层ROI-确认残留补修')
+    _model_stage(args,rep_dir,task.name+'-'+rep_dir.name,cwd=os.environ['PROPAINTER_ROOT'],timeout=timeout,stage='逐层ROI-确认残留补修',
+                 oom_recovery=lambda: log(f'逐层ROI {rep_dir.name} 显存降档：重启模型进程并启用可扩展显存段'))
     predicted=sorted((rep_dir/'out/frames/frames').glob('*.png'))
     if len(predicted)!=(2 if singleton else right-left):
         shutil.rmtree(rep_dir)
@@ -608,7 +631,7 @@ def _prepare_parallel_inputs(pool, task, current, files, masks, ownership, box,
             audit['帧'].append(details[0])
 
 
-def _run_attempt_model(task, length, singleton, cfg, timeout, check):
+def _run_attempt_model(task, length, singleton, cfg, timeout, check, **recovery):
     if singleton:
         for name in ('frames', 'masks'):
             shutil.copy2(task/name/'000000.png', task/name/'000001.png')
@@ -622,7 +645,7 @@ def _run_attempt_model(task, length, singleton, cfg, timeout, check):
     if cfg.fp16:
         args.append('--fp16')
     _model_stage(args, task, task.name, check=check, cwd=os.environ['PROPAINTER_ROOT'],
-                 timeout=timeout, stage='逐层ROI-ProPainter')
+                 timeout=timeout, stage='逐层ROI-ProPainter', **recovery)
 
 
 def _make_attempt_dirs(task):
@@ -861,6 +884,7 @@ def execute(work,files,detected,log,cfg):
                 executor = ThreadPoolExecutor(max_workers=1) if prefetch_enabled else None
                 prefetch_stop = Event()
                 pending = None
+                allow_prefetch = prefetch_enabled
                 max_tasks = int(os.environ.get('ROI_MAX_TASKS') or 0)
                 timeout = min(840, policy.get('model_timeout_seconds') or 840)
 
@@ -908,7 +932,6 @@ def execute(work,files,detected,log,cfg):
                                 continue
                             baseline=work/f'roi-{len(records):04d}-baseline'
                             variants=list(window_variants)
-                            oom_used=False
                             task_shm=None;task_shm_spec=None
                             try:
                                 for attempt,(left,right,length) in enumerate(variants):
@@ -927,11 +950,27 @@ def execute(work,files,detected,log,cfg):
                                         audit = prefetched[1] if prefetched else _attempt_audit(row['任务'],k,attempt,left,right,box)
                                         input_audits.append(audit)
                                     log(f'逐层ROI 任务={row["任务"]} 尝试={attempt} 输入帧={left}:{right} 施工帧={start}:{end} subvideo={length} 裁块={c-a}×{d-b}')
+                                    def recover_model():
+                                        nonlocal allow_prefetch
+                                        allow_prefetch = False
+                                        trial['显存降档'] = '同输入重启模型进程，启用可扩展显存段，停止本镜头后续模型预取'
+                                        log(f'逐层ROI 任务={row["任务"]} 尝试={attempt} 显存降档：{trial["显存降档"]}')
+                                        # 预取已结束，回收空闲进程的 CUDA 上下文与分配缓存。
+                                        if pool_holder[0] is not None:
+                                            pool_holder[0].close()
+                                            pool_holder[0].join()
+                                            pool_holder[0] = None
+
                                     try:
                                         if padded_area(box)*(right-left)>spatial.maximum_pixel_frames:raise PipelineError('GPU_BUDGET_EXCEEDED','空间裁块超过配置像素帧预算')
                                         if prefetched is not None:
                                             try:
                                                 prefetched[2].result()
+                                            except PipelineError as exc:
+                                                if exc.code != 'GPU_OOM':
+                                                    raise
+                                                _run_attempt_model(task,length,False,cfg,timeout,lambda: None,
+                                                                   oom_recovery=recover_model,oom_pending=True)
                                             finally:
                                                 if audit['通过']:
                                                     trial['超时秒'] = timeout
@@ -963,9 +1002,9 @@ def execute(work,files,detected,log,cfg):
                                                     log(f'逐层ROI 任务={row["任务"]} 尝试={attempt} {phase}')
                                                     heartbeat=time.monotonic()
 
-                                            _run_attempt_model(task,length,singleton,cfg,timeout,check_model)
+                                            _run_attempt_model(task,length,singleton,cfg,timeout,check_model,oom_recovery=recover_model)
                                         next_number = len(records) + 1
-                                        if executor and pending is None and (not max_tasks or next_number <= max_tasks):
+                                        if allow_prefetch and pending is None and (not max_tasks or next_number <= max_tasks):
                                             if job_index+1 < len(jobs):
                                                 next_job = start, end, jobs[job_index+1]
                                                 next_left, next_right, next_length = window_variants[0]
@@ -1230,18 +1269,11 @@ def execute(work,files,detected,log,cfg):
                                         if trial['错误码'] in RESIDUE_ERRORS:
                                             trial['待目检说明']=('确认残留：背景证据表明该处背景不是水印主色，需补修；颜色问题换接缝窗口无效，不重试' if trial['错误码']=='RESIDUE_FOUND'
                                                              else '待目检：主色候选或无模板组缺少可判背景证据，需人工目检，不算通过；颜色问题换接缝窗口无效，不重试')
-                                        if trial['错误码']=='GPU_OOM' and not oom_used:
-                                            oom_used=True;retry=True
-                                            if attempt+1<len(variants):
-                                                variants[attempt+1]=(left,right,max(2,length//2))
-                                            elif cfg.seam_retries>0:
-                                                # 去重后已无后续参数时，仍保留原有的一次显存恢复。
-                                                variants.append((left,right,max(2,length//2)))
                                         if not retry or attempt==len(variants)-1:
                                             row.update(错误码=trial['错误码'],耗时秒=time.monotonic()-tick)
                                             if '残留汇总' in trial:row['残留判定']=trial['残留汇总']['判定']
                                             if '待目检说明' in trial:row['待目检说明']=trial['待目检说明']
-                                            if continue_unpassed:break
+                                            if continue_unpassed or trial['错误码']=='GPU_OOM':break
                                             raise
                                     finally:
                                         save_input_audit()
@@ -1265,7 +1297,7 @@ def execute(work,files,detected,log,cfg):
                                 if task_shm is not None:
                                     task_shm.close()
                                     task_shm.unlink()
-                            if not row['通过'] and continue_unpassed:
+                            if not row['通过'] and (continue_unpassed or row.get('错误码')=='GPU_OOM'):
                                 candidates=[p for p in row['尝试'] if p.get('完整暂存') and p.get('重叠最大差异') is not None]
                                 unpassed.append(row['任务']);row['未过块']=True
                                 if candidates:
@@ -1316,9 +1348,9 @@ def execute(work,files,detected,log,cfg):
             else:
                 pool_holder[0].terminate()
             pool_holder[0].join()
-    (work/'composite').symlink_to(current[0].parent,target_is_directory=True)
     if unfillable:
         save();raise PipelineError('ROI_UNFILLABLE','其余任务已执行，但部分未过块无完整模型候选，禁止原帧回退',details=dict(tasks=unfillable))
+    (work/'composite').symlink_to(current[0].parent,target_is_directory=True)
     roi.assert_coverage(work,files)
     summary=save();summary.update(覆盖核验通过=True,任务数=len(records))
     (work/'roi-report.json').write_text(json.dumps(json_native(summary),ensure_ascii=False,separators=(',',':')))
