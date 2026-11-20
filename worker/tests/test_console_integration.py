@@ -97,3 +97,78 @@ def test_console_cancel_and_media_range(console):
         db.rollback()
         db.execute("DELETE FROM jobs WHERE id=ANY(%s)", (fixture_ids,))
         db.commit()
+
+
+def test_hls_submission_idempotency_scope_and_cancel(console):
+    token, db = console
+    key = "hls-test-" + secrets.token_hex(12)
+    body = json.dumps(
+        {
+            "hls_input": "kelin/hls-test/absent.m3u8",
+            "options": {"hls_bandwidth": 1200000},
+        }
+    ).encode()
+    headers = {"Content-Type": "application/json", "Idempotency-Key": key}
+    code, raw, _ = request("/v1/jobs", token, method="POST", data=body, headers=headers)
+    assert code == 202
+    job = json.loads(raw)
+    try:
+        code, repeated, _ = request(
+            "/v1/jobs", token, method="POST", data=body, headers=headers
+        )
+        assert code == 202 and json.loads(repeated)["id"] == job["id"]
+        code, _, _ = request(
+            "/v1/jobs",
+            token,
+            method="POST",
+            data=body.replace(b"absent", b"changed"),
+            headers=headers,
+        )
+        assert code == 409
+        code, _, _ = request(
+            "/v1/jobs",
+            token,
+            method="POST",
+            data=body.replace(b"kelin/", b"other-tenant/"),
+            headers={**headers, "Idempotency-Key": key + "-scope"},
+        )
+        assert code == 400
+        code, _, _ = request("/v1/jobs/" + job["id"] + "/hls/index.m3u8", token)
+        assert code == 404
+        code, _, _ = request(
+            "/v1/jobs/" + job["id"] + "/hls/000000.ts", "invalid-token"
+        )
+        assert code == 401
+    finally:
+        code, raw, _ = request(
+            "/v1/jobs/" + job["id"] + "/cancel", token, method="POST"
+        )
+        assert code == 202
+        assert json.loads(raw)["status"] in ("CANCELED", "CANCEL_REQUESTED")
+
+
+def test_hls_terminal_retry_preserves_identity_and_completed_blocks(console):
+    from worker import store
+    from worker.process import PipelineError
+    token, db=console
+    key='hls-retry-'+secrets.token_hex(12)
+    body=json.dumps({'hls_input':'kelin/hls-test/absent.m3u8','options':{}}).encode()
+    code,raw,_=request('/v1/jobs',token,method='POST',data=body,headers={'Content-Type':'application/json','Idempotency-Key':key})
+    assert code==202
+    job=json.loads(raw);jid=job['id']
+    # 独立测试版本不会被真实 GPU worker 领取。
+    db.execute("UPDATE jobs SET pipeline_version='hls-retry-test' WHERE id=%s",(jid,));db.commit()
+    claimed=store.claim(os.environ['DATABASE_URL'],jid,'integration-test','hls-retry-test','test-config')
+    assert claimed
+    assert store.finish(os.environ['DATABASE_URL'],claimed,error=PipelineError('PROCESS_FAILED','测试块失败'))
+    try:
+        code,raw,_=request('/v1/jobs/'+jid+'/retry',token,method='POST')
+        retried=json.loads(raw)
+        assert code==202 and retried['id']==jid and retried['status']=='QUEUED' and retried['attempt']==1
+        saved=db.execute("SELECT input_key,options FROM jobs WHERE id=%s",(jid,)).fetchone()
+        assert saved['input_key']=='kelin/hls-test/absent.m3u8' and saved['options']['hls']
+    finally:
+        code,raw,_=request('/v1/jobs/'+jid+'/cancel',token,method='POST')
+        assert code==202 and json.loads(raw)['status']=='CANCELED'
+    code,_,_=request('/v1/jobs/'+jid+'/retry',token,method='POST')
+    assert code==409

@@ -1,0 +1,7 @@
+{
+  "mask_fraction_limit": 0.2,
+  "strategy": "stable_union_or_stop",
+  "model_sample_count": 3,
+  "retain_stage_sample_count": 1,
+  "boundary_exclusion_pixels": 3
+}

@@ -1,5 +1,13 @@
 """Mask-region PSNR/SSIM on aligned clean-master and repaired PNG frames."""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    import sys as _json_sys
+    from pathlib import Path as _JSONPath
+    _json_sys.path.insert(0,str(_JSONPath(__file__).resolve().parents[1]))
+    from worker.json_types import json_native
+
 import argparse
 import json
 from pathlib import Path
@@ -50,11 +58,11 @@ def main():
     finite = [r["psnr_db"] for r in rows if r["psnr_db"] is not None]
     Path(a.output).write_text(
         json.dumps(
-            {
+            json_native({
                 "frames": rows,
                 "mean_psnr_db": float(np.mean(finite)) if finite else None,
                 "mean_ssim": float(np.mean([r["ssim"] for r in rows])),
-            },
+            }),
             indent=2,
         )
     )

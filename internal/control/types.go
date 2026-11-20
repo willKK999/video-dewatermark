@@ -17,12 +17,17 @@ type Prompt struct {
 	Box   [4]float64 `json:"box"`
 }
 type Options struct {
+	HLS            bool     `json:"hls,omitempty"`
+	HLSBandwidth   int      `json:"hls_bandwidth,omitempty"`
 	MaxShortEdge   int      `json:"max_short_edge"`
 	AllowDowngrade bool     `json:"allow_downgrade"`
 	Prompts        []Prompt `json:"prompts,omitempty"`
 }
 
 func (o *Options) Validate() error {
+	if o.HLSBandwidth < 0 || (o.HLS && len(o.Prompts) > 0) {
+		return errors.New("HLS 码率必须非负，且只支持自动检测")
+	}
 	if o.MaxShortEdge == 0 {
 		o.MaxShortEdge = 720
 	}
@@ -38,15 +43,16 @@ func (o *Options) Validate() error {
 }
 
 type Job struct {
-	ID              string    `json:"id"`
-	Status          string    `json:"status"`
-	Stage           *string   `json:"stage"`
-	Attempt         int       `json:"attempt"`
-	PipelineVersion string    `json:"pipeline_version"`
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
-	Result          any       `json:"result"`
-	Error           any       `json:"error"`
+	ID              string          `json:"id"`
+	Status          string          `json:"status"`
+	Stage           *string         `json:"stage"`
+	Attempt         int             `json:"attempt"`
+	PipelineVersion string          `json:"pipeline_version"`
+	CreatedAt       time.Time       `json:"created_at"`
+	UpdatedAt       time.Time       `json:"updated_at"`
+	Progress        json.RawMessage `json:"progress"`
+	Result          any             `json:"result"`
+	Error           any             `json:"error"`
 }
 
 func id(prefix string) string {

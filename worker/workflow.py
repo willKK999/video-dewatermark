@@ -50,3 +50,22 @@ def abrupt_area(previous, area):
     return (previous is not None and min(previous, area) > .001
             and abs(previous-area) > setting('MASK_JUMP_ABSOLUTE', .015)
             and max(previous, area)/min(previous, area) > setting('MASK_JUMP_RATIO', 3))
+
+
+def stabilize_hls_hints(hints,scenes,seeds=(),radius=5):
+    """镜头内仅修正孤立尺寸尖峰，保留线性运动、镜头边缘及跨块种子。"""
+    seeded={int(p['frame']) for p in seeds}
+    result=[]
+    for hint in hints:
+        index=hint['frame'];start,end=next((s,e) for s,e in scenes if s<=index<e)
+        box=hint['box'];updated=dict(hint)
+        if index not in seeded and start+radius<=index<end-radius:
+            nearby=[p['box'] for p in hints if p['frame']!=index and index-radius<=p['frame']<=index+radius and start<=p['frame']<end]
+            if len(nearby)>=7:
+                median=np.median(nearby,axis=0).tolist()
+                area=lambda b:max(0,b[2]-b[0])*max(0,b[3]-b[1])
+                ratio=area(box)/max(area(median),1)
+                if ratio>1.5 or ratio<1/1.5:
+                    updated.update(box=median,temporal_stabilized=True)
+        result.append(updated)
+    return result

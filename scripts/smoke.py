@@ -1,5 +1,13 @@
 """Exercise upload -> immutable job -> worker -> downloadable MP4 using synthetic owned media."""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    import sys as _json_sys
+    from pathlib import Path as _JSONPath
+    _json_sys.path.insert(0,str(_JSONPath(__file__).resolve().parents[1]))
+    from worker.json_types import json_native
+
 import argparse
 import json
 import os
@@ -17,7 +25,7 @@ args = p.parse_args()
 
 
 def request(path, body=None, method=None, headers=None):
-    data = json.dumps(body).encode() if body is not None else None
+    data = json.dumps(json_native(body)).encode() if body is not None else None
     req = urllib.request.Request(
         args.url + path,
         data=data,
@@ -82,13 +90,13 @@ with tempfile.TemporaryDirectory() as temp:
         output.write_bytes(data)
     print(
         json.dumps(
-            {
+            json_native({
                 "id": job["id"],
                 "status": job["status"],
                 "result": {
                     k: v for k, v in job["result"].items() if k != "download_url"
                 },
-            },
+            }),
             indent=2,
         )
     )

@@ -1,5 +1,13 @@
 """Run a frozen, authorized dataset and report observed latency, VRAM and mask quality."""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    import sys as _json_sys
+    from pathlib import Path as _JSONPath
+    _json_sys.path.insert(0,str(_JSONPath(__file__).resolve().parents[1]))
+    from worker.json_types import json_native
+
 import argparse
 import fcntl
 import json
@@ -116,7 +124,7 @@ def main():
                 peak_vram_mib=peak[0] or None,
             )
             rows.append(row)
-            Path(a.output).write_text(json.dumps({"runs": rows}, indent=2))
+            Path(a.output).write_text(json.dumps(json_native({"runs": rows}), indent=2))
     measured = [r for r in rows if not r["warmup"]]
     groups = {}
     for name, group in [
@@ -148,7 +156,7 @@ def main():
         }
     Path(a.output).write_text(
         json.dumps(
-            {"runs": rows, "summary": groups, "total_measured": len(measured)}, indent=2
+            json_native({"runs": rows, "summary": groups, "total_measured": len(measured)}), indent=2
         )
     )
     print(a.output)

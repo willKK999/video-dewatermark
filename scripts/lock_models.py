@@ -1,5 +1,13 @@
 """Generate a reviewable local lock after downloading and reviewing model sources."""
 
+try:
+    from worker.json_types import json_native
+except ModuleNotFoundError:
+    import sys as _json_sys
+    from pathlib import Path as _JSONPath
+    _json_sys.path.insert(0,str(_JSONPath(__file__).resolve().parents[1]))
+    from worker.json_types import json_native
+
 import argparse
 import hashlib
 import json
@@ -38,6 +46,6 @@ for name in a.repo:
         raise ValueError("review and commit model source patches before locking")
     repos.append({"path": str(path), "commit": commit})
 Path(a.output).write_text(
-    json.dumps({"files": files, "repositories": repos}, indent=2) + "\n"
+    json.dumps(json_native({"files": files, "repositories": repos}), indent=2) + "\n"
 )
 print(a.output)

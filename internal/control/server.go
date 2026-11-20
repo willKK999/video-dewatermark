@@ -35,13 +35,20 @@ type Server struct {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", consolePage)
+	mux.HandleFunc("GET /assets/hls.min.js", func(w http.ResponseWriter, r *http.Request) {
+		b, _ := consoleFiles.ReadFile("web/hls.min.js")
+		w.Header().Set("Content-Type", "text/javascript")
+		w.Write(b)
+	})
 	mux.HandleFunc("GET /v1/jobs", s.list)
 	mux.HandleFunc("PUT /v1/uploads/{id}/content", s.proxyUpload)
 	mux.HandleFunc("GET /v1/jobs/{id}/media/{kind}", s.media)
+	mux.HandleFunc("GET /v1/jobs/{id}/hls/{name}", s.hlsMedia)
 	mux.HandleFunc("POST /v1/uploads", s.upload)
 	mux.HandleFunc("POST /v1/jobs", s.create)
 	mux.HandleFunc("GET /v1/jobs/{id}", s.get)
 	mux.HandleFunc("POST /v1/jobs/{id}/cancel", s.cancel)
+	mux.HandleFunc("POST /v1/jobs/{id}/retry", s.retryHLS)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
@@ -56,7 +63,7 @@ func (s *Server) Handler() http.Handler {
 		w.Header().Set("X-Request-ID", r.Header.Get("X-Request-ID"))
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
-		if (r.URL.Path == "/" && r.Method == "GET") || r.URL.Path == "/healthz" {
+		if ((r.URL.Path == "/" || r.URL.Path == "/assets/hls.min.js") && r.Method == "GET") || r.URL.Path == "/healthz" {
 			mux.ServeHTTP(w, r)
 			return
 		}
@@ -134,7 +141,7 @@ func (s *Server) load(ctx context.Context, q interface {
 	var key, code, message *string
 	var meta []byte
 	var expires *time.Time
-	err := q.QueryRow(ctx, `SELECT id,status,stage,attempt,pipeline_version,created_at,updated_at,result_key,result_meta,result_expires_at,error_code,error_message FROM jobs WHERE id=$1 AND tenant_id=$2`, jid, t).Scan(&j.ID, &j.Status, &j.Stage, &j.Attempt, &j.PipelineVersion, &j.CreatedAt, &j.UpdatedAt, &key, &meta, &expires, &code, &message)
+	err := q.QueryRow(ctx, `SELECT id,status,stage,attempt,pipeline_version,created_at,updated_at,progress,result_key,result_meta,result_expires_at,error_code,error_message FROM jobs WHERE id=$1 AND tenant_id=$2`, jid, t).Scan(&j.ID, &j.Status, &j.Stage, &j.Attempt, &j.PipelineVersion, &j.CreatedAt, &j.UpdatedAt, &j.Progress, &key, &meta, &expires, &code, &message)
 	if err != nil {
 		return j, err
 	}
@@ -178,11 +185,22 @@ func (s *Server) load(ctx context.Context, q interface {
 func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		UploadID string  `json:"upload_id"`
+		HLSInput string  `json:"hls_input"`
 		Options  Options `json:"options"`
 	}
 	ik := r.Header.Get("Idempotency-Key")
-	if ik == "" || len(ik) > 200 || decode(w, r, &in) != nil || in.UploadID == "" {
+	if ik == "" || len(ik) > 200 || decode(w, r, &in) != nil || (in.UploadID == "" && in.HLSInput == "") {
 		fail(w, r, 400, "INVALID_ARGUMENT", "valid body and Idempotency-Key required")
+		return
+	}
+	if in.HLSInput != "" {
+		if in.UploadID != "" || !validHLSInput(in.HLSInput) || (!strings.Contains(in.HLSInput, "://") && !strings.HasPrefix(in.HLSInput, tenant(r)+"/")) {
+			fail(w, r, 400, "INVALID_ARGUMENT", "请输入有效的 m3u8 对象键或公开链接")
+			return
+		}
+		in.Options.HLS = true
+	} else if in.Options.HLS {
+		fail(w, r, 400, "INVALID_ARGUMENT", "HLS 任务需要 hls_input")
 		return
 	}
 	if err := in.Options.Validate(); err != nil {
@@ -239,39 +257,50 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	var source, ct string
 	var size int64
 	var expires time.Time
-	err = tx.QueryRow(ctx, `SELECT object_key,size_bytes,content_type,expires_at FROM uploads WHERE id=$1 AND tenant_id=$2`, in.UploadID, t).Scan(&source, &size, &ct, &expires)
-	if errors.Is(err, pgx.ErrNoRows) {
-		fail(w, r, 404, "NOT_FOUND", "upload not found")
-		return
-	}
-	if err != nil {
-		fail(w, r, 503, "DATABASE_UNAVAILABLE", "cannot read upload")
-		return
-	}
-	if time.Now().After(expires) {
-		fail(w, r, 422, "UPLOAD_EXPIRED", "upload reservation expired")
-		return
-	}
-	info, err := s.Store.StatObject(ctx, s.Bucket, source, minio.StatObjectOptions{})
-	if err != nil {
-		e := minio.ToErrorResponse(err)
-		if e.Code == "NoSuchKey" || e.Code == "NoSuchObject" {
-			fail(w, r, 422, "UPLOAD_INVALID", "upload missing")
-		} else {
-			fail(w, r, 503, "STORAGE_UNAVAILABLE", "cannot verify upload")
-		}
-		return
-	}
-	if info.Size != size || info.ContentType != ct {
-		fail(w, r, 422, "UPLOAD_INVALID", "uploaded size or content type differs")
-		return
-	}
 	jid := id("job_")
-	input := t + "/inputs/" + jid + "/source"
-	_, err = s.Store.CopyObject(ctx, s.inputCopyOptions(input), minio.CopySrcOptions{Bucket: s.Bucket, Object: source, MatchETag: info.ETag})
-	if err != nil {
-		fail(w, r, 503, "STORAGE_UNAVAILABLE", "cannot freeze input")
-		return
+	input := in.HLSInput
+	if input != "" {
+		in.UploadID = id("upl_")
+		_, err = tx.Exec(ctx, `INSERT INTO uploads(id,tenant_id,object_key,filename,size_bytes,content_type,expires_at) VALUES($1,$2,$3,'HLS 视频.m3u8',1,'application/vnd.apple.mpegurl',now()+interval '15 minutes')`, in.UploadID, t, t+"/hls-inputs/"+jid)
+		if err != nil {
+			fail(w, r, 503, "DATABASE_UNAVAILABLE", "无法保存 HLS 输入")
+			return
+		}
+	} else {
+		err = tx.QueryRow(ctx, `SELECT object_key,size_bytes,content_type,expires_at FROM uploads WHERE id=$1 AND tenant_id=$2`, in.UploadID, t).Scan(&source, &size, &ct, &expires)
+		if errors.Is(err, pgx.ErrNoRows) {
+			fail(w, r, 404, "NOT_FOUND", "upload not found")
+			return
+		}
+		if err != nil {
+			fail(w, r, 503, "DATABASE_UNAVAILABLE", "cannot read upload")
+			return
+		}
+		if time.Now().After(expires) {
+			fail(w, r, 422, "UPLOAD_EXPIRED", "upload reservation expired")
+			return
+		}
+		info, err := s.Store.StatObject(ctx, s.Bucket, source, minio.StatObjectOptions{})
+		if err != nil {
+			e := minio.ToErrorResponse(err)
+			if e.Code == "NoSuchKey" || e.Code == "NoSuchObject" {
+				fail(w, r, 422, "UPLOAD_INVALID", "upload missing")
+			} else {
+				fail(w, r, 503, "STORAGE_UNAVAILABLE", "cannot verify upload")
+			}
+			return
+		}
+		if info.Size != size || info.ContentType != ct {
+			fail(w, r, 422, "UPLOAD_INVALID", "uploaded size or content type differs")
+			return
+		}
+		input = t + "/inputs/" + jid + "/source"
+		_, err = s.Store.CopyObject(ctx, s.inputCopyOptions(input), minio.CopySrcOptions{Bucket: s.Bucket, Object: source, MatchETag: info.ETag})
+		if err != nil {
+			fail(w, r, 503, "STORAGE_UNAVAILABLE", "cannot freeze input")
+			return
+		}
+
 	}
 	opts, _ := json.Marshal(in.Options)
 	_, err = tx.Exec(ctx, `INSERT INTO jobs(id,tenant_id,upload_id,input_key,idempotency_key,request_hash,status,options,pipeline_version) VALUES($1,$2,$3,$4,$5,$6,'QUEUED',$7,$8)`, jid, t, in.UploadID, input, ik, hash, opts, s.Pipeline)
